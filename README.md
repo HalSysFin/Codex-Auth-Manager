@@ -1,11 +1,19 @@
 # Codex Auth Manager (FastAPI)
 
-Small FastAPI service that captures OAuth callbacks, persists Codex auth into `codex-switch`, and shows remaining rate limits per account.
+Central orchestration service for Codex auth profiles.
+
+Primary architecture:
+- Codex CLI performs login and writes `~/.codex/auth.json`
+- `codex-switch` stores/switches labeled profiles
+- `auth-manager` orchestrates login status, import/labeling, API, and UI
+
+Legacy callback/exchange routes are still available, but the primary happy path is now Codex CLI driven.
 
 ## Requirements
 
 - Python 3.10+
-- `codex-switch` installed and on your `PATH`
+- `codex` CLI installed and on `PATH` (or set `CODEX_CLI_BIN`)
+- `codex-switch` installed and on `PATH` (or set `CODEX_SWITCH_BIN`)
 
 ## Setup
 
@@ -21,58 +29,57 @@ pip install -r requirements.txt
 uvicorn app.main:app --reload --port 8080
 ```
 
-Open the dashboard at `http://localhost:8080/`.
+Open `http://localhost:8080/`.
+
+## Primary Flow
+
+1. Click **Add account** (or `POST /auth/login/start`) to launch Codex CLI login.
+2. Codex CLI produces/updates `CODEX_AUTH_PATH` (default `~/.codex/auth.json`).
+3. Click **Import current auth** (or `POST /auth/import-current`).
+4. auth-manager extracts email and derives a label when none is provided.
+5. auth-manager runs `codex-switch save --label <label>`.
+6. Switch later via UI or `POST /auth/switch`.
 
 ## Endpoints
 
+Core:
 - `GET /health`
-- `GET /` — dashboard UI (rate limits per account)
-- `GET /ui` — alias for the dashboard UI
-- `GET /api/accounts` — returns connected accounts + rate limit info (Bearer token required if `INTERNAL_API_TOKEN` is set)
-- `GET /oauth/callback` — captures query params and stores them to the callback store
-- `POST /oauth/callback` — captures JSON payload; if it includes `label` + `auth_json`, it saves immediately
-- `GET /auth/callback` — alias for `/oauth/callback` (matches Codex redirect)
-- `POST /auth/callback` — alias for `/oauth/callback`
-- `POST /auth/exchange` — exchanges `code` + `code_verifier` for tokens and optionally saves
-- `POST /auth/save` — persists `auth_json` to `~/.codex/auth.json` and runs `codex-switch save --label <label>`
-- `GET /internal/auths` — returns stored auth JSON (Bearer token required if `INTERNAL_API_TOKEN` is set)
+- `GET /` and `GET /ui` dashboard
+- `GET /api/accounts` list saved accounts + rate limit probes
+- `POST /auth/login/start` start Codex CLI login
+- `GET /auth/login/status` login status (`wait_seconds` optional)
+- `POST /auth/import-current` import current auth.json and save label
+- `POST /auth/switch` switch active profile via `codex-switch`
+- `GET /auth/current` metadata for active auth file and guessed/current label
+- `GET /auth/export?label=<label>` return stored auth JSON for a label
 
-## Dashboard auth
+Legacy/secondary:
+- `GET/POST /oauth/callback`
+- `GET/POST /auth/callback`
+- `POST /auth/save`
+- `POST /auth/exchange`
+- `GET /internal/auths`
 
-If `INTERNAL_API_TOKEN` is set, the dashboard will prompt for a Bearer token. The token is stored in `localStorage` as `internalToken` for convenience.
+## Internal Token Protection
 
-## Example payload
+When `INTERNAL_API_TOKEN` is set, sensitive endpoints require `Authorization: Bearer <token>`.
+This includes endpoints that expose raw auth JSON or mutate active auth state, including:
+- `/auth/export`
+- `/auth/import-current`
+- `/auth/switch`
+- `/auth/save`
+- `/auth/exchange`
+- `/internal/auths`
+- `/auth/login/start`
 
-```json
-{
-  "label": "work",
-  "auth_json": {
-    "access_token": "...",
-    "refresh_token": "...",
-    "expires_at": 1730000000
-  }
-}
-```
-
-## Token exchange
-
-`/auth/exchange` expects:
-
-```json
-{
-  "code": "ac_...",
-  "code_verifier": "....",
-  "label": "work"
-}
-```
-
-If `label` is provided, the token response is written to `~/.codex/auth.json` and then saved via `codex-switch save --label <label>`.
+The UI stores the token in `localStorage` key `internalToken` for convenience.
 
 ## Environment
 
-Create a `.env` file if you want to override defaults:
+Example `.env` values:
 
-```
+```env
+CODEX_CLI_BIN=codex
 CODEX_SWITCH_BIN=codex-switch
 CODEX_AUTH_PATH=~/.codex/auth.json
 CALLBACK_STORE_DIR=~/.codex-switch/callbacks
@@ -86,3 +93,23 @@ OPENAI_CLIENT_ID=
 OPENAI_CLIENT_SECRET=
 OPENAI_REDIRECT_URI=http://localhost:1455/auth/callback
 ```
+
+## Docker
+
+Build and run:
+
+```bash
+docker compose up --build
+```
+
+Container defaults:
+- `CODEX_AUTH_PATH=/root/.codex/auth.json`
+- `CALLBACK_STORE_DIR=/root/.codex-switch/callbacks`
+- `CODEX_PROFILES_DIR=/root/.codex-switch/profiles`
+
+Persistent volumes:
+- `/root/.codex`
+- `/root/.codex-switch/profiles`
+- `/root/.codex-switch/callbacks`
+
+Note: Dockerfile assumes Codex CLI and `codex-switch` can be installed via npm (`@openai/codex` and `codex-switch`). Override build arg `CODEX_INSTALL_CMD` if your install command differs.

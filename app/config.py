@@ -11,6 +11,7 @@ def _expand(path: str) -> Path:
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8")
 
+    codex_cli_bin: str = "codex"
     codex_switch_bin: str = "codex-switch"
     codex_auth_path: str = "~/.codex/auth.json"
     callback_store_dir: str = "~/.codex-switch/callbacks"
