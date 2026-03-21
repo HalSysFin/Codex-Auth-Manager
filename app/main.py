@@ -217,12 +217,12 @@ async def ui() -> HTMLResponse:
 
 @app.get("/ui/accounts/{label}")
 async def ui_account_usage(label: str) -> HTMLResponse:
-    return _spa_or_legacy_index()
+    return HTMLResponse(_render_account_usage_page(label))
 
 
 @app.get("/ui/stats")
 async def ui_usage_stats() -> HTMLResponse:
-    return _spa_or_legacy_index()
+    return HTMLResponse(_render_usage_stats_page())
 
 
 @app.get("/oauth/callback")
