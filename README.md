@@ -163,6 +163,13 @@ Build and run:
 docker compose up --build
 ```
 
+Frontend dev server in stack:
+
+- `auth-manager` API/UI container: `http://localhost:8080`
+- `frontend` Vite dev container: `http://localhost:5173`
+
+The Vite service proxies `/api`, `/auth`, `/health`, and `/internal` to `auth-manager:8080`.
+
 Container defaults:
 - `CODEX_AUTH_PATH=/root/.codex/auth.json`
 - `CALLBACK_STORE_DIR=/root/.codex-switch/callbacks`

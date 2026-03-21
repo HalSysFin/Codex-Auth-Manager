@@ -25,6 +25,19 @@ services:
       - codex_auth:/root/.codex
       - codex_switch:/root/.codex-switch
     restart: unless-stopped
+  frontend:
+    image: node:20-alpine
+    working_dir: /frontend
+    command: sh -c "npm install && npm run dev -- --host 0.0.0.0 --port 5173"
+    environment:
+      VITE_API_BASE_URL: ${VITE_API_BASE_URL:-http://auth-manager:8080}
+    volumes:
+      - ./frontend:/frontend
+    ports:
+      - "5173:5173"
+    depends_on:
+      - auth-manager
+    restart: unless-stopped
 
 volumes:
   codex_auth:
