@@ -328,7 +328,7 @@ async def auth_login_status(wait_seconds: int = 0, session_id: str | None = None
         try:
             persist_result = _persist_current_auth_to_profile(
                 desired_label=None,
-                create_if_missing=False,
+                create_if_missing=True,
             )
             auto_persist.update(
                 {
@@ -358,7 +358,10 @@ async def auth_login_status(wait_seconds: int = 0, session_id: str | None = None
             "Relay callback captured. Waiting for auth finalization before any profile persistence."
         )
     elif result.auth_updated and auto_persist.get("status") == "persisted":
-        next_action = "Auth finalized and matching saved profile was updated automatically."
+        if auto_persist.get("created_new_profile"):
+            next_action = "Auth finalized and saved as a new profile automatically."
+        else:
+            next_action = "Auth finalized and matching saved profile was updated automatically."
     elif result.auth_updated and auto_persist.get("status") == "skipped":
         if auto_persist.get("reason") == "up_to_date":
             next_action = "Auth finalized. Saved profile already had the latest auth."

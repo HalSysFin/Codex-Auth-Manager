@@ -204,6 +204,45 @@ class AutoPersistReauthTests(unittest.TestCase):
         self.assertEqual(result.label, "newuser")
         save_mock.assert_called_once_with("newuser")
 
+    def test_login_status_auto_persist_creates_new_profile_when_unmatched(self) -> None:
+        status_result = LoginStatusResult(
+            status="complete",
+            auth_exists=True,
+            auth_updated=True,
+            auth_path="/tmp/auth.json",
+            started_at="2026-03-21T00:00:00+00:00",
+            completed_at="2026-03-21T00:01:00+00:00",
+            browser_url=None,
+            pid=123,
+            error=None,
+        )
+        switch_result = CodexSwitchResult(
+            command=["internal-save", "--label", "fresh"],
+            returncode=0,
+            stdout="ok",
+            stderr="",
+        )
+
+        with (
+            patch("app.main.get_latest_session", return_value=None),
+            patch("app.main.get_login_status", return_value=status_result),
+            patch("app.main.session_state", return_value=("complete", None)),
+            patch("app.main.read_current_auth", return_value={"email": "fresh@example.com"}),
+            patch("app.main.list_profiles", return_value=[]),
+            patch("app.main.list_labels", return_value=[]),
+            patch("app.main.persist_current_auth"),
+            patch("app.main._touch_account_usage"),
+            patch("app.main.save_current_auth_under_label", return_value=switch_result) as save_mock,
+        ):
+            response = asyncio.run(auth_login_status())
+
+        payload = _json_response_payload(response)
+        self.assertEqual(payload["status"], "complete")
+        self.assertEqual(payload["auto_persist"]["status"], "persisted")
+        self.assertEqual(payload["auto_persist"]["label"], "fresh")
+        self.assertTrue(payload["auto_persist"]["created_new_profile"])
+        save_mock.assert_called_once_with("fresh")
+
 
 if __name__ == "__main__":
     unittest.main()
