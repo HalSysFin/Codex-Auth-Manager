@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import unittest
 from datetime import datetime, timezone
@@ -16,6 +17,16 @@ from app.main import _persist_current_auth_to_profile, auth_login_status
 
 def _json_response_payload(response) -> dict:
     return json.loads(response.body.decode("utf-8"))
+
+
+def _jwt_with_claims(claims: dict) -> str:
+    header = {"alg": "none", "typ": "JWT"}
+
+    def _enc(obj: dict) -> str:
+        raw = json.dumps(obj, separators=(",", ":")).encode("utf-8")
+        return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+
+    return f"{_enc(header)}.{_enc(claims)}."
 
 
 class AutoPersistReauthTests(unittest.TestCase):
@@ -242,6 +253,56 @@ class AutoPersistReauthTests(unittest.TestCase):
         self.assertEqual(payload["auto_persist"]["label"], "fresh")
         self.assertTrue(payload["auto_persist"]["created_new_profile"])
         save_mock.assert_called_once_with("fresh")
+
+    def test_callback_auth_with_expired_token_is_not_persisted(self) -> None:
+        now = datetime.now(timezone.utc)
+        session = LoginSession(
+            session_id="sess-expired",
+            relay_token="rtok",
+            auth_url="https://auth.openai.com/oauth/authorize?state=abc",
+            created_at=now,
+            expires_at=now,
+            callback_payload={"code": "abc"},
+            callback_received_at=now,
+            relay_used=True,
+        )
+        status_result = LoginStatusResult(
+            status="complete",
+            auth_exists=True,
+            auth_updated=True,
+            auth_path="/tmp/auth.json",
+            started_at="2026-03-21T19:20:54+00:00",
+            completed_at="2026-03-21T19:24:34+00:00",
+            browser_url=None,
+            pid=123,
+            error=None,
+        )
+        expired_access = _jwt_with_claims(
+            {
+                "exp": int(datetime(2026, 3, 21, 17, 10, 24, tzinfo=timezone.utc).timestamp()),
+                "iat": int(datetime(2026, 3, 11, 17, 10, 23, tzinfo=timezone.utc).timestamp()),
+                "sub": "auth0|xKsUogc5K6oFmHnFY171YbaT",
+            }
+        )
+
+        with (
+            patch("app.main.get_latest_session", return_value=session),
+            patch("app.main.get_login_status", return_value=status_result),
+            patch("app.main.session_state", return_value=("complete", None)),
+            patch("app.main.read_current_auth", return_value={"tokens": {"access_token": expired_access}}),
+            patch("app.main.save_current_auth_under_label") as save_mock,
+        ):
+            response = asyncio.run(auth_login_status())
+
+        payload = _json_response_payload(response)
+        self.assertEqual(payload["status"], "complete")
+        self.assertEqual(payload["auto_persist"]["status"], "error")
+        self.assertEqual(payload["auto_persist"]["reason"], "auth_not_fresh")
+        self.assertEqual(
+            payload["auto_persist"]["auth_validation"]["reason"],
+            "access_token_expired",
+        )
+        save_mock.assert_not_called()
 
 
 if __name__ == "__main__":

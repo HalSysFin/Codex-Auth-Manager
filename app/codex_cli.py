@@ -5,6 +5,9 @@ import json
 import re
 import subprocess
 import time
+import urllib.error
+import urllib.parse
+import urllib.request
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -402,14 +405,70 @@ def derive_label(email: str, existing_labels: set[str] | None = None) -> str:
 
 
 def relay_callback_to_login(callback_payload: dict[str, Any]) -> dict[str, Any]:
-    # TODO: Wire relayed callback params (code/state/error) into codex CLI once
-    # the CLI supports direct callback injection in a stable way.
-    _ = callback_payload
+    full_url_raw = callback_payload.get("full_url")
+    full_url = str(full_url_raw).strip() if isinstance(full_url_raw, str) else ""
+    relay_url = full_url or _build_callback_url_from_payload(callback_payload)
+    if not relay_url:
+        return {
+            "attempted": False,
+            "supported": True,
+            "completed": False,
+            "message": "Missing callback URL for relay handoff.",
+        }
+
+    parsed = urllib.parse.urlparse(relay_url)
+    host = (parsed.hostname or "").strip().lower()
+    if host not in {"localhost", "127.0.0.1", "::1"}:
+        return {
+            "attempted": False,
+            "supported": True,
+            "completed": False,
+            "message": "Relay handoff URL must target localhost.",
+            "url": relay_url,
+        }
+
+    req = urllib.request.Request(
+        relay_url,
+        method="GET",
+        headers={"User-Agent": "codex-auth-manager/relay"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=8.0) as resp:
+            status = int(getattr(resp, "status", 200) or 200)
+            body = _to_text(resp.read(512))
+    except urllib.error.HTTPError as exc:
+        body = _to_text(exc.read(512))
+        return {
+            "attempted": True,
+            "supported": True,
+            "completed": False,
+            "message": f"Local callback listener returned HTTP {exc.code}.",
+            "url": relay_url,
+            "http_status": int(exc.code),
+            "body_excerpt": body,
+        }
+    except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        return {
+            "attempted": True,
+            "supported": True,
+            "completed": False,
+            "message": f"Unable to deliver callback to local listener: {exc}",
+            "url": relay_url,
+        }
+
+    success = 200 <= status < 500
     return {
-        "attempted": False,
-        "supported": False,
-        "completed": False,
-        "message": "Direct Codex CLI callback handoff is not implemented yet.",
+        "attempted": True,
+        "supported": True,
+        "completed": success,
+        "message": (
+            "Callback delivered to local Codex listener."
+            if success
+            else f"Unexpected listener response HTTP {status}."
+        ),
+        "url": relay_url,
+        "http_status": status,
+        "body_excerpt": body,
     }
 
 
@@ -569,6 +628,44 @@ def _stop_process(process: subprocess.Popen[str]) -> None:
 
 def _clean_url(url: str) -> str:
     return url.rstrip(".,);]")
+
+
+def _build_callback_url_from_payload(callback_payload: dict[str, Any]) -> str | None:
+    base = str(settings.openai_redirect_uri or "").strip()
+    if not base:
+        return None
+    code = callback_payload.get("code")
+    state = callback_payload.get("state")
+    error = callback_payload.get("error")
+    error_description = callback_payload.get("error_description")
+
+    params: dict[str, str] = {}
+    if isinstance(code, str) and code.strip():
+        params["code"] = code.strip()
+    if isinstance(state, str) and state.strip():
+        params["state"] = state.strip()
+    if isinstance(error, str) and error.strip():
+        params["error"] = error.strip()
+    if isinstance(error_description, str) and error_description.strip():
+        params["error_description"] = error_description.strip()
+    if not params:
+        return None
+
+    parsed = urllib.parse.urlparse(base)
+    existing = urllib.parse.parse_qsl(parsed.query, keep_blank_values=True)
+    merged = dict(existing)
+    merged.update(params)
+    query = urllib.parse.urlencode(merged)
+    return urllib.parse.urlunparse(
+        (
+            parsed.scheme or "http",
+            parsed.netloc,
+            parsed.path or "/auth/callback",
+            parsed.params,
+            query,
+            parsed.fragment,
+        )
+    )
 
 
 def _mtime(path: Path) -> float | None:

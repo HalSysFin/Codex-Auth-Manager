@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import hmac
 import ipaddress
 import json
@@ -326,9 +327,27 @@ async def auth_login_status(wait_seconds: int = 0, session_id: str | None = None
     if result.auth_updated:
         auto_persist["attempted"] = True
         try:
+            current_auth = read_current_auth()
+            if callback_received:
+                auth_validation = _validate_relay_finalized_auth(
+                    current_auth,
+                    started_at_iso=result.started_at,
+                )
+                auto_persist["auth_validation"] = auth_validation
+                if not auth_validation.get("ok"):
+                    auto_persist.update(
+                        {
+                            "status": "error",
+                            "reason": "auth_not_fresh",
+                            "error": auth_validation.get("message"),
+                        }
+                    )
+                    raise ValueError("Relay auth payload is stale or expired")
+
             persist_result = _persist_current_auth_to_profile(
                 desired_label=None,
                 create_if_missing=True,
+                auth_json=current_auth,
             )
             auto_persist.update(
                 {
@@ -342,7 +361,16 @@ async def auth_login_status(wait_seconds: int = 0, session_id: str | None = None
                     "codex_switch": persist_result.codex_switch,
                 }
             )
-        except (CodexCLIError, AuthStoreError, CodexSwitchError, ValueError) as exc:
+        except ValueError as exc:
+            if auto_persist.get("status") != "error":
+                auto_persist.update(
+                    {
+                        "status": "error",
+                        "reason": "persist_failed",
+                        "error": str(exc),
+                    }
+                )
+        except (CodexCLIError, AuthStoreError, CodexSwitchError) as exc:
             logger.warning("auto persist after auth update failed: %s", exc)
             auto_persist.update(
                 {
@@ -373,10 +401,16 @@ async def auth_login_status(wait_seconds: int = 0, session_id: str | None = None
         else:
             next_action = None
     elif result.auth_updated and auto_persist.get("status") == "error":
-        next_action = (
-            "Auth finalized but automatic profile persistence failed. "
-            "Check auto_persist.error or run POST /auth/import-current."
-        )
+        if auto_persist.get("reason") == "auth_not_fresh":
+            next_action = (
+                "Relay callback was received, but finalized auth is stale/expired. "
+                "Retry Add Account and complete a fresh login for the intended user."
+            )
+        else:
+            next_action = (
+                "Auth finalized but automatic profile persistence failed. "
+                "Check auto_persist.error or run POST /auth/import-current."
+            )
     else:
         next_action = None
 
@@ -411,7 +445,7 @@ async def auth_login_status(wait_seconds: int = 0, session_id: str | None = None
                 ),
                 "auth_updated": result.auth_updated,
                 "cli_status": result.status,
-                "handoff_supported": False,
+                "handoff_supported": True,
                 "finalization_supported": False,
                 "next_action": (
                     next_action
@@ -1537,12 +1571,13 @@ def _persist_current_auth_to_profile(
     *,
     desired_label: str | None,
     create_if_missing: bool,
+    auth_json: dict[str, Any] | None = None,
 ) -> PersistCurrentAuthResult:
-    auth_json = read_current_auth()
-    email = extract_email(auth_json)
+    resolved_auth = auth_json if isinstance(auth_json, dict) else read_current_auth()
+    email = extract_email(resolved_auth)
     existing = set(list_labels())
     profiles = _dedupe_profiles(list_profiles())
-    matched_profile = _find_matching_profile(profiles, auth_json, email)
+    matched_profile = _find_matching_profile(profiles, resolved_auth, email)
 
     if desired_label is not None:
         label = desired_label.strip()
@@ -1569,7 +1604,7 @@ def _persist_current_auth_to_profile(
         )
 
     current_for_label = next((p for p in profiles if p.label == label), None)
-    if current_for_label is not None and current_for_label.auth == auth_json:
+    if current_for_label is not None and current_for_label.auth == resolved_auth:
         _touch_account_usage(profile_label=label, profile_email=email)
         return PersistCurrentAuthResult(
             persisted=False,
@@ -1583,7 +1618,7 @@ def _persist_current_auth_to_profile(
             codex_switch=None,
         )
 
-    persist_current_auth(auth_json)
+    persist_current_auth(resolved_auth)
     switch_save = save_current_auth_under_label(label)
     _touch_account_usage(profile_label=label, profile_email=email)
     return PersistCurrentAuthResult(
@@ -1767,6 +1802,108 @@ def _extract_token(payload: Any) -> str | None:
             if found:
                 return found
     return None
+
+
+def _extract_id_token(payload: Any) -> str | None:
+    if isinstance(payload, dict):
+        for key in ["id_token", "idToken"]:
+            value = payload.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        for value in payload.values():
+            found = _extract_id_token(value)
+            if found:
+                return found
+    elif isinstance(payload, list):
+        for item in payload:
+            found = _extract_id_token(item)
+            if found:
+                return found
+    return None
+
+
+def _decode_jwt_claims(token: str) -> dict[str, Any] | None:
+    parts = token.split(".")
+    if len(parts) < 2:
+        return None
+    payload = parts[1]
+    padding = "=" * ((4 - (len(payload) % 4)) % 4)
+    try:
+        decoded = base64.urlsafe_b64decode((payload + padding).encode("ascii"))
+        claims = json.loads(decoded.decode("utf-8", errors="replace"))
+    except (ValueError, OSError):
+        return None
+    if isinstance(claims, dict):
+        return claims
+    return None
+
+
+def _validate_relay_finalized_auth(
+    auth_json: dict[str, Any],
+    *,
+    started_at_iso: str | None,
+) -> dict[str, Any]:
+    now = datetime.now(timezone.utc)
+    access_token = _extract_token(auth_json)
+    if not access_token:
+        return {"ok": False, "reason": "missing_access_token", "message": "No access token found in finalized auth."}
+
+    access_claims = _decode_jwt_claims(access_token)
+    if not access_claims:
+        return {"ok": False, "reason": "invalid_access_token", "message": "Unable to decode finalized access token."}
+
+    exp = access_claims.get("exp")
+    iat = access_claims.get("iat")
+    exp_dt = None
+    if isinstance(exp, int):
+        exp_dt = datetime.fromtimestamp(exp, tz=timezone.utc)
+        if exp_dt <= now:
+            return {
+                "ok": False,
+                "reason": "access_token_expired",
+                "message": "Finalized access token is already expired.",
+                "access_exp_at": exp_dt.isoformat(),
+            }
+
+    started_dt = None
+    if started_at_iso:
+        with suppress(ValueError):
+            started_dt = datetime.fromisoformat(started_at_iso.replace("Z", "+00:00"))
+            if started_dt.tzinfo is None:
+                started_dt = started_dt.replace(tzinfo=timezone.utc)
+            else:
+                started_dt = started_dt.astimezone(timezone.utc)
+    iat_dt = None
+    if isinstance(iat, int):
+        iat_dt = datetime.fromtimestamp(iat, tz=timezone.utc)
+    # If relay was just completed but token was minted long before this login session,
+    # treat it as stale and avoid persisting a false "refreshed" auth.
+    if started_dt and iat_dt and iat_dt < (started_dt.replace(microsecond=0)):
+        return {
+            "ok": False,
+            "reason": "stale_access_token",
+            "message": "Finalized access token predates the current login session.",
+            "access_iat": iat_dt.isoformat(),
+            "login_started_at": started_dt.isoformat(),
+        }
+
+    id_token = _extract_id_token(auth_json)
+    email = None
+    if id_token:
+        id_claims = _decode_jwt_claims(id_token)
+        if id_claims:
+            maybe_email = id_claims.get("email")
+            if isinstance(maybe_email, str) and maybe_email.strip():
+                email = maybe_email.strip().lower()
+
+    result: dict[str, Any] = {"ok": True, "reason": "fresh_access_token"}
+    if exp_dt:
+        result["access_exp_at"] = exp_dt.isoformat()
+    if iat_dt:
+        result["access_iat"] = iat_dt.isoformat()
+    if email:
+        result["email"] = email
+    return result
 
 
 def _auth_file_metadata(path: Path) -> dict[str, Any]:
