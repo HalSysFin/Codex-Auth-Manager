@@ -11,6 +11,7 @@ services:
       CODEX_AUTH_PATH: ${CODEX_AUTH_PATH:-/root/.codex/auth.json}
       CALLBACK_STORE_DIR: ${CALLBACK_STORE_DIR:-/root/.codex-switch/callbacks}
       CODEX_PROFILES_DIR: ${CODEX_PROFILES_DIR:-/root/.codex-switch/profiles}
+      USAGE_DB_PATH: ${USAGE_DB_PATH:-/root/.codex-switch/auth-manager.sqlite3}
       LOGIN_SESSION_TTL_SECONDS: ${LOGIN_SESSION_TTL_SECONDS:-600}
       INTERNAL_API_TOKEN: ${INTERNAL_API_TOKEN:-}
       RATE_LIMIT_PROBE_URL: ${RATE_LIMIT_PROBE_URL:-https://api.openai.com/v1/models}
@@ -22,11 +23,9 @@ services:
       OPENAI_REDIRECT_URI: ${OPENAI_REDIRECT_URI:-http://localhost:1455/auth/callback}
     volumes:
       - codex_auth:/root/.codex
-      - codex_profiles:/root/.codex-switch/profiles
-      - codex_callbacks:/root/.codex-switch/callbacks
+      - codex_switch:/root/.codex-switch
     restart: unless-stopped
 
 volumes:
   codex_auth:
-  codex_profiles:
-  codex_callbacks:
+  codex_switch:

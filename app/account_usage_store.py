@@ -344,6 +344,143 @@ def delete_account_data(account_id: str, db_path: Path | None = None) -> None:
         conn.execute("DELETE FROM accounts WHERE id = ?", (account_id,))
 
 
+def rename_account_data(
+    old_account_id: str,
+    new_account_id: str,
+    db_path: Path | None = None,
+) -> bool:
+    old_id = (old_account_id or "").strip()
+    new_id = (new_account_id or "").strip()
+    if not old_id or not new_id or old_id == new_id:
+        return False
+
+    with _connect(db_path) as conn:
+        _ensure_schema(conn)
+        conn.execute("BEGIN IMMEDIATE")
+        exists_old = conn.execute(
+            "SELECT 1 FROM accounts WHERE id = ?",
+            (old_id,),
+        ).fetchone()
+        if exists_old is None:
+            return False
+        exists_new = conn.execute(
+            "SELECT 1 FROM accounts WHERE id = ?",
+            (new_id,),
+        ).fetchone()
+        if exists_new is not None:
+            raise ValueError(f"Account data for '{new_id}' already exists")
+
+        conn.execute(
+            "UPDATE usage_rollovers SET account_id = ? WHERE account_id = ?",
+            (new_id, old_id),
+        )
+        conn.execute(
+            "UPDATE accounts SET id = ?, updated_at = ? WHERE id = ?",
+            (new_id, _to_iso(datetime.now(timezone.utc)), old_id),
+        )
+    return True
+
+
+def merge_account_data(
+    from_account_id: str,
+    into_account_id: str,
+    db_path: Path | None = None,
+) -> bool:
+    source_id = (from_account_id or "").strip()
+    target_id = (into_account_id or "").strip()
+    if not source_id or not target_id or source_id == target_id:
+        return False
+
+    with _connect(db_path) as conn:
+        _ensure_schema(conn)
+        conn.execute("BEGIN IMMEDIATE")
+
+        source = _get_account_row(conn, source_id)
+        if source is None:
+            return False
+        target = _get_account_row(conn, target_id)
+        if target is None:
+            conn.execute("UPDATE usage_rollovers SET account_id = ? WHERE account_id = ?", (target_id, source_id))
+            conn.execute("UPDATE accounts SET id = ?, updated_at = ? WHERE id = ?", (target_id, _to_iso(datetime.now(timezone.utc)), source_id))
+            return True
+
+        now_iso = _to_iso(datetime.now(timezone.utc))
+        merged_limit = max(int(source["usage_limit"]), int(target["usage_limit"]))
+        merged_window = max(int(source["usage_in_window"]), int(target["usage_in_window"]))
+        merged_lifetime = max(int(source["lifetime_used"]), int(target["lifetime_used"]))
+        merged_refresh = str(target["rate_limit_refresh_at"]) if str(target["rate_limit_refresh_at"]) >= str(source["rate_limit_refresh_at"]) else str(source["rate_limit_refresh_at"])
+        merged_window_type = str(target["rate_limit_window_type"]) or str(source["rate_limit_window_type"])
+        merged_provider = target["provider_account_id"] or source["provider_account_id"]
+        merged_name = target["name"] or source["name"]
+        merged_last_refreshed = target["rate_limit_last_refreshed_at"] or source["rate_limit_last_refreshed_at"]
+        merged_last_sync = target["last_usage_sync_at"] or source["last_usage_sync_at"]
+        merged_created = target["created_at"] if str(target["created_at"]) <= str(source["created_at"]) else source["created_at"]
+
+        conn.execute(
+            """
+            UPDATE accounts
+            SET provider_account_id = ?,
+                name = ?,
+                rate_limit_window_type = ?,
+                usage_limit = ?,
+                usage_in_window = ?,
+                rate_limit_refresh_at = ?,
+                rate_limit_last_refreshed_at = ?,
+                last_usage_sync_at = ?,
+                lifetime_used = ?,
+                created_at = ?,
+                updated_at = ?
+            WHERE id = ?
+            """,
+            (
+                merged_provider,
+                merged_name,
+                merged_window_type,
+                merged_limit,
+                merged_window,
+                merged_refresh,
+                merged_last_refreshed,
+                merged_last_sync,
+                merged_lifetime,
+                merged_created,
+                now_iso,
+                target_id,
+            ),
+        )
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO usage_rollovers (
+                account_id,
+                window_started_at,
+                window_ended_at,
+                usage_limit,
+                usage_used,
+                usage_wasted,
+                rolled_over_at
+            )
+            SELECT ?, window_started_at, window_ended_at, usage_limit, usage_used, usage_wasted, rolled_over_at
+            FROM usage_rollovers
+            WHERE account_id = ?
+            """,
+            (target_id, source_id),
+        )
+        conn.execute("DELETE FROM usage_rollovers WHERE account_id = ?", (source_id,))
+        conn.execute("DELETE FROM accounts WHERE id = ?", (source_id,))
+    return True
+
+
+def migrate_account_ids(id_map: dict[str, str], db_path: Path | None = None) -> int:
+    changed = 0
+    for old_id, new_id in id_map.items():
+        old = (old_id or "").strip()
+        new = (new_id or "").strip()
+        if not old or not new or old == new:
+            continue
+        if merge_account_data(old, new, db_path=db_path):
+            changed += 1
+    return changed
+
+
 def _refresh_account_window_if_needed_locked(
     conn: sqlite3.Connection, account_id: str, now_dt: datetime
 ) -> sqlite3.Row:

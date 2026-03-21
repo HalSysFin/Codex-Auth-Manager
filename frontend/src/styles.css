@@ -1,0 +1,145 @@
+:root {
+  color-scheme: dark;
+  font-family: "Space Grotesk", "Segoe UI", sans-serif;
+  background: #090c10;
+  color: #e9eef7;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  min-height: 100vh;
+  background:
+    radial-gradient(circle at 10% 10%, rgba(0, 212, 255, 0.14), transparent 35%),
+    radial-gradient(circle at 80% 20%, rgba(0, 255, 163, 0.1), transparent 40%),
+    #090c10;
+}
+
+.app-shell {
+  max-width: 1120px;
+  margin: 0 auto;
+  padding: 24px;
+}
+
+.topbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 20px;
+}
+
+.topbar h1 {
+  margin: 0;
+}
+
+.toolbar {
+  display: flex;
+  gap: 8px;
+}
+
+.panel {
+  background: rgba(14, 19, 26, 0.9);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 14px;
+  padding: 16px;
+  margin-bottom: 16px;
+}
+
+.panel-title {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 12px;
+}
+
+input {
+  width: 100%;
+  margin-top: 8px;
+  border-radius: 8px;
+  border: 1px solid rgba(255, 255, 255, 0.15);
+  background: #121922;
+  color: inherit;
+  padding: 10px;
+}
+
+button {
+  border: 1px solid rgba(255, 255, 255, 0.2);
+  background: #121922;
+  color: #e9eef7;
+  border-radius: 9px;
+  padding: 8px 12px;
+  cursor: pointer;
+}
+
+button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.notice {
+  padding: 10px 12px;
+  border-radius: 10px;
+  margin-bottom: 12px;
+}
+
+.notice.success {
+  background: rgba(34, 197, 94, 0.14);
+  border: 1px solid rgba(34, 197, 94, 0.4);
+}
+
+.notice.error {
+  background: rgba(239, 68, 68, 0.13);
+  border: 1px solid rgba(239, 68, 68, 0.4);
+}
+
+.table {
+  display: grid;
+  gap: 10px;
+}
+
+.row {
+  display: grid;
+  grid-template-columns: 2fr 1fr 1fr 1.4fr;
+  gap: 12px;
+  align-items: center;
+  border: 1px solid rgba(255, 255, 255, 0.06);
+  border-radius: 10px;
+  padding: 12px;
+}
+
+.row code {
+  display: block;
+  font-size: 12px;
+  opacity: 0.85;
+}
+
+.actions {
+  display: flex;
+  gap: 8px;
+  justify-content: flex-end;
+}
+
+@media (max-width: 860px) {
+  .topbar {
+    flex-direction: column;
+    align-items: flex-start;
+  }
+
+  .toolbar {
+    width: 100%;
+    flex-wrap: wrap;
+  }
+
+  .row {
+    grid-template-columns: 1fr;
+    gap: 6px;
+  }
+
+  .actions {
+    justify-content: flex-start;
+  }
+}

@@ -1,12 +1,13 @@
-# Codex Auth Manager (FastAPI)
+# Codex Auth Manager (FastAPI + React)
 
 Central orchestration service for Codex auth profiles.
 
 Primary architecture:
-- Codex CLI performs login and writes `~/.codex/auth.json`
-- `codex-switch` stores/switches labeled profiles
-- `auth-manager` orchestrates login status, import/labeling, API, and UI
-- Chrome extension relays fixed localhost OAuth callbacks to auth-manager when login runs on a remote management server
+- Codex CLI performs login and writes `CODEX_AUTH_PATH` (default `/root/.codex/auth.json`)
+- `codex-switch` stores/switches labeled profiles in `CODEX_PROFILES_DIR`
+- FastAPI backend owns auth/account persistence APIs
+- React + TypeScript + Vite frontend (`frontend/`) consumes backend APIs
+- Chrome extension relays localhost OAuth callbacks to auth-manager when login runs remotely
 
 Legacy callback/exchange routes are still available, but the primary happy path is now Codex CLI driven.
 
@@ -24,7 +25,7 @@ python -m venv .venv
 pip install -r requirements.txt
 ```
 
-## Run
+## Run (Local)
 
 ```bash
 uvicorn app.main:app --reload --port 8080
@@ -32,14 +33,22 @@ uvicorn app.main:app --reload --port 8080
 
 Open `http://localhost:8080/`.
 
+Frontend dev server:
+
+```bash
+cd frontend
+npm install
+npm run dev
+```
+
 ## Primary Flow
 
 1. Click **Add account** (or `POST /auth/login/start`) to launch Codex CLI login.
 2. Codex CLI produces/updates `CODEX_AUTH_PATH` (default `~/.codex/auth.json`).
-3. Click **Import current auth** (or `POST /auth/import-current`).
-4. auth-manager extracts email and derives a label when none is provided.
-5. auth-manager runs `codex-switch save --label <label>`.
-6. Switch later via UI or `POST /auth/switch`.
+3. Callback is relayed to the local Codex listener (`POST /auth/relay-callback`).
+4. Once auth finalizes and `auth.json` is updated, auth-manager auto-persists to the matched profile.
+5. If no matching profile exists, import/create is available via `POST /auth/import-current`.
+6. Switch later via UI/API with `POST /auth/switch`.
 
 ## Chrome Extension Relay Flow
 
@@ -58,15 +67,14 @@ Relay sequence:
 6. auth-manager stores callback for the login session and exposes state via `GET /auth/login/status`.
 
 Current Codex CLI handoff note:
-- Relayed callback is stored and observable.
-- Direct callback injection into a running Codex CLI process is not yet implemented.
-- Integration point exists in `app/codex_cli.py` (`relay_callback_to_login` TODO).
+- Relay callback handoff to localhost listener is implemented in `app/codex_cli.py` (`relay_callback_to_login`).
+- Callback receipt alone does not persist; persistence happens only after finalized auth is detected.
 
 ## Endpoints
 
 Core:
 - `GET /health`
-- `GET /` and `GET /ui` dashboard
+- `GET /` and `GET /ui` frontend app shell (React build)
 - `GET /api/accounts` list saved accounts + rate limit probes
 - `GET /auth/rate-limits` read active Codex session ChatGPT rate limits via `codex app-server`
 - `POST /auth/login/start` start Codex CLI login
@@ -97,7 +105,7 @@ This includes endpoints that expose raw auth JSON or mutate active auth state, i
 - `/internal/auths`
 - `/auth/login/start`
 
-The UI stores the token in `localStorage` key `internalToken` for convenience.
+The React frontend stores the API token in `localStorage` key `auth_manager_api_key` for convenience.
 
 ## Public Login Gate (Proxy + Internal Bypass)
 
@@ -125,10 +133,10 @@ Example `.env` values:
 ```env
 CODEX_CLI_BIN=codex
 CODEX_SWITCH_BIN=codex-switch
-CODEX_AUTH_PATH=~/.codex/auth.json
-CALLBACK_STORE_DIR=~/.codex-switch/callbacks
-CODEX_PROFILES_DIR=~/.codex-switch/profiles
-USAGE_DB_PATH=~/.codex-switch/auth-manager.sqlite3
+CODEX_AUTH_PATH=/root/.codex/auth.json
+CALLBACK_STORE_DIR=/root/.codex-switch/callbacks
+CODEX_PROFILES_DIR=/root/.codex-switch/profiles
+USAGE_DB_PATH=/root/.codex-switch/auth-manager.sqlite3
 LOGIN_SESSION_TTL_SECONDS=600
 WEB_LOGIN_USERNAME=
 WEB_LOGIN_PASSWORD=
@@ -161,16 +169,17 @@ Container defaults:
 - `CODEX_PROFILES_DIR=/root/.codex-switch/profiles`
 - `USAGE_DB_PATH=/root/.codex-switch/auth-manager.sqlite3`
 
-Persistent volumes:
+Persistent named volumes:
 - `/root/.codex`
-- `/root/.codex-switch/profiles`
-- `/root/.codex-switch/callbacks`
+- `/root/.codex-switch`
+
+No host Codex bind mounts are required; container state is isolated by default.
 
 Note: Dockerfile assumes Codex CLI and `codex-switch` can be installed via npm (`@openai/codex` and `codex-switch`). Override build arg `CODEX_INSTALL_CMD` if your install command differs.
 
 ## Chrome Extension Dev Setup
 
-Extension files are in `extension/`:
+Extension files are in `chrome-extension/`:
 - `manifest.json`
 - `background.js`
 - `popup.html` / `popup.js`
@@ -182,7 +191,7 @@ To load unpacked in Chrome:
 1. Open `chrome://extensions`.
 2. Enable **Developer mode**.
 3. Click **Load unpacked**.
-4. Select the `extension/` folder from this repo.
+4. Select the `chrome-extension/` folder from this repo.
 5. Open extension settings (Details -> Extension options) and set:
    - Auth Manager Base URL
    - Internal API Bearer Token (only if `INTERNAL_API_TOKEN` is enabled server-side)

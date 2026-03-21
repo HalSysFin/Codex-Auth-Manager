@@ -1,10 +1,10 @@
 from __future__ import annotations
 
-import base64
 import hmac
 import ipaddress
 import json
 import logging
+import re
 import secrets
 import asyncio
 from dataclasses import dataclass
@@ -18,14 +18,25 @@ from urllib.parse import parse_qs, quote, urlparse
 import httpx
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
+from fastapi.staticfiles import StaticFiles
 
 from .accounts import AccountProfile, list_profiles
+from .account_identity import (
+    decode_jwt_claims,
+    extract_access_token,
+    extract_account_identity,
+    extract_email,
+    extract_id_token,
+)
 from .account_usage_store import (
     delete_account_data,
     ensure_account,
     get_account,
     initialize_usage_store,
     list_usage_rollovers,
+    merge_account_data,
+    migrate_account_ids,
+    rename_account_data,
     record_account_usage,
     reconcile_due_accounts,
     sync_account_usage_snapshot,
@@ -40,7 +51,6 @@ from .codex_cli import (
     CodexCLIError,
     cancel_login,
     derive_label,
-    extract_email,
     get_login_status,
     read_rate_limits_via_app_server,
     read_current_auth,
@@ -70,6 +80,11 @@ app = FastAPI(title="Codex Auth Manager", version="0.2.0")
 logger = logging.getLogger(__name__)
 _RECONCILE_INTERVAL_SECONDS = 600
 _reconcile_task: asyncio.Task[None] | None = None
+LABEL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+_FRONTEND_DIST = Path(__file__).resolve().parents[1] / "frontend" / "dist"
+
+if (_FRONTEND_DIST / "assets").exists():
+    app.mount("/assets", StaticFiles(directory=str(_FRONTEND_DIST / "assets")), name="frontend-assets")
 
 
 @dataclass
@@ -78,6 +93,7 @@ class PersistCurrentAuthResult:
     skipped: bool
     reason: str
     label: str | None
+    account_key: str | None
     email: str | None
     matched_existing_profile: bool
     created_new_profile: bool
@@ -88,6 +104,7 @@ class PersistCurrentAuthResult:
 @app.on_event("startup")
 async def on_startup() -> None:
     initialize_usage_store()
+    _migrate_usage_keys_from_labels()
     global _reconcile_task
     if _reconcile_task is None:
         _reconcile_task = asyncio.create_task(_periodic_reconcile_usage_windows())
@@ -190,22 +207,22 @@ async def logout(request: Request) -> RedirectResponse:
 
 @app.get("/")
 async def index() -> HTMLResponse:
-    return HTMLResponse(_render_index())
+    return _spa_or_legacy_index()
 
 
 @app.get("/ui")
 async def ui() -> HTMLResponse:
-    return HTMLResponse(_render_index())
+    return _spa_or_legacy_index()
 
 
 @app.get("/ui/accounts/{label}")
 async def ui_account_usage(label: str) -> HTMLResponse:
-    return HTMLResponse(_render_account_usage_page(label))
+    return _spa_or_legacy_index()
 
 
 @app.get("/ui/stats")
 async def ui_usage_stats() -> HTMLResponse:
-    return HTMLResponse(_render_usage_stats_page())
+    return _spa_or_legacy_index()
 
 
 @app.get("/oauth/callback")
@@ -354,6 +371,7 @@ async def auth_login_status(wait_seconds: int = 0, session_id: str | None = None
                     "status": "persisted" if persist_result.persisted else "skipped",
                     "reason": persist_result.reason,
                     "label": persist_result.label,
+                    "account_key": persist_result.account_key,
                     "email": persist_result.email,
                     "matched_existing_profile": persist_result.matched_existing_profile,
                     "created_new_profile": persist_result.created_new_profile,
@@ -584,6 +602,42 @@ async def import_current_auth(request: Request, payload: dict[str, Any] | None =
         {
             "status": "imported",
             "label": persist_result.label,
+            "account_key": persist_result.account_key,
+            "email": persist_result.email,
+            "matched_existing_profile": persist_result.matched_existing_profile,
+            "saved": persist_result.persisted or persist_result.up_to_date,
+            "created_new_profile": persist_result.created_new_profile,
+            "up_to_date": persist_result.up_to_date,
+            "codex_switch": persist_result.codex_switch,
+        }
+    )
+
+
+@app.post("/auth/import-json")
+async def import_auth_json(request: Request, payload: dict[str, Any] | None = None) -> JSONResponse:
+    _require_internal_auth(request)
+    raw_auth = (payload or {}).get("auth_json") if payload else None
+    desired_label = (payload or {}).get("label") if payload else None
+
+    if not isinstance(raw_auth, dict):
+        raise HTTPException(status_code=400, detail="auth_json object is required")
+
+    try:
+        persist_result = _persist_current_auth_to_profile(
+            desired_label=(str(desired_label) if desired_label is not None else None),
+            create_if_missing=True,
+            auth_json=raw_auth,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except (AuthStoreError, CodexSwitchError) as exc:
+        raise _to_switch_http_error(exc) from exc
+
+    return JSONResponse(
+        {
+            "status": "imported",
+            "label": persist_result.label,
+            "account_key": persist_result.account_key,
             "email": persist_result.email,
             "matched_existing_profile": persist_result.matched_existing_profile,
             "saved": persist_result.persisted or persist_result.up_to_date,
@@ -601,10 +655,14 @@ async def auth_switch(request: Request, payload: dict[str, Any]) -> JSONResponse
     if not label:
         raise HTTPException(status_code=400, detail="label is required")
 
+    profile = _profile_for_label(label)
+    switched_account_key = profile.account_key if profile is not None else None
+
     try:
         result = switch_label(label)
         now_current = _resolve_current_label(read_current_auth(), list_profiles())
-        _touch_account_usage(profile_label=label, profile_email=None)
+        if profile is not None:
+            _touch_account_usage(profile=profile)
     except CodexSwitchError as exc:
         raise _to_switch_http_error(exc) from exc
     except CodexCLIError:
@@ -614,6 +672,7 @@ async def auth_switch(request: Request, payload: dict[str, Any]) -> JSONResponse
         {
             "status": "switched",
             "label": label,
+            "account_key": switched_account_key,
             "current_label": now_current or label,
             "codex_switch": {
                 "command": result.command,
@@ -635,13 +694,100 @@ async def auth_delete(request: Request, payload: dict[str, Any]) -> JSONResponse
     if not profile_path.exists():
         raise HTTPException(status_code=404, detail="Label not found")
 
+    profile = _profile_for_label(label)
+    usage_key = profile.account_key if profile else label
+
     try:
         profile_path.unlink()
-        delete_account_data(label)
+        delete_account_data(usage_key)
     except OSError as exc:
         raise HTTPException(status_code=500, detail=f"Unable to delete profile: {exc}") from exc
 
     return JSONResponse({"status": "deleted", "label": label})
+
+
+@app.post("/auth/rename")
+async def auth_rename(request: Request, payload: dict[str, Any]) -> JSONResponse:
+    _require_internal_auth(request)
+    old_label = str(payload.get("old_label", "")).strip()
+    new_label = str(payload.get("new_label", "")).strip()
+    if not old_label or not new_label:
+        raise HTTPException(status_code=400, detail="old_label and new_label are required")
+    if old_label == new_label:
+        return JSONResponse({"status": "unchanged", "label": old_label})
+    if not LABEL_RE.match(new_label):
+        raise HTTPException(
+            status_code=400,
+            detail="new_label must be 1-64 chars and contain only letters, numbers, dot, underscore, or dash",
+        )
+
+    profiles_dir = settings.profiles_dir()
+    source = profiles_dir / f"{old_label}.json"
+    target = profiles_dir / f"{new_label}.json"
+    if not source.exists():
+        raise HTTPException(status_code=404, detail="old_label not found")
+    merged_duplicate = False
+    if target.exists():
+        try:
+            source_auth = json.loads(source.read_text())
+            target_auth = json.loads(target.read_text())
+        except (OSError, ValueError):
+            source_auth = None
+            target_auth = None
+
+        source_email = extract_email(source_auth) if isinstance(source_auth, dict) else None
+        target_email = extract_email(target_auth) if isinstance(target_auth, dict) else None
+        source_token = extract_access_token(source_auth)
+        target_token = extract_access_token(target_auth)
+        same_identity = False
+        if source_email and target_email and source_email.strip().lower() == target_email.strip().lower():
+            same_identity = True
+        if source_token and target_token and source_token == target_token:
+            same_identity = True
+        if not same_identity:
+            raise HTTPException(status_code=409, detail="new_label already exists")
+        try:
+            target.unlink()
+            merged_duplicate = True
+        except OSError as exc:
+            raise HTTPException(status_code=500, detail=f"Unable to replace duplicate profile: {exc}") from exc
+        with suppress(Exception):
+            delete_account_data(new_label)
+
+    try:
+        source.rename(target)
+    except OSError as exc:
+        raise HTTPException(status_code=500, detail=f"Unable to rename profile: {exc}") from exc
+
+    with suppress(Exception):
+        rename_account_data(old_label, new_label)
+    with suppress(Exception):
+        renamed_profile = _profile_for_label(new_label)
+        if renamed_profile is not None:
+            merge_account_data(old_label, renamed_profile.account_key)
+
+    now_current = None
+    was_current = False
+    try:
+        was_current = current_label() == old_label
+    except CodexSwitchError:
+        was_current = False
+    if was_current:
+        try:
+            switch_label(new_label)
+            now_current = new_label
+        except CodexSwitchError:
+            now_current = None
+
+    return JSONResponse(
+        {
+            "status": "renamed",
+            "old_label": old_label,
+            "label": new_label,
+            "current_label": now_current,
+            "merged_duplicate": merged_duplicate,
+        }
+    )
 
 
 @app.get("/auth/current")
@@ -662,6 +808,7 @@ async def auth_current() -> JSONResponse:
     try:
         auth_json = read_current_auth()
         email = extract_email(auth_json)
+        identity = extract_account_identity(auth_json)
         current = _resolve_current_label(auth_json, list_profiles())
     except CodexCLIError as exc:
         return JSONResponse(
@@ -678,6 +825,7 @@ async def auth_current() -> JSONResponse:
         {
             "auth": meta,
             "email": email,
+            "account_key": identity.account_key,
             "current_label": current,
             "current_display_label": _display_label(current, email),
             "status": "ok",
@@ -702,10 +850,11 @@ async def auth_rate_limits(request: Request) -> JSONResponse:
         if current_label:
             current_profile = next((p for p in profiles if p.label == current_label), None)
             current_email = current_profile.email if current_profile else None
-            _touch_account_usage(profile_label=current_label, profile_email=current_email)
+            if current_profile is not None:
+                _touch_account_usage(profile=current_profile)
             snapshot = _extract_limit_snapshot(result.rate_limits)
             sync_account_usage_snapshot(
-                current_label,
+                current_profile.account_key if current_profile else current_label,
                 usage_limit=snapshot["usage_limit"],
                 usage_used=snapshot["usage_used"],
                 rate_limit_window_type=snapshot["window_type"],
@@ -832,11 +981,12 @@ async def api_accounts(request: Request) -> JSONResponse:
         results.append(
             {
                 "label": profile.label,
+                "account_key": profile.account_key,
                 "display_label": _display_label(profile.label, profile.email),
                 "email": profile.email,
                 "is_current": profile.label == current,
                 "rate_limits": final_rate_info,
-                "usage_tracking": _usage_tracking_payload(profile.label),
+                "usage_tracking": _usage_tracking_payload(profile.account_key),
             }
         )
 
@@ -857,14 +1007,15 @@ async def api_account_usage_history(request: Request, label: str) -> JSONRespons
         if isinstance(rate_info, dict):
             _sync_profile_usage_from_probe(profile, rate_info)
 
-    _touch_account_usage(profile_label=profile.label, profile_email=profile.email)
-    usage = _usage_tracking_payload(profile.label)
-    rollovers = list_usage_rollovers(profile.label)
+    _touch_account_usage(profile=profile)
+    usage = _usage_tracking_payload(profile.account_key)
+    rollovers = list_usage_rollovers(profile.account_key)
     summary = _rollover_summary(rollovers, usage)
 
     return JSONResponse(
         {
             "label": profile.label,
+            "account_key": profile.account_key,
             "display_label": _display_label(profile.label, profile.email),
             "email": profile.email,
             "usage_tracking": usage,
@@ -892,8 +1043,8 @@ async def api_usage_stats(request: Request) -> JSONResponse:
     }
 
     for profile in profiles:
-        usage = _usage_tracking_payload(profile.label)
-        rollovers = list_usage_rollovers(profile.label)
+        usage = _usage_tracking_payload(profile.account_key)
+        rollovers = list_usage_rollovers(profile.account_key)
         summary = _rollover_summary(rollovers, usage)
         all_rollovers.extend(rollovers)
 
@@ -906,6 +1057,7 @@ async def api_usage_stats(request: Request) -> JSONResponse:
         per_account.append(
             {
                 "label": profile.label,
+                "account_key": profile.account_key,
                 "display_label": _display_label(profile.label, profile.email),
                 "email": profile.email,
                 "usage_tracking": usage,
@@ -993,6 +1145,34 @@ def _to_switch_http_error(exc: Exception) -> HTTPException:
             },
         )
     return HTTPException(status_code=500, detail=str(exc))
+
+
+def _migrate_usage_keys_from_labels() -> None:
+    profiles = list_profiles()
+    if not profiles:
+        return
+    id_map: dict[str, str] = {}
+    for profile in profiles:
+        if not profile.account_key:
+            continue
+        id_map[profile.label] = profile.account_key
+    if not id_map:
+        return
+    migrated = migrate_account_ids(id_map)
+    if migrated:
+        logger.info("migrated %s legacy usage account id(s) from labels to canonical keys", migrated)
+
+
+def _spa_or_legacy_index() -> HTMLResponse:
+    index_path = _FRONTEND_DIST / "index.html"
+    if index_path.exists():
+        return HTMLResponse(index_path.read_text(encoding="utf-8"))
+    return HTMLResponse(
+        "<html><body><h1>Frontend build not found</h1>"
+        "<p>Run <code>cd frontend && npm run build</code> and restart the service.</p>"
+        "</body></html>",
+        status_code=503,
+    )
 
 
 def _store_callback(payload: Any) -> Path:
@@ -1358,33 +1538,28 @@ def _parse_int(value: str | None) -> int | None:
 def _touch_profiles_usage(profiles: list[AccountProfile]) -> None:
     now = datetime.now(timezone.utc)
     for profile in profiles:
-        _touch_account_usage(
-            profile_label=profile.label,
-            profile_email=profile.email,
-            now=now,
-        )
+        _touch_account_usage(profile=profile, now=now)
 
 
 def _touch_account_usage(
     *,
-    profile_label: str,
-    profile_email: str | None,
+    profile: AccountProfile,
     now: datetime | None = None,
 ) -> None:
     moment = now or datetime.now(timezone.utc)
     try:
         ensure_account(
-            profile_label,
+            profile.account_key,
             moment,
-            provider_account_id=profile_email,
-            name=profile_email,
+            provider_account_id=profile.provider_account_id,
+            name=profile.name or profile.email,
             rate_limit_window_type=None,
             usage_limit=None,
         )
         # Activity-driven refresh path; delta may be 0 when no concrete usage delta is known.
-        record_account_usage(profile_label, 0, now=moment)
+        record_account_usage(profile.account_key, 0, now=moment)
     except Exception:
-        logger.exception("Unable to touch usage account for label=%s", profile_label)
+        logger.exception("Unable to touch usage account for key=%s", profile.account_key)
 
 
 def _sync_profile_usage_from_probe(profile: AccountProfile, rate_info: dict[str, Any]) -> None:
@@ -1400,17 +1575,17 @@ def _sync_profile_usage_from_probe(profile: AccountProfile, rate_info: dict[str,
     refresh_at = _parse_probe_reset_to_iso(reset)
     try:
         sync_account_usage_snapshot(
-            profile.label,
+            profile.account_key,
             usage_limit=limit,
             usage_used=used,
             rate_limit_window_type="daily",
             rate_limit_refresh_at=refresh_at,
-            provider_account_id=profile.email,
-            name=profile.email,
+            provider_account_id=profile.provider_account_id,
+            name=profile.name or profile.email,
             now=datetime.now(timezone.utc),
         )
     except Exception:
-        logger.exception("Unable to sync probe usage for label=%s", profile.label)
+        logger.exception("Unable to sync probe usage for key=%s", profile.account_key)
 
 
 def _sync_profile_usage_from_session_limits(profile: AccountProfile, rate_info: dict[str, Any]) -> None:
@@ -1423,17 +1598,17 @@ def _sync_profile_usage_from_session_limits(profile: AccountProfile, rate_info: 
         return
     try:
         sync_account_usage_snapshot(
-            profile.label,
+            profile.account_key,
             usage_limit=snapshot["usage_limit"],
             usage_used=snapshot["usage_used"],
             rate_limit_window_type=snapshot["window_type"],
             rate_limit_refresh_at=snapshot["refresh_at"],
-            provider_account_id=profile.email,
-            name=profile.email,
+            provider_account_id=profile.provider_account_id,
+            name=profile.name or profile.email,
             now=datetime.now(timezone.utc),
         )
     except Exception:
-        logger.exception("Unable to sync session usage for label=%s", profile.label)
+        logger.exception("Unable to sync session usage for key=%s", profile.account_key)
 
 
 def _parse_probe_reset_to_iso(reset: Any) -> str | None:
@@ -1550,8 +1725,8 @@ def _account_name(account_payload: dict[str, Any] | None, fallback_email: str | 
     return fallback_email
 
 
-def _usage_tracking_payload(label: str) -> dict[str, Any] | None:
-    state = get_account(label)
+def _usage_tracking_payload(account_key: str) -> dict[str, Any] | None:
+    state = get_account(account_key)
     if state is None:
         return None
     return {
@@ -1574,10 +1749,11 @@ def _persist_current_auth_to_profile(
     auth_json: dict[str, Any] | None = None,
 ) -> PersistCurrentAuthResult:
     resolved_auth = auth_json if isinstance(auth_json, dict) else read_current_auth()
-    email = extract_email(resolved_auth)
+    identity = extract_account_identity(resolved_auth)
+    email = identity.email
     existing = set(list_labels())
     profiles = _dedupe_profiles(list_profiles())
-    matched_profile = _find_matching_profile(profiles, resolved_auth, email)
+    matched_profile = _find_matching_profile(profiles, resolved_auth, identity)
 
     if desired_label is not None:
         label = desired_label.strip()
@@ -1596,6 +1772,7 @@ def _persist_current_auth_to_profile(
             skipped=True,
             reason="no_matching_profile",
             label=None,
+            account_key=identity.account_key,
             email=email,
             matched_existing_profile=False,
             created_new_profile=False,
@@ -1605,12 +1782,13 @@ def _persist_current_auth_to_profile(
 
     current_for_label = next((p for p in profiles if p.label == label), None)
     if current_for_label is not None and current_for_label.auth == resolved_auth:
-        _touch_account_usage(profile_label=label, profile_email=email)
+        _touch_account_usage(profile=current_for_label)
         return PersistCurrentAuthResult(
             persisted=False,
             skipped=True,
             reason="up_to_date",
             label=label,
+            account_key=current_for_label.account_key,
             email=email,
             matched_existing_profile=matched_profile is not None,
             created_new_profile=False,
@@ -1620,12 +1798,25 @@ def _persist_current_auth_to_profile(
 
     persist_current_auth(resolved_auth)
     switch_save = save_current_auth_under_label(label)
-    _touch_account_usage(profile_label=label, profile_email=email)
+    profile_for_usage = matched_profile or AccountProfile(
+        label=label,
+        path=settings.profiles_dir() / f"{label}.json",
+        auth=resolved_auth,
+        account_key=identity.account_key,
+        subject=identity.subject,
+        user_id=identity.user_id,
+        provider_account_id=identity.account_id,
+        name=identity.name,
+        access_token=extract_access_token(resolved_auth),
+        email=email,
+    )
+    _touch_account_usage(profile=profile_for_usage)
     return PersistCurrentAuthResult(
         persisted=True,
         skipped=False,
         reason="persisted",
         label=label,
+        account_key=profile_for_usage.account_key,
         email=email,
         matched_existing_profile=matched_profile is not None,
         created_new_profile=created_new_profile,
@@ -1641,11 +1832,14 @@ def _persist_current_auth_to_profile(
 def _find_matching_profile(
     profiles: list[AccountProfile],
     auth_json: dict[str, Any],
-    email: str | None,
+    identity: Any,
 ) -> AccountProfile | None:
-    incoming_email = (email or "").strip().lower()
-    incoming_token = _extract_token(auth_json)
+    incoming_email = (identity.email or "").strip().lower() if getattr(identity, "email", None) else ""
+    incoming_key = getattr(identity, "account_key", None)
+    incoming_token = extract_access_token(auth_json)
     for profile in profiles:
+        if incoming_key and profile.account_key == incoming_key:
+            return profile
         profile_email = (profile.email or "").strip().lower()
         if incoming_email and profile_email and incoming_email == profile_email:
             return profile
@@ -1679,6 +1873,8 @@ def _dedupe_profiles(profiles: list[AccountProfile]) -> list[AccountProfile]:
 
 
 def _profile_identity_key(profile: AccountProfile) -> str:
+    if profile.account_key and profile.account_key != "unknown":
+        return f"account:{profile.account_key}"
     email = (profile.email or "").strip().lower()
     if email:
         return f"email:{email}"
@@ -1766,8 +1962,11 @@ def _resolve_current_label(
     except CodexSwitchError:
         pass
 
-    token = _extract_token(current_auth)
+    current_identity = extract_account_identity(current_auth)
+    token = extract_access_token(current_auth)
     for profile in profiles:
+        if current_identity.account_key and profile.account_key == current_identity.account_key:
+            return profile.label
         if profile.auth == current_auth:
             return profile.label
         if token and profile.access_token and profile.access_token == token:
@@ -1778,64 +1977,16 @@ def _resolve_current_label(
 def _display_label(label: str | None, email: str | None) -> str | None:
     if not label:
         return None
-    if not email:
-        return label
-    local = email.split("@", 1)[0].strip().lower()
-    if not local:
-        return label
-    return local
-
-
-def _extract_token(payload: Any) -> str | None:
-    if isinstance(payload, dict):
-        for key in ["access_token", "accessToken", "token", "api_key", "apiKey"]:
-            value = payload.get(key)
-            if isinstance(value, str) and value.strip():
-                return value.strip()
-        for value in payload.values():
-            found = _extract_token(value)
-            if found:
-                return found
-    elif isinstance(payload, list):
-        for item in payload:
-            found = _extract_token(item)
-            if found:
-                return found
-    return None
-
-
-def _extract_id_token(payload: Any) -> str | None:
-    if isinstance(payload, dict):
-        for key in ["id_token", "idToken"]:
-            value = payload.get(key)
-            if isinstance(value, str) and value.strip():
-                return value.strip()
-        for value in payload.values():
-            found = _extract_id_token(value)
-            if found:
-                return found
-    elif isinstance(payload, list):
-        for item in payload:
-            found = _extract_id_token(item)
-            if found:
-                return found
-    return None
-
-
-def _decode_jwt_claims(token: str) -> dict[str, Any] | None:
-    parts = token.split(".")
-    if len(parts) < 2:
-        return None
-    payload = parts[1]
-    padding = "=" * ((4 - (len(payload) % 4)) % 4)
-    try:
-        decoded = base64.urlsafe_b64decode((payload + padding).encode("ascii"))
-        claims = json.loads(decoded.decode("utf-8", errors="replace"))
-    except (ValueError, OSError):
-        return None
-    if isinstance(claims, dict):
-        return claims
-    return None
+    # For legacy auto-generated UUID labels, prefer email local-part as display.
+    if re.fullmatch(
+        r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}",
+        label,
+    ):
+        if not email:
+            return label
+        local = email.split("@", 1)[0].strip().lower()
+        return local or label
+    return label
 
 
 def _validate_relay_finalized_auth(
@@ -1844,11 +1995,11 @@ def _validate_relay_finalized_auth(
     started_at_iso: str | None,
 ) -> dict[str, Any]:
     now = datetime.now(timezone.utc)
-    access_token = _extract_token(auth_json)
+    access_token = extract_access_token(auth_json)
     if not access_token:
         return {"ok": False, "reason": "missing_access_token", "message": "No access token found in finalized auth."}
 
-    access_claims = _decode_jwt_claims(access_token)
+    access_claims = decode_jwt_claims(access_token)
     if not access_claims:
         return {"ok": False, "reason": "invalid_access_token", "message": "Unable to decode finalized access token."}
 
@@ -1887,10 +2038,10 @@ def _validate_relay_finalized_auth(
             "login_started_at": started_dt.isoformat(),
         }
 
-    id_token = _extract_id_token(auth_json)
+    id_token = extract_id_token(auth_json)
     email = None
     if id_token:
-        id_claims = _decode_jwt_claims(id_token)
+        id_claims = decode_jwt_claims(id_token)
         if id_claims:
             maybe_email = id_claims.get("email")
             if isinstance(maybe_email, str) and maybe_email.strip():
@@ -2718,6 +2869,20 @@ def _render_index() -> str:
 
       .acct-actions{display:flex;gap:6px}
       .acct-actions a{text-decoration:none}
+      .actions-menu{position:relative;display:inline-block}
+      .actions-menu .btn{min-width:96px;justify-content:space-between}
+      .actions-panel{
+        position:absolute;right:0;top:calc(100% + 6px);z-index:25;display:none;min-width:170px;
+        background:var(--surface);border:1px solid var(--border);border-radius:10px;padding:6px;
+        box-shadow:0 14px 28px rgba(0,0,0,.35);
+      }
+      .actions-menu.open .actions-panel{display:block}
+      .menu-item{
+        width:100%;height:34px;display:flex;align-items:center;padding:0 10px;border:0;background:transparent;
+        color:var(--text);font-size:.82rem;border-radius:8px;cursor:pointer;text-align:left;
+      }
+      .menu-item:hover{background:var(--surface-hi)}
+      .menu-item.danger{color:#fca5a5}
 
       /* empty state */
       .empty-state{
@@ -2745,6 +2910,24 @@ def _render_index() -> str:
         font-size:.82rem;resize:vertical;
       }
       #callbackHint{font-size:.8rem;color:var(--dim);min-height:20px}
+      #importLabelInput,#importJsonInput{
+        width:100%;border:1px solid var(--border);background:var(--bg);color:var(--text);
+        border-radius:10px;padding:10px 12px;font-family:'Inter',sans-serif;font-size:.84rem;
+      }
+      #importLabelInput{height:38px;padding:0 12px}
+      #importJsonInput{
+        height:150px;resize:vertical;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;
+      }
+      #importFileInput{
+        width:100%;padding:8px;border:1px dashed var(--border);border-radius:10px;background:var(--bg);
+        color:var(--dim);font-size:.8rem;
+      }
+      #importHint{font-size:.8rem;color:var(--dim);min-height:20px}
+      #editProfileInput{
+        width:100%;height:38px;border:1px solid var(--border);background:var(--bg);color:var(--text);
+        border-radius:10px;padding:0 12px;font-family:'Inter',sans-serif;font-size:.85rem;
+      }
+      #editProfileHint{font-size:.8rem;color:var(--dim);min-height:20px}
 
       /* ── RESPONSIVE ───────────────────────── */
       @media(max-width:860px){
@@ -2818,6 +3001,40 @@ def _render_index() -> str:
           </div>
         </div>
       </div>
+      <div id="editProfileModal" class="callback-modal" role="dialog" aria-modal="true" aria-labelledby="editProfileTitle">
+        <div class="callback-card" style="width:min(520px,95vw)">
+          <div id="editProfileTitle" class="callback-title">Edit Profile Name</div>
+          <div class="callback-sub">Change the saved profile label used by switch/export operations.</div>
+          <input id="editProfileInput" type="text" maxlength="64" autocomplete="off" />
+          <div id="editProfileHint"></div>
+          <div class="callback-row" style="justify-content:flex-end;margin-top:8px">
+            <button id="cancelEditProfile" class="btn btn-sm" type="button">Cancel</button>
+            <button id="saveEditProfile" class="btn btn-primary btn-sm" type="button">Save</button>
+          </div>
+        </div>
+      </div>
+      <div id="importModal" class="callback-modal" role="dialog" aria-modal="true" aria-labelledby="importModalTitle">
+        <div class="callback-card" style="width:min(760px,95vw)">
+          <div id="importModalTitle" class="callback-title">Import Auth Credentials</div>
+          <div class="callback-sub">Import current local auth, or paste/upload auth JSON from another machine.</div>
+          <div class="callback-row" style="align-items:flex-start">
+            <div style="flex:1;min-width:220px">
+              <div class="callback-sub" style="margin:0 0 6px 0">Optional profile label</div>
+              <input id="importLabelInput" type="text" maxlength="64" placeholder="Leave blank for auto label" />
+            </div>
+          </div>
+          <div class="callback-sub" style="margin:8px 0 6px 0">Paste auth JSON</div>
+          <textarea id="importJsonInput" placeholder='{"auth_mode":"chatgpt","tokens":{"access_token":"..."}}'></textarea>
+          <div class="callback-sub" style="margin:10px 0 6px 0">Or upload auth JSON file</div>
+          <input id="importFileInput" type="file" accept="application/json,.json" />
+          <div id="importHint"></div>
+          <div class="callback-row" style="justify-content:flex-end;margin-top:8px">
+            <button id="cancelImport" class="btn btn-sm" type="button">Cancel</button>
+            <button id="importCurrentModalBtn" class="btn btn-sm" type="button">Import Current</button>
+            <button id="importJsonModalBtn" class="btn btn-primary btn-sm" type="button">Import JSON</button>
+          </div>
+        </div>
+      </div>
 
       <!-- TWO COLUMN LAYOUT -->
       <div class="two-col">
@@ -2867,7 +3084,7 @@ def _render_index() -> str:
 
         <!-- RIGHT: MAIN -->
         <main>
-          <div class="panel" style="padding:0;overflow:hidden">
+          <div class="panel" style="padding:0;overflow:visible">
             <div style="padding:16px 20px;border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:space-between">
               <div class="panel-title" style="margin:0">Saved Profiles</div>
               <span class="pill" id="accountCount">0 accounts</span>
@@ -2891,7 +3108,16 @@ def _render_index() -> str:
       const callbackUrlInputEl = $("callbackUrlInput");
       const callbackHintEl = $("callbackHint");
       const callbackSessionMetaEl = $("callbackSessionMeta");
+      const editProfileModalEl = $("editProfileModal");
+      const editProfileInputEl = $("editProfileInput");
+      const editProfileHintEl = $("editProfileHint");
+      const importModalEl = $("importModal");
+      const importLabelInputEl = $("importLabelInput");
+      const importJsonInputEl = $("importJsonInput");
+      const importFileInputEl = $("importFileInput");
+      const importHintEl = $("importHint");
       let pendingRelay = null;
+      let pendingRenameLabel = null;
 
       const getToken = () => (localStorage.getItem("internalToken") || "").trim();
 
@@ -3014,11 +3240,17 @@ def _render_index() -> str:
           <td data-label="Rate Limits">${limitsHtml}</td>
           <td data-label="Rate Limit Reset">${resetHtml}</td>
           <td data-label="Actions"><div class="acct-actions">
-            <button class="btn btn-sm ${isActive ? "" : "btn-primary"}" type="button" data-action="switch" data-label="${account.label}">${isActive ? "Current" : "Switch"}</button>
-            <button class="btn btn-sm" type="button" data-action="delete" data-label="${account.label}" style="border-color:rgba(239,68,68,.35);color:#fca5a5">Delete</button>
-            <button class="btn btn-sm btn-icon" type="button" data-action="export" data-label="${account.label}" title="Export">
-              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
-            </button>
+            <div class="actions-menu" data-menu-root>
+              <button class="btn btn-sm" type="button" data-action="menu" data-label="${account.label}">Actions
+                <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg>
+              </button>
+              <div class="actions-panel">
+                <button class="menu-item" type="button" data-action="switch" data-label="${account.label}">${isActive ? "Switch (Current)" : "Switch"}</button>
+                <button class="menu-item" type="button" data-action="edit" data-label="${account.label}" data-display="${displayLabel}">Change profile label</button>
+                <button class="menu-item" type="button" data-action="export" data-label="${account.label}">Export</button>
+                <button class="menu-item danger" type="button" data-action="delete" data-label="${account.label}">Delete</button>
+              </div>
+            </div>
           </div></td>
         </tr>`;
       }
@@ -3215,16 +3447,50 @@ def _render_index() -> str:
       }
 
       async function importCurrent() {
-        const lbl = window.prompt("Optional label (leave empty for auto):", "");
-        if (lbl === null) {
-          setStatus("Import canceled.");
-          return;
-        }
-        const body = lbl && lbl.trim() ? { label: lbl.trim() } : {};
+        const lbl = importLabelInputEl.value.trim();
+        const body = lbl ? { label: lbl } : {};
         const res = await apiFetch("/auth/import-current", { method: "POST", body: JSON.stringify(body) });
         if (!res.ok) throw new Error(await readError(res, "Import failed"));
         const data = await res.json();
         setStatus("Imported current auth as '" + data.label + "'");
+      }
+
+      function openImportModal() {
+        importHintEl.textContent = "";
+        importJsonInputEl.value = "";
+        importFileInputEl.value = "";
+        importLabelInputEl.value = "";
+        importModalEl.classList.add("open");
+      }
+
+      function closeImportModal() {
+        importModalEl.classList.remove("open");
+      }
+
+      async function parseImportedAuthJson() {
+        const pasted = importJsonInputEl.value.trim();
+        if (pasted) {
+          try { return JSON.parse(pasted); }
+          catch (_) { throw new Error("Pasted JSON is invalid."); }
+        }
+        const file = importFileInputEl.files && importFileInputEl.files[0];
+        if (file) {
+          const txt = await file.text();
+          try { return JSON.parse(txt); }
+          catch (_) { throw new Error("Uploaded file is not valid JSON."); }
+        }
+        throw new Error("Paste JSON or upload a JSON file first.");
+      }
+
+      async function importProvidedJson() {
+        const authJson = await parseImportedAuthJson();
+        const lbl = importLabelInputEl.value.trim();
+        const body = { auth_json: authJson };
+        if (lbl) body.label = lbl;
+        const res = await apiFetch("/auth/import-json", { method: "POST", body: JSON.stringify(body) });
+        if (!res.ok) throw new Error(await readError(res, "Import JSON failed"));
+        const data = await res.json();
+        setStatus("Imported credentials as '" + data.label + "'");
       }
 
       async function switchProfile(label) {
@@ -3251,21 +3517,58 @@ def _render_index() -> str:
         setStatus("Deleted '" + label + "'");
       }
 
+      function openEditProfileModal(label) {
+        pendingRenameLabel = label;
+        editProfileInputEl.value = label;
+        editProfileHintEl.textContent = "";
+        editProfileModalEl.classList.add("open");
+        setTimeout(() => editProfileInputEl.focus(), 0);
+      }
+
+      function closeEditProfileModal() {
+        editProfileModalEl.classList.remove("open");
+        pendingRenameLabel = null;
+      }
+
+      async function renameProfile(oldLabel, newLabel) {
+        const res = await apiFetch("/auth/rename", {
+          method: "POST",
+          body: JSON.stringify({ old_label: oldLabel, new_label: newLabel }),
+        });
+        if (!res.ok) throw new Error(await readError(res, "Rename failed"));
+        return await res.json();
+      }
+
       const refreshAll = () => Promise.all([loadPublicStats(), loadAccounts()]);
 
       $("tokenSave").addEventListener("click", async () => { localStorage.setItem("internalToken", tokenInput.value.trim()); await refreshAll(); });
       $("tokenClear").addEventListener("click", async () => { localStorage.removeItem("internalToken"); tokenInput.value = ""; await refreshAll(); });
       $("addAccount").addEventListener("click", async () => { try { await startLogin(); } catch (e) { setStatus(e.message, true); } });
-      $("importCurrent").addEventListener("click", async () => { try { await importCurrent(); await refreshAll(); } catch (e) { setStatus(e.message, true); } });
+      $("importCurrent").addEventListener("click", () => { openImportModal(); });
       $("refreshAll").addEventListener("click", refreshAll);
       accountsEl.addEventListener("click", async e => {
         const t = e.target.closest("[data-action]"); if (!t) return;
         const action = t.dataset.action, label = t.dataset.label; if (!action || !label) return;
+        if (action === "menu") {
+          const root = t.closest("[data-menu-root]");
+          if (!root) return;
+          document.querySelectorAll("[data-menu-root].open").forEach(el => { if (el !== root) el.classList.remove("open"); });
+          root.classList.toggle("open");
+          return;
+        }
+        document.querySelectorAll("[data-menu-root].open").forEach(el => el.classList.remove("open"));
         try {
           if (action === "switch") { await switchProfile(label); await refreshAll(); }
+          else if (action === "edit") { openEditProfileModal(label); }
           else if (action === "export") { await exportProfile(label); }
           else if (action === "delete") { await deleteProfile(label); await refreshAll(); }
         } catch (err) { setStatus(err.message, true); }
+      });
+      document.addEventListener("click", e => {
+        if (!(e.target instanceof Element)) return;
+        if (!e.target.closest("[data-menu-root]")) {
+          document.querySelectorAll("[data-menu-root].open").forEach(el => el.classList.remove("open"));
+        }
       });
       $("openAuthUrl").addEventListener("click", () => {
         if (!pendingRelay?.authUrl) {
@@ -3291,6 +3594,63 @@ def _render_index() -> str:
         if (e.target === callbackModalEl) {
           callbackHintEl.textContent = "";
           cancelAddAccountFlow();
+        }
+      });
+      $("cancelEditProfile").addEventListener("click", () => {
+        editProfileHintEl.textContent = "";
+        closeEditProfileModal();
+      });
+      $("saveEditProfile").addEventListener("click", async () => {
+        const oldLabel = pendingRenameLabel;
+        const nextLabel = editProfileInputEl.value.trim();
+        if (!oldLabel) return;
+        if (!nextLabel) {
+          editProfileHintEl.textContent = "Profile name cannot be empty.";
+          return;
+        }
+        try {
+          const result = await renameProfile(oldLabel, nextLabel);
+          closeEditProfileModal();
+          setStatus(result.status === "unchanged" ? "Profile name unchanged." : `Renamed '${oldLabel}' to '${result.label}'.`);
+          await refreshAll();
+        } catch (err) {
+          editProfileHintEl.textContent = err.message || "Unable to rename profile.";
+        }
+      });
+      editProfileModalEl.addEventListener("click", e => {
+        if (e.target === editProfileModalEl) {
+          editProfileHintEl.textContent = "";
+          closeEditProfileModal();
+        }
+      });
+      $("cancelImport").addEventListener("click", () => {
+        importHintEl.textContent = "";
+        closeImportModal();
+      });
+      $("importCurrentModalBtn").addEventListener("click", async () => {
+        try {
+          importHintEl.textContent = "";
+          await importCurrent();
+          closeImportModal();
+          await refreshAll();
+        } catch (err) {
+          importHintEl.textContent = err.message || "Import current failed.";
+        }
+      });
+      $("importJsonModalBtn").addEventListener("click", async () => {
+        try {
+          importHintEl.textContent = "";
+          await importProvidedJson();
+          closeImportModal();
+          await refreshAll();
+        } catch (err) {
+          importHintEl.textContent = err.message || "Import JSON failed.";
+        }
+      });
+      importModalEl.addEventListener("click", e => {
+        if (e.target === importModalEl) {
+          importHintEl.textContent = "";
+          closeImportModal();
         }
       });
       refreshAll();

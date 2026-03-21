@@ -17,10 +17,10 @@ class Settings(BaseSettings):
 
     codex_cli_bin: str = "codex"
     codex_switch_bin: str = "codex-switch"
-    codex_auth_path: str = "~/.codex/auth.json"
-    callback_store_dir: str = "~/.codex-switch/callbacks"
-    codex_profiles_dir: str = "~/.codex-switch/profiles"
-    usage_db_path: str = "~/.codex-switch/auth-manager.sqlite3"
+    codex_auth_path: str = "/root/.codex/auth.json"
+    callback_store_dir: str = "/root/.codex-switch/callbacks"
+    codex_profiles_dir: str = "/root/.codex-switch/profiles"
+    usage_db_path: str = "/root/.codex-switch/auth-manager.sqlite3"
     login_session_ttl_seconds: int = 600
     web_login_username: str | None = None
     web_login_password: str | None = None
