@@ -7,10 +7,11 @@ services:
       - "8080:8080"
     environment:
       CODEX_CLI_BIN: ${CODEX_CLI_BIN:-codex}
-      CODEX_SWITCH_BIN: ${CODEX_SWITCH_BIN:-codex-switch}
+      CODEX_SWITCH_BIN: ${CODEX_SWITCH_BIN:-cxs}
       CODEX_AUTH_PATH: ${CODEX_AUTH_PATH:-/root/.codex/auth.json}
       CALLBACK_STORE_DIR: ${CALLBACK_STORE_DIR:-/root/.codex-switch/callbacks}
       CODEX_PROFILES_DIR: ${CODEX_PROFILES_DIR:-/root/.codex-switch/profiles}
+      LOGIN_SESSION_TTL_SECONDS: ${LOGIN_SESSION_TTL_SECONDS:-600}
       INTERNAL_API_TOKEN: ${INTERNAL_API_TOKEN:-}
       RATE_LIMIT_PROBE_URL: ${RATE_LIMIT_PROBE_URL:-https://api.openai.com/v1/models}
       OPENAI_ORGANIZATION: ${OPENAI_ORGANIZATION:-}
@@ -20,12 +21,7 @@ services:
       OPENAI_CLIENT_SECRET: ${OPENAI_CLIENT_SECRET:-}
       OPENAI_REDIRECT_URI: ${OPENAI_REDIRECT_URI:-http://localhost:1455/auth/callback}
     volumes:
-      - codex_auth:/root/.codex
-      - codex_profiles:/root/.codex-switch/profiles
-      - codex_callbacks:/root/.codex-switch/callbacks
+      - ${HOST_CODEX_DIR:-/root/.codex}:/root/.codex
+      - ${HOST_CODEX_PROFILES_DIR:-/root/.codex-switch/profiles}:/root/.codex-switch/profiles
+      - ${HOST_CODEX_CALLBACKS_DIR:-/root/.codex-switch/callbacks}:/root/.codex-switch/callbacks
     restart: unless-stopped
-
-volumes:
-  codex_auth:
-  codex_profiles:
-  codex_callbacks:

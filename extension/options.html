@@ -1,0 +1,106 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Codex Auth Relay Settings</title>
+    <style>
+      body {
+        margin: 0;
+        font-family: Arial, sans-serif;
+        background: #f5f7fb;
+        color: #101828;
+      }
+      .wrap {
+        max-width: 720px;
+        margin: 24px auto;
+        padding: 0 16px;
+      }
+      .card {
+        background: #fff;
+        border: 1px solid #dce4f2;
+        border-radius: 12px;
+        padding: 18px;
+      }
+      h1 {
+        margin: 0 0 14px;
+        font-size: 22px;
+      }
+      .field {
+        margin-bottom: 14px;
+      }
+      label {
+        display: block;
+        font-weight: 600;
+        margin-bottom: 6px;
+      }
+      input {
+        width: 100%;
+        box-sizing: border-box;
+        border: 1px solid #c5d0e6;
+        border-radius: 8px;
+        padding: 9px 10px;
+        font-size: 14px;
+      }
+      .hint {
+        margin-top: 5px;
+        color: #51607a;
+        font-size: 12px;
+      }
+      .actions {
+        margin-top: 16px;
+      }
+      button {
+        border: 0;
+        border-radius: 10px;
+        padding: 10px 14px;
+        font-weight: 600;
+        background: #0f5fe8;
+        color: #fff;
+        cursor: pointer;
+      }
+      #status {
+        margin-top: 12px;
+        font-size: 13px;
+      }
+      .ok {
+        color: #0f6b35;
+      }
+      .err {
+        color: #9d1c1c;
+      }
+      code {
+        background: #eff3ff;
+        border-radius: 6px;
+        padding: 1px 5px;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="wrap">
+      <div class="card">
+        <h1>Codex Auth Relay Settings</h1>
+
+        <div class="field">
+          <label for="baseUrl">Auth Manager Base URL</label>
+          <input id="baseUrl" type="text" placeholder="http://localhost:8080" />
+          <div class="hint">Example: <code>http://localhost:8080</code> or <code>https://auth.example.com</code></div>
+        </div>
+
+        <div class="field">
+          <label for="bearerToken">Internal API Bearer Token (Optional)</label>
+          <input id="bearerToken" type="password" placeholder="Leave empty if INTERNAL_API_TOKEN is not set" />
+          <div class="hint">Used as <code>Authorization: Bearer &lt;token&gt;</code>.</div>
+        </div>
+
+        <div class="actions">
+          <button id="saveBtn" type="button">Save Settings</button>
+        </div>
+
+        <div id="status"></div>
+      </div>
+    </div>
+
+    <script src="options.js"></script>
+  </body>
+</html>

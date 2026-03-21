@@ -1,0 +1,89 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Codex Auth Relay</title>
+    <style>
+      body {
+        margin: 0;
+        width: 320px;
+        font-family: Arial, sans-serif;
+        background: #f5f7fb;
+        color: #1b2230;
+      }
+      .wrap {
+        padding: 14px;
+      }
+      h1 {
+        margin: 0 0 8px;
+        font-size: 16px;
+      }
+      p {
+        margin: 0 0 12px;
+        font-size: 13px;
+        line-height: 1.4;
+      }
+      button {
+        width: 100%;
+        border: 0;
+        border-radius: 10px;
+        padding: 10px 12px;
+        font-weight: 600;
+        background: #0f5fe8;
+        color: #fff;
+        cursor: pointer;
+      }
+      button:disabled {
+        opacity: 0.6;
+        cursor: default;
+      }
+      .row {
+        margin-top: 10px;
+        display: flex;
+        justify-content: space-between;
+        gap: 8px;
+      }
+      .link-btn {
+        border: 0;
+        background: transparent;
+        color: #0f5fe8;
+        font-size: 12px;
+        padding: 0;
+        cursor: pointer;
+      }
+      .status {
+        margin-top: 10px;
+        font-size: 12px;
+        white-space: pre-wrap;
+      }
+      .ok {
+        color: #0f6b35;
+      }
+      .err {
+        color: #971b1b;
+      }
+      code {
+        background: #eef2ff;
+        border-radius: 6px;
+        padding: 1px 5px;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="wrap">
+      <h1>Codex Auth Relay</h1>
+      <p>Start login relay, then complete auth in the opened tab. Localhost callback will be captured and relayed automatically.</p>
+      <button id="startBtn" type="button">Start Relay Login</button>
+      <div class="row">
+        <button id="optionsBtn" class="link-btn" type="button">Settings</button>
+      </div>
+      <div id="status" class="status"></div>
+      <p style="margin-top: 12px; margin-bottom: 0; font-size: 11px; color: #4b5568;">
+        Shortcut to open popup: <code>Ctrl+Shift+Y</code><br />
+        Direct start shortcut: <code>Ctrl+Shift+L</code>
+      </p>
+    </div>
+    <script src="popup.js"></script>
+  </body>
+</html>

@@ -1,0 +1,38 @@
+{
+  "manifest_version": 3,
+  "name": "Codex Auth Relay",
+  "description": "Relays fixed localhost OAuth callbacks to Codex auth-manager.",
+  "version": "0.2.0",
+  "permissions": ["storage", "tabs", "webNavigation"],
+  "host_permissions": [
+    "http://127.0.0.1:1445/*",
+    "http://localhost:1445/*",
+    "http://127.0.0.1:1455/*",
+    "http://localhost:1455/*",
+    "http://*/*",
+    "https://*/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_title": "Codex Auth Relay",
+    "default_popup": "popup.html"
+  },
+  "options_page": "options.html",
+  "commands": {
+    "_execute_action": {
+      "suggested_key": {
+        "default": "Ctrl+Shift+Y",
+        "mac": "Command+Shift+Y"
+      }
+    },
+    "start-relay-login": {
+      "suggested_key": {
+        "default": "Ctrl+Shift+L",
+        "mac": "Command+Shift+L"
+      },
+      "description": "Start Codex relay login immediately"
+    }
+  }
+}

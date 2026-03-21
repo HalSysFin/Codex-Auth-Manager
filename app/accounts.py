@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import json
 from dataclasses import dataclass
 from pathlib import Path
@@ -31,6 +32,11 @@ EMAIL_KEYS = [
     "userEmail",
 ]
 
+ID_TOKEN_KEYS = [
+    "id_token",
+    "idToken",
+]
+
 
 def _load_json(path: Path) -> dict[str, Any] | None:
     try:
@@ -56,6 +62,52 @@ def _find_first_key(payload: Any, keys: list[str]) -> str | None:
     return None
 
 
+def _decode_jwt_payload(token: str) -> dict[str, Any] | None:
+    parts = token.split(".")
+    if len(parts) < 2:
+        return None
+    payload = parts[1]
+    padding = "=" * ((4 - (len(payload) % 4)) % 4)
+    try:
+        decoded = base64.urlsafe_b64decode((payload + padding).encode("ascii"))
+        parsed = json.loads(decoded.decode("utf-8", errors="replace"))
+    except (ValueError, OSError):
+        return None
+    if isinstance(parsed, dict):
+        return parsed
+    return None
+
+
+def _extract_email_from_jwt_claims(payload: dict[str, Any]) -> str | None:
+    direct = _find_first_key(payload, EMAIL_KEYS)
+    if direct:
+        return direct
+    profile = payload.get("https://api.openai.com/profile")
+    if isinstance(profile, dict):
+        prof = _find_first_key(profile, EMAIL_KEYS)
+        if prof:
+            return prof
+    return None
+
+
+def _extract_email(payload: dict[str, Any]) -> str | None:
+    direct = _find_first_key(payload, EMAIL_KEYS)
+    if direct:
+        return direct
+
+    for key in ID_TOKEN_KEYS:
+        token = _find_first_key(payload, [key])
+        if not token:
+            continue
+        claims = _decode_jwt_payload(token)
+        if not claims:
+            continue
+        email = _extract_email_from_jwt_claims(claims)
+        if email:
+            return email
+    return None
+
+
 def list_profiles() -> list[AccountProfile]:
     profiles_dir = settings.profiles_dir()
     if not profiles_dir.exists():
@@ -71,7 +123,7 @@ def list_profiles() -> list[AccountProfile]:
 
         label = path.stem
         access_token = _find_first_key(auth, TOKEN_KEYS)
-        email = _find_first_key(auth, EMAIL_KEYS)
+        email = _extract_email(auth)
         profiles.append(
             AccountProfile(
                 label=label,

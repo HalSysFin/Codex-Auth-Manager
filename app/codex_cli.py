@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import base64
 import json
 import re
 import subprocess
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -16,6 +18,10 @@ EMAIL_KEYS = [
     "userEmail",
     "account_email",
     "primary_email",
+]
+ID_TOKEN_KEYS = [
+    "id_token",
+    "idToken",
 ]
 
 URL_RE = re.compile(r"https?://[^\s\"'>]+")
@@ -52,6 +58,13 @@ class LoginStatusResult:
 
 
 @dataclass
+class AppServerRateLimitsResult:
+    account: dict[str, Any] | None
+    rate_limits: Any
+    notifications: list[dict[str, Any]]
+
+
+@dataclass
 class _LoginState:
     started_at: datetime
     before_mtime: float | None
@@ -61,6 +74,117 @@ class _LoginState:
 
 
 _LOGIN_STATE: _LoginState | None = None
+
+
+def read_rate_limits_via_app_server(timeout_seconds: float = 15.0) -> AppServerRateLimitsResult:
+    cmd = [settings.codex_cli_bin, "app-server", "--listen", "stdio://"]
+    try:
+        process = subprocess.Popen(
+            cmd,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            bufsize=1,
+        )
+    except FileNotFoundError as exc:
+        raise CodexCLIError(f"codex CLI binary not found: {settings.codex_cli_bin}") from exc
+    except OSError as exc:
+        raise CodexCLIError(f"Unable to start codex app-server: {exc}") from exc
+
+    responses: dict[int, dict[str, Any]] = {}
+    notifications: list[dict[str, Any]] = []
+    deadline = time.monotonic() + timeout_seconds
+
+    try:
+        _rpc_send(
+            process,
+            {
+                "id": 1,
+                "method": "initialize",
+                "params": {
+                    "clientInfo": {
+                        "name": "auth_manager",
+                        "title": "Codex Auth Manager",
+                        "version": "0.2.0",
+                    }
+                },
+            },
+        )
+        _rpc_send(process, {"method": "initialized", "params": {}})
+        _rpc_send(
+            process,
+            {"id": 2, "method": "account/read", "params": {"refreshToken": True}},
+        )
+        _rpc_send(
+            process,
+            {"id": 3, "method": "account/rateLimits/read", "params": {}},
+        )
+
+        while time.monotonic() < deadline:
+            if 2 in responses and 3 in responses:
+                break
+
+            line = _readline_with_timeout(process, timeout_seconds=0.25)
+            if line is None:
+                continue
+            raw = line.strip()
+            if not raw:
+                continue
+
+            try:
+                message = json.loads(raw)
+            except ValueError:
+                continue
+            if not isinstance(message, dict):
+                continue
+
+            message_id = message.get("id")
+            if isinstance(message_id, int):
+                responses[message_id] = message
+                continue
+
+            method = message.get("method")
+            if isinstance(method, str):
+                notifications.append(message)
+
+        if 2 not in responses or 3 not in responses:
+            stderr_excerpt = _drain_stderr(process, max_lines=20)
+            detail = (
+                f"; stderr: {' | '.join(stderr_excerpt)}"
+                if stderr_excerpt
+                else ""
+            )
+            raise CodexCLIError(
+                "Timed out waiting for codex app-server account/rate-limit responses"
+                + detail
+            )
+
+        account_response = responses[2]
+        rate_limit_response = responses[3]
+
+        if "error" in account_response:
+            raise CodexCLIError(_rpc_error_text("account/read", account_response["error"]))
+        if "error" in rate_limit_response:
+            raise CodexCLIError(
+                _rpc_error_text("account/rateLimits/read", rate_limit_response["error"])
+            )
+
+        account_result = account_response.get("result")
+        account = None
+        if isinstance(account_result, dict):
+            maybe_account = account_result.get("account")
+            if isinstance(maybe_account, dict):
+                account = maybe_account
+
+        rate_limits = rate_limit_response.get("result")
+        return AppServerRateLimitsResult(
+            account=account,
+            rate_limits=rate_limits,
+            notifications=notifications,
+        )
+    finally:
+        _stop_process(process)
 
 
 def start_login(capture_timeout_seconds: float = 1.2) -> LoginStartResult:
@@ -87,10 +211,12 @@ def start_login(capture_timeout_seconds: float = 1.2) -> LoginStartResult:
     err = ""
     try:
         out, err = process.communicate(timeout=capture_timeout_seconds)
+        out = _to_text(out)
+        err = _to_text(err)
         # Process ended quickly; still valid for non-interactive setups.
     except subprocess.TimeoutExpired as exc:
-        out = exc.stdout or ""
-        err = exc.stderr or ""
+        out = _to_text(exc.stdout)
+        err = _to_text(exc.stderr)
 
     combined = "\n".join(part for part in [out, err] if part).strip()
     browser_url = _extract_first_url(combined)
@@ -241,6 +367,17 @@ def extract_email(auth_json: dict[str, Any]) -> str | None:
     if found:
         return found
 
+    for key in ID_TOKEN_KEYS:
+        token = _find_first_key(auth_json, [key])
+        if not token:
+            continue
+        claims = _decode_jwt_payload(token)
+        if not claims:
+            continue
+        claim_email = _find_first_key(claims, EMAIL_KEYS)
+        if claim_email:
+            return claim_email
+
     # TODO: If email is absent in auth.json, call an identity endpoint using the
     # bearer access token to resolve the account email.
     return None
@@ -264,6 +401,18 @@ def derive_label(email: str, existing_labels: set[str] | None = None) -> str:
     return label
 
 
+def relay_callback_to_login(callback_payload: dict[str, Any]) -> dict[str, Any]:
+    # TODO: Wire relayed callback params (code/state/error) into codex CLI once
+    # the CLI supports direct callback injection in a stable way.
+    _ = callback_payload
+    return {
+        "attempted": False,
+        "supported": False,
+        "completed": False,
+        "message": "Direct Codex CLI callback handoff is not implemented yet.",
+    }
+
+
 def _find_first_key(payload: Any, keys: list[str]) -> str | None:
     if isinstance(payload, dict):
         for key in keys:
@@ -282,11 +431,121 @@ def _find_first_key(payload: Any, keys: list[str]) -> str | None:
     return None
 
 
+def _decode_jwt_payload(token: str) -> dict[str, Any] | None:
+    parts = token.split(".")
+    if len(parts) < 2:
+        return None
+    payload = parts[1]
+    padding = "=" * ((4 - (len(payload) % 4)) % 4)
+    try:
+        decoded = base64.urlsafe_b64decode((payload + padding).encode("ascii"))
+        parsed = json.loads(decoded.decode("utf-8", errors="replace"))
+    except (ValueError, OSError):
+        return None
+    if isinstance(parsed, dict):
+        return parsed
+    return None
+
+
 def _extract_first_url(text: str) -> str | None:
     if not text:
         return None
-    match = URL_RE.search(text)
-    return match.group(0) if match else None
+    urls = [_clean_url(match.group(0)) for match in URL_RE.finditer(text)]
+    urls = [url for url in urls if url]
+    if not urls:
+        return None
+
+    # Prefer the actual authorization URL over local callback/listener URLs.
+    for url in urls:
+        if "auth.openai.com/oauth/authorize" in url:
+            return url
+
+    return urls[0]
+
+
+def _to_text(value: str | bytes | None) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    return value
+
+
+def _rpc_send(process: subprocess.Popen[str], message: dict[str, Any]) -> None:
+    if process.stdin is None:
+        raise CodexCLIError("codex app-server stdin is unavailable")
+    try:
+        process.stdin.write(json.dumps(message) + "\n")
+        process.stdin.flush()
+    except OSError as exc:
+        raise CodexCLIError(f"Failed writing to codex app-server: {exc}") from exc
+
+
+def _readline_with_timeout(
+    process: subprocess.Popen[str], timeout_seconds: float
+) -> str | None:
+    if process.stdout is None:
+        return None
+    end = time.monotonic() + timeout_seconds
+    while time.monotonic() < end:
+        line = process.stdout.readline()
+        if line:
+            return line
+        if process.poll() is not None:
+            return None
+        time.sleep(0.02)
+    return None
+
+
+def _rpc_error_text(method: str, error_obj: Any) -> str:
+    if isinstance(error_obj, dict):
+        message = error_obj.get("message")
+        code = error_obj.get("code")
+        if message is not None and code is not None:
+            return f"{method} failed ({code}): {message}"
+        if message is not None:
+            return f"{method} failed: {message}"
+    return f"{method} failed"
+
+
+def _drain_stderr(process: subprocess.Popen[str], max_lines: int = 20) -> list[str]:
+    if process.stderr is None:
+        return []
+    lines: list[str] = []
+    try:
+        for _ in range(max_lines):
+            line = process.stderr.readline()
+            if not line:
+                break
+            value = line.strip()
+            if value:
+                lines.append(value)
+    except OSError:
+        return lines
+    return lines
+
+
+def _stop_process(process: subprocess.Popen[str]) -> None:
+    try:
+        if process.stdin is not None:
+            process.stdin.close()
+    except OSError:
+        pass
+
+    if process.poll() is None:
+        process.terminate()
+        try:
+            process.wait(timeout=1.5)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            try:
+                process.wait(timeout=1.0)
+            except subprocess.TimeoutExpired:
+                pass
+
+
+def _clean_url(url: str) -> str:
+    return url.rstrip(".,);]")
 
 
 def _mtime(path: Path) -> float | None:

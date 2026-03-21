@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
@@ -34,22 +35,43 @@ class CodexSwitchError(RuntimeError):
 
 
 def run_codex_switch(args: Sequence[str], *, check: bool = True) -> CodexSwitchResult:
-    cmd = [settings.codex_switch_bin, *args]
-    try:
-        completed = subprocess.run(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            check=False,
-        )
-    except FileNotFoundError as exc:
+    primary = settings.codex_switch_bin
+    candidates: list[str] = [primary]
+    if primary == "codex-switch":
+        candidates.append("cxs")
+    elif primary == "cxs":
+        candidates.append("codex-switch")
+
+    completed = None
+    cmd: list[str] = []
+    last_os_error: OSError | None = None
+    for binary in candidates:
+        cmd = [binary, *args]
+        try:
+            completed = subprocess.run(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                check=False,
+            )
+            break
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            last_os_error = exc
+            break
+
+    if completed is None:
+        if last_os_error is not None:
+            raise CodexSwitchError(
+                f"Unable to execute codex-switch: {last_os_error}",
+                command=cmd or [primary, *args],
+            ) from last_os_error
         raise CodexSwitchError(
-            f"codex-switch binary not found: {settings.codex_switch_bin}",
-            command=cmd,
-        ) from exc
-    except OSError as exc:
-        raise CodexSwitchError(f"Unable to execute codex-switch: {exc}", command=cmd) from exc
+            f"codex-switch binary not found: {primary} (also tried: {', '.join(candidates[1:]) or 'none'})",
+            command=cmd or [primary, *args],
+        )
 
     result = CodexSwitchResult(
         command=cmd,
@@ -72,11 +94,17 @@ def run_codex_switch(args: Sequence[str], *, check: bool = True) -> CodexSwitchR
 
 
 def save_label(label: str) -> CodexSwitchResult:
-    return run_codex_switch(["save", "--label", label], check=True)
+    try:
+        return run_codex_switch(["save", "--label", label], check=True)
+    except CodexSwitchError as exc:
+        return _save_label_fallback(label, exc)
 
 
 def switch_label(label: str) -> CodexSwitchResult:
-    return run_codex_switch(["switch", "--label", label], check=True)
+    try:
+        return run_codex_switch(["switch", "--label", label], check=True)
+    except CodexSwitchError as exc:
+        return _switch_label_fallback(label, exc)
 
 
 def list_labels() -> list[str]:
@@ -113,3 +141,77 @@ def _labels_from_profiles_dir(profiles_dir: Path) -> list[str]:
         if path.is_file():
             labels.append(path.stem)
     return labels
+
+
+def _save_label_fallback(label: str, cause: CodexSwitchError) -> CodexSwitchResult:
+    auth_path = settings.codex_auth_file()
+    if not auth_path.exists():
+        raise CodexSwitchError(
+            f"Auth file not found at {auth_path}",
+            command=["internal-save", "--label", label],
+        ) from cause
+
+    try:
+        auth_json = json.loads(auth_path.read_text())
+    except (OSError, ValueError) as exc:
+        raise CodexSwitchError(
+            f"Unable to read current auth JSON: {exc}",
+            command=["internal-save", "--label", label],
+        ) from exc
+
+    profiles_dir = settings.profiles_dir()
+    profiles_dir.mkdir(parents=True, exist_ok=True)
+    target = profiles_dir / f"{label}.json"
+    try:
+        target.write_text(json.dumps(auth_json, indent=2, sort_keys=True))
+    except OSError as exc:
+        raise CodexSwitchError(
+            f"Unable to save profile '{label}': {exc}",
+            command=["internal-save", "--label", label],
+        ) from exc
+
+    return CodexSwitchResult(
+        command=["internal-save", "--label", label],
+        returncode=0,
+        stdout=f"Saved profile '{label}' to {target}",
+        stderr=f"Fallback used because external codex-switch failed: {cause}",
+    )
+
+
+def _switch_label_fallback(label: str, cause: CodexSwitchError) -> CodexSwitchResult:
+    profile_path = settings.profiles_dir() / f"{label}.json"
+    if not profile_path.exists():
+        raise CodexSwitchError(
+            f"Profile '{label}' not found at {profile_path}",
+            command=["internal-switch", "--label", label],
+        ) from cause
+
+    try:
+        profile_json = json.loads(profile_path.read_text())
+    except (OSError, ValueError) as exc:
+        raise CodexSwitchError(
+            f"Unable to read profile '{label}': {exc}",
+            command=["internal-switch", "--label", label],
+        ) from exc
+
+    if isinstance(profile_json, dict) and isinstance(profile_json.get("authJson"), dict):
+        auth_json = profile_json["authJson"]
+    else:
+        auth_json = profile_json
+
+    auth_path = settings.codex_auth_file()
+    auth_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        auth_path.write_text(json.dumps(auth_json, indent=2, sort_keys=True))
+    except OSError as exc:
+        raise CodexSwitchError(
+            f"Unable to switch to profile '{label}': {exc}",
+            command=["internal-switch", "--label", label],
+        ) from exc
+
+    return CodexSwitchResult(
+        command=["internal-switch", "--label", label],
+        returncode=0,
+        stdout=f"Switched to profile '{label}' via internal fallback",
+        stderr=f"Fallback used because external codex-switch failed: {cause}",
+    )

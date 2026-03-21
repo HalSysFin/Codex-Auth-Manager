@@ -9,13 +9,27 @@ def _expand(path: str) -> Path:
 
 
 class Settings(BaseSettings):
-    model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8")
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_file_encoding="utf-8",
+        extra="ignore",
+    )
 
     codex_cli_bin: str = "codex"
     codex_switch_bin: str = "codex-switch"
     codex_auth_path: str = "~/.codex/auth.json"
     callback_store_dir: str = "~/.codex-switch/callbacks"
     codex_profiles_dir: str = "~/.codex-switch/profiles"
+    login_session_ttl_seconds: int = 600
+    web_login_username: str | None = None
+    web_login_password: str | None = None
+    web_login_session_secret: str | None = None
+    web_login_cookie_name: str = "auth_manager_session"
+    web_login_session_ttl_seconds: int = 43200
+    trusted_proxy_ips: str = ""
+    internal_network_cidrs: str = (
+        "127.0.0.1/32,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,::1/128,fc00::/7"
+    )
     internal_api_token: str | None = None
     rate_limit_probe_url: str = "https://api.openai.com/v1/models"
     openai_organization: str | None = None

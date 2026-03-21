@@ -21,7 +21,8 @@ ENV CODEX_CLI_BIN=codex \
     CODEX_SWITCH_BIN=codex-switch \
     CODEX_AUTH_PATH=/root/.codex/auth.json \
     CALLBACK_STORE_DIR=/root/.codex-switch/callbacks \
-    CODEX_PROFILES_DIR=/root/.codex-switch/profiles
+    CODEX_PROFILES_DIR=/root/.codex-switch/profiles \
+    LOGIN_SESSION_TTL_SECONDS=600
 
 EXPOSE 8080
 
