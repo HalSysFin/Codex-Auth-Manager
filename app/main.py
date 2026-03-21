@@ -6,12 +6,13 @@ import json
 import logging
 import secrets
 import asyncio
+from dataclasses import dataclass
 from hashlib import sha256
 from contextlib import suppress
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qs, quote
+from urllib.parse import parse_qs, quote, urlparse
 
 import httpx
 from fastapi import FastAPI, HTTPException, Request
@@ -68,6 +69,19 @@ app = FastAPI(title="Codex Auth Manager", version="0.2.0")
 logger = logging.getLogger(__name__)
 _RECONCILE_INTERVAL_SECONDS = 600
 _reconcile_task: asyncio.Task[None] | None = None
+
+
+@dataclass
+class PersistCurrentAuthResult:
+    persisted: bool
+    skipped: bool
+    reason: str
+    label: str | None
+    email: str | None
+    matched_existing_profile: bool
+    created_new_profile: bool
+    up_to_date: bool
+    codex_switch: dict[str, Any] | None
 
 
 @app.on_event("startup")
@@ -308,6 +322,61 @@ async def auth_login_status(wait_seconds: int = 0, session_id: str | None = None
     elif session is not None and session.provider_error:
         relay_stage = "provider_error"
 
+    auto_persist: dict[str, Any] = {"attempted": False}
+    if result.auth_updated:
+        auto_persist["attempted"] = True
+        try:
+            persist_result = _persist_current_auth_to_profile(
+                desired_label=None,
+                create_if_missing=False,
+            )
+            auto_persist.update(
+                {
+                    "status": "persisted" if persist_result.persisted else "skipped",
+                    "reason": persist_result.reason,
+                    "label": persist_result.label,
+                    "email": persist_result.email,
+                    "matched_existing_profile": persist_result.matched_existing_profile,
+                    "created_new_profile": persist_result.created_new_profile,
+                    "up_to_date": persist_result.up_to_date,
+                    "codex_switch": persist_result.codex_switch,
+                }
+            )
+        except (CodexCLIError, AuthStoreError, CodexSwitchError, ValueError) as exc:
+            logger.warning("auto persist after auth update failed: %s", exc)
+            auto_persist.update(
+                {
+                    "status": "error",
+                    "reason": "persist_failed",
+                    "error": str(exc),
+                }
+            )
+
+    next_action: str | None
+    if callback_received and not result.auth_updated:
+        next_action = (
+            "Relay callback captured. Waiting for auth finalization before any profile persistence."
+        )
+    elif result.auth_updated and auto_persist.get("status") == "persisted":
+        next_action = "Auth finalized and matching saved profile was updated automatically."
+    elif result.auth_updated and auto_persist.get("status") == "skipped":
+        if auto_persist.get("reason") == "up_to_date":
+            next_action = "Auth finalized. Saved profile already had the latest auth."
+        elif auto_persist.get("reason") == "no_matching_profile":
+            next_action = (
+                "Auth finalized but no existing profile matched. Use POST /auth/import-current "
+                "to intentionally create/import a new saved profile."
+            )
+        else:
+            next_action = None
+    elif result.auth_updated and auto_persist.get("status") == "error":
+        next_action = (
+            "Auth finalized but automatic profile persistence failed. "
+            "Check auto_persist.error or run POST /auth/import-current."
+        )
+    else:
+        next_action = None
+
     return JSONResponse(
         {
             "status": state,
@@ -342,16 +411,10 @@ async def auth_login_status(wait_seconds: int = 0, session_id: str | None = None
                 "handoff_supported": False,
                 "finalization_supported": False,
                 "next_action": (
-                    "Relay callback captured. Direct CLI callback handoff is not implemented; "
-                    "finalize auth in CLI/manual flow, then run POST /auth/import-current."
-                    if callback_received and not result.auth_updated
-                    else (
-                        "Run POST /auth/import-current to save this auth into codex-switch profiles."
-                        if result.auth_updated
-                        else None
-                    )
+                    next_action
                 ),
             },
+            "auto_persist": auto_persist,
         }
     )
 
@@ -408,10 +471,17 @@ async def auth_relay_callback(payload: dict[str, Any]) -> JSONResponse:
     expected_state = _expected_state_from_auth_url(session.auth_url)
     if expected_state and state and str(state).strip() != expected_state:
         logger.warning(
-            "relay-callback state mismatch accepted session_id=%s expected=%s got=%s",
+            "relay-callback rejected: state mismatch session_id=%s expected=%s got=%s",
             session_id,
             expected_state,
             state,
+        )
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Callback state does not match active login session. "
+                "Start Add Account again and use that session's callback URL."
+            ),
         )
 
     callback_payload = {
@@ -462,46 +532,27 @@ async def import_current_auth(request: Request, payload: dict[str, Any] | None =
     desired_label = (payload or {}).get("label") if payload else None
 
     try:
-        auth_json = read_current_auth()
+        persist_result = _persist_current_auth_to_profile(
+            desired_label=(str(desired_label) if desired_label is not None else None),
+            create_if_missing=True,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     except CodexCLIError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-
-    email = extract_email(auth_json)
-    existing = set(list_labels())
-    profiles = _dedupe_profiles(list_profiles())
-    matched_profile = _find_matching_profile(profiles, auth_json, email)
-
-    if desired_label:
-        label = str(desired_label).strip()
-        if not label:
-            raise HTTPException(status_code=400, detail="label cannot be empty")
-    elif matched_profile is not None:
-        # Keep a stable profile label for the same underlying account/auth.
-        label = matched_profile.label
-    else:
-        label = derive_label(email or "account", existing_labels=existing)
-
-    try:
-        # Keep current auth.json as the active source of truth, then save profile.
-        persist_current_auth(auth_json)
-        switch_save = save_current_auth_under_label(label)
     except (AuthStoreError, CodexSwitchError) as exc:
         raise _to_switch_http_error(exc) from exc
-
-    _touch_account_usage(profile_label=label, profile_email=email)
 
     return JSONResponse(
         {
             "status": "imported",
-            "label": label,
-            "email": email,
-            "matched_existing_profile": bool(matched_profile is not None),
-            "saved": True,
-            "codex_switch": {
-                "command": switch_save.command,
-                "exit_code": switch_save.returncode,
-                "stdout": switch_save.stdout,
-            },
+            "label": persist_result.label,
+            "email": persist_result.email,
+            "matched_existing_profile": persist_result.matched_existing_profile,
+            "saved": persist_result.persisted or persist_result.up_to_date,
+            "created_new_profile": persist_result.created_new_profile,
+            "up_to_date": persist_result.up_to_date,
+            "codex_switch": persist_result.codex_switch,
         }
     )
 
@@ -925,14 +976,14 @@ def _store_callback(payload: Any) -> Path:
 def _expected_state_from_auth_url(auth_url: str | None) -> str | None:
     if not auth_url:
         return None
-    marker = "state="
-    index = auth_url.find(marker)
-    if index < 0:
+    try:
+        parsed = urlparse(auth_url)
+        states = parse_qs(parsed.query).get("state", [])
+    except Exception:
         return None
-    raw = auth_url[index + len(marker):]
-    if "&" in raw:
-        raw = raw.split("&", 1)[0]
-    state = raw.strip()
+    if not states:
+        return None
+    state = str(states[0]).strip()
     return state or None
 
 
@@ -1477,6 +1528,76 @@ def _usage_tracking_payload(label: str) -> dict[str, Any] | None:
         "created_at": state.created_at,
         "updated_at": state.updated_at,
     }
+
+
+def _persist_current_auth_to_profile(
+    *,
+    desired_label: str | None,
+    create_if_missing: bool,
+) -> PersistCurrentAuthResult:
+    auth_json = read_current_auth()
+    email = extract_email(auth_json)
+    existing = set(list_labels())
+    profiles = _dedupe_profiles(list_profiles())
+    matched_profile = _find_matching_profile(profiles, auth_json, email)
+
+    if desired_label is not None:
+        label = desired_label.strip()
+        if not label:
+            raise ValueError("label cannot be empty")
+        created_new_profile = matched_profile is None
+    elif matched_profile is not None:
+        label = matched_profile.label
+        created_new_profile = False
+    elif create_if_missing:
+        label = derive_label(email or "account", existing_labels=existing)
+        created_new_profile = True
+    else:
+        return PersistCurrentAuthResult(
+            persisted=False,
+            skipped=True,
+            reason="no_matching_profile",
+            label=None,
+            email=email,
+            matched_existing_profile=False,
+            created_new_profile=False,
+            up_to_date=False,
+            codex_switch=None,
+        )
+
+    current_for_label = next((p for p in profiles if p.label == label), None)
+    if current_for_label is not None and current_for_label.auth == auth_json:
+        _touch_account_usage(profile_label=label, profile_email=email)
+        return PersistCurrentAuthResult(
+            persisted=False,
+            skipped=True,
+            reason="up_to_date",
+            label=label,
+            email=email,
+            matched_existing_profile=matched_profile is not None,
+            created_new_profile=False,
+            up_to_date=True,
+            codex_switch=None,
+        )
+
+    persist_current_auth(auth_json)
+    switch_save = save_current_auth_under_label(label)
+    _touch_account_usage(profile_label=label, profile_email=email)
+    return PersistCurrentAuthResult(
+        persisted=True,
+        skipped=False,
+        reason="persisted",
+        label=label,
+        email=email,
+        matched_existing_profile=matched_profile is not None,
+        created_new_profile=created_new_profile,
+        up_to_date=False,
+        codex_switch={
+            "command": switch_save.command,
+            "exit_code": switch_save.returncode,
+            "stdout": switch_save.stdout,
+        },
+    )
 
 
 def _find_matching_profile(
