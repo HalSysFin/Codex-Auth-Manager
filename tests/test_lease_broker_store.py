@@ -12,6 +12,7 @@ from app.lease_broker_store import (
     get_broker_lease,
     get_broker_lease_status,
     initialize_lease_broker_store,
+    materialize_broker_lease,
     record_broker_lease_telemetry,
     release_broker_lease,
     renew_broker_lease,
@@ -298,6 +299,37 @@ class LeaseBrokerStoreTests(unittest.TestCase):
         self.assertEqual(renewed["status"], "denied")
         self.assertEqual(released["status"], "denied")
         self.assertEqual(get_broker_lease(lease["id"], db_path=self.db_path)["state"], "active")
+
+    def test_materialize_updates_delivery_metadata_for_owned_active_lease(self) -> None:
+        self._sync_credential("cred-a")
+        lease = acquire_broker_lease(machine_id="m1", agent_id="a1", db_path=self.db_path)["lease"]
+
+        result = materialize_broker_lease(
+            lease_id=lease["id"],
+            machine_id="m1",
+            agent_id="a1",
+            db_path=self.db_path,
+        )
+
+        self.assertEqual(result["status"], "ok")
+        metadata = result["lease"]["metadata"]
+        self.assertEqual(metadata["delivery_count"], 1)
+        self.assertIn("first_materialized_at", metadata)
+        self.assertIn("last_materialized_at", metadata)
+
+    def test_materialize_denies_for_wrong_owner(self) -> None:
+        self._sync_credential("cred-a")
+        lease = acquire_broker_lease(machine_id="m1", agent_id="a1", db_path=self.db_path)["lease"]
+
+        result = materialize_broker_lease(
+            lease_id=lease["id"],
+            machine_id="m2",
+            agent_id="a2",
+            db_path=self.db_path,
+        )
+
+        self.assertEqual(result["status"], "denied")
+        self.assertEqual(result["reason"], "lease_not_found_or_not_owned")
 
 
 if __name__ == "__main__":

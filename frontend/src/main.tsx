@@ -48,6 +48,14 @@ type Account = {
   }
   usage_tracking?: UsageTracking | null
   refresh_status?: RefreshStatus
+  active_lease?: {
+    lease_id: string
+    machine_id: string
+    agent_id: string
+    state?: string | null
+    issued_at?: string | null
+    expires_at?: string | null
+  } | null
 }
 
 type Aggregate = {
@@ -1193,6 +1201,11 @@ function App() {
                     </div>
                     <div className="muted">{a.email || 'email unavailable'} · <span className="mono">{a.account_type || 'ChatGPT Plus'}</span></div>
                     <div className="muted mono">Profile label: {a.label}</div>
+                    {a.active_lease ? (
+                      <div className="muted mono">
+                        Leased to {a.active_lease.machine_id} / {a.active_lease.agent_id}
+                      </div>
+                    ) : null}
                   </div>
                   <div>
                     {p1 !== null || p2 !== null ? (

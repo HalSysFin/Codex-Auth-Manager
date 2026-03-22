@@ -350,6 +350,30 @@ def list_broker_credentials(db_path: Path | None = None) -> list[dict[str, Any]]
         return [_decode_credential_row(dict(row)) for row in rows]
 
 
+def list_active_broker_leases_by_credential(
+    db_path: Path | None = None,
+) -> dict[str, dict[str, Any]]:
+    with _connect(db_path) as conn:
+        _ensure_schema(conn)
+        _ensure_lease_broker_schema(conn)
+        rows = conn.execute(
+            f"""
+            SELECT *
+            FROM broker_leases
+            WHERE state IN ({','.join('?' for _ in ACTIVE_LEASE_STATES)})
+            ORDER BY created_at DESC, id DESC
+            """,
+            tuple(ACTIVE_LEASE_STATES),
+        ).fetchall()
+        out: dict[str, dict[str, Any]] = {}
+        for row in rows:
+            lease = _decode_lease_row(dict(row))
+            credential_id = str(lease.get("credential_id") or "").strip()
+            if credential_id and credential_id not in out:
+                out[credential_id] = lease
+        return out
+
+
 def get_broker_credential(
     credential_id: str,
     *,
@@ -697,6 +721,51 @@ def rotate_broker_lease(
         _reconcile_credential_row(conn, old_credential, has_active_lease=False, now_dt=now_dt)
         new_lease = dict(conn.execute("SELECT * FROM broker_leases WHERE id = ?", (new_lease_id,)).fetchone())
         return {"status": "ok", "reason": None, "lease": _decode_lease_row(new_lease)}
+
+
+def materialize_broker_lease(
+    *,
+    lease_id: str,
+    machine_id: str,
+    agent_id: str,
+    now: datetime | None = None,
+    db_path: Path | None = None,
+) -> dict[str, Any]:
+    now_dt = _as_utc(now)
+    now_iso = _to_iso(now_dt)
+    with _connect(db_path) as conn:
+        _ensure_schema(conn)
+        _ensure_lease_broker_schema(conn)
+        conn.execute("BEGIN IMMEDIATE")
+        lease = _owned_lease_or_error(conn, lease_id, machine_id, agent_id)
+        if lease is None:
+            return {"status": "denied", "reason": "lease_not_found_or_not_owned", "lease": None}
+        _expire_lease_if_needed(conn, lease, now_dt)
+        lease = dict(conn.execute("SELECT * FROM broker_leases WHERE id = ?", (lease_id,)).fetchone())
+        if lease["state"] not in ACTIVE_LEASE_STATES:
+            return {"status": "denied", "reason": f"lease_not_materializable:{lease['state']}", "lease": _decode_lease_row(lease)}
+        credential = _credential_for_lease(conn, lease)
+        if not _credential_is_usable_for_existing_lease(credential, now_dt=now_dt):
+            return {"status": "denied", "reason": "credential_not_usable", "lease": _decode_lease_row(lease)}
+        metadata = lease.get("metadata")
+        if not isinstance(metadata, dict):
+            metadata = {}
+        delivery_count = int(metadata.get("delivery_count") or 0) + 1
+        metadata["delivery_count"] = delivery_count
+        metadata["last_materialized_at"] = now_iso
+        if not metadata.get("first_materialized_at"):
+            metadata["first_materialized_at"] = now_iso
+        conn.execute(
+            """
+            UPDATE broker_leases
+            SET metadata = ?,
+                updated_at = ?
+            WHERE id = ?
+            """,
+            (_json_dump(metadata), now_iso, lease_id),
+        )
+        updated = dict(conn.execute("SELECT * FROM broker_leases WHERE id = ?", (lease_id,)).fetchone())
+        return {"status": "ok", "reason": None, "lease": _decode_lease_row(updated)}
 
 
 def mark_broker_credential_exhausted(

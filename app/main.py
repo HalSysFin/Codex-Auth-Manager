@@ -61,8 +61,10 @@ from .lease_broker_store import (
     get_broker_lease_status,
     initialize_lease_broker_store,
     is_credential_assignable,
+    list_active_broker_leases_by_credential,
     list_broker_credentials,
     mark_broker_credential_exhausted,
+    materialize_broker_lease,
     record_broker_lease_telemetry,
     release_broker_lease,
     renew_broker_lease,
@@ -201,6 +203,28 @@ def _sync_broker_credentials_from_profiles() -> list[dict[str, Any]]:
             )
         )
     return synced
+
+
+def _leased_profile_payload_for_credential(
+    credential_id: str,
+    *,
+    label_hint: str | None = None,
+) -> dict[str, Any] | None:
+    if label_hint:
+        saved = get_saved_profile(label_hint)
+        if saved and str(saved.get("account_key") or "") == credential_id:
+            return saved
+    for profile in _dedupe_profiles(list_profiles()):
+        if profile.account_key == credential_id:
+            return {
+                "label": profile.label,
+                "account_key": profile.account_key,
+                "email": profile.email,
+                "name": getattr(profile, "name", None),
+                "provider_account_id": None,
+                "auth_json": profile.auth,
+            }
+    return None
 
 
 @app.on_event("startup")
@@ -1235,6 +1259,70 @@ async def api_lease_telemetry(request: Request, lease_id: str, payload: dict[str
         reason=result.get("reason") or payload.get("status"),
     )
     return JSONResponse(result, status_code=200 if result["status"] == "ok" else 409)
+
+
+@app.post("/api/leases/{lease_id}/materialize")
+async def api_lease_materialize(request: Request, lease_id: str, payload: dict[str, Any]) -> JSONResponse:
+    _require_internal_auth(request)
+    machine_id = str(payload.get("machine_id") or "").strip()
+    agent_id = str(payload.get("agent_id") or "").strip()
+    if not machine_id or not agent_id:
+        raise HTTPException(status_code=400, detail="machine_id and agent_id are required")
+    result = materialize_broker_lease(
+        lease_id=lease_id,
+        machine_id=machine_id,
+        agent_id=agent_id,
+    )
+    if result["status"] != "ok":
+        _audit_broker_event(
+            "lease_materialize_denied",
+            lease_id=lease_id,
+            machine_id=machine_id,
+            agent_id=agent_id,
+            decision=result["status"],
+            reason=result.get("reason"),
+        )
+        return JSONResponse(result, status_code=409)
+
+    lease = result["lease"] or {}
+    lease_metadata = lease.get("metadata") if isinstance(lease.get("metadata"), dict) else {}
+    profile = _leased_profile_payload_for_credential(
+        str(lease.get("credential_id") or ""),
+        label_hint=str(lease_metadata.get("label") or ""),
+    )
+    if profile is None:
+        _audit_broker_event(
+            "lease_materialize_denied",
+            lease_id=lease_id,
+            credential_id=lease.get("credential_id"),
+            machine_id=machine_id,
+            agent_id=agent_id,
+            decision="denied",
+            reason="credential_material_not_found",
+        )
+        return JSONResponse(
+            {"status": "denied", "reason": "credential_material_not_found", "lease": lease},
+            status_code=404,
+        )
+
+    material = {
+        "label": profile.get("label"),
+        "account_key": profile.get("account_key"),
+        "email": profile.get("email"),
+        "name": profile.get("name"),
+        "provider_account_id": profile.get("provider_account_id"),
+        "auth_json": profile.get("auth_json"),
+    }
+    _audit_broker_event(
+        "lease_materialized",
+        lease_id=lease_id,
+        credential_id=lease.get("credential_id"),
+        machine_id=machine_id,
+        agent_id=agent_id,
+        decision="ok",
+        reason="credential_material_delivered",
+    )
+    return JSONResponse({"status": "ok", "reason": None, "lease": lease, "credential_material": material})
 
 
 @app.post("/api/leases/rotate")
@@ -2352,6 +2440,7 @@ def _build_cached_accounts_snapshot(
     profiles: list[AccountProfile] | None = None,
 ) -> dict[str, Any]:
     profs = _dedupe_profiles(profiles if profiles is not None else list_profiles())
+    active_leases_by_credential = list_active_broker_leases_by_credential()
     current = None
     try:
         current = _resolve_current_label(read_current_auth(), profs)
@@ -2359,7 +2448,12 @@ def _build_cached_accounts_snapshot(
         current = None
 
     accounts = [
-        _account_payload(profile, current, usage_tracking=_usage_tracking_payload(profile.account_key))
+        _account_payload(
+            profile,
+            current,
+            usage_tracking=_usage_tracking_payload(profile.account_key),
+            active_lease=active_leases_by_credential.get(profile.account_key),
+        )
         for profile in profs
     ]
     aggregate = _compute_aggregate(accounts)
@@ -2385,6 +2479,7 @@ def _account_payload(
     current_label_name: str | None,
     *,
     usage_tracking: dict[str, Any] | None,
+    active_lease: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     refresh_status = _refresh_status_payload(profile.account_key, usage_tracking)
     usage_limit = int((usage_tracking or {}).get("usage_limit") or 0)
@@ -2428,6 +2523,18 @@ def _account_payload(
         "rate_limits": rate_limits,
         "usage_tracking": usage_tracking,
         "refresh_status": refresh_status,
+        "active_lease": (
+            {
+                "lease_id": active_lease.get("id"),
+                "machine_id": active_lease.get("machine_id"),
+                "agent_id": active_lease.get("agent_id"),
+                "state": active_lease.get("state"),
+                "issued_at": active_lease.get("issued_at"),
+                "expires_at": active_lease.get("expires_at"),
+            }
+            if active_lease
+            else None
+        ),
     }
 
 
