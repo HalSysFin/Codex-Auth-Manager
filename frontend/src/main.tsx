@@ -111,6 +111,7 @@ type AccountHistoryResponse = {
     last_refresh_label?: string | null
     fallback_mode?: boolean
     fallback_reason?: string | null
+    modeled_usage_basis?: string | null
     weekly_utilization_now?: number | null
     average_weekly_utilization_in_range?: number | null
   }
@@ -135,6 +136,7 @@ type AccountHistoryResponse = {
     average_daily_consumption: number | null
     absolute_usage_available?: boolean
     fallback_mode?: boolean
+    modeled_usage_basis?: string | null
     daily_weekly_utilization?: Array<{ day: string; value: number }>
     hourly_weekly_utilization?: Array<{ t: string; value: number }>
   }
@@ -185,6 +187,7 @@ type UsageHistoryResponse = {
     last_refresh_label?: string | null
     fallback_mode?: boolean
     fallback_reason?: string | null
+    modeled_usage_basis?: string | null
     weekly_utilization_now?: number | null
     average_weekly_utilization_in_range?: number | null
   }
@@ -496,13 +499,18 @@ function App() {
   const weeklyUtilizationSeries = selectedRange === '1d'
     ? (usageHistory?.series.hourly_weekly_utilization || [])
     : (usageHistory?.series.daily_weekly_utilization || [])
-  const statsFallbackMode = Boolean(usageHistory?.summary.fallback_mode && weeklyUtilizationSeries.length)
-  const statsPrimarySeries = statsFallbackMode
-    ? weeklyUtilizationSeries
-    : (statsChartMode === 'daily' ? statsDaily : statsCumulative)
-  const statsMaxValue = statsFallbackMode
-    ? 100
-    : Math.max(1, ...statsPrimarySeries.map((d: any) => Number((d as any).consumed ?? (d as any).cumulative ?? 0)))
+  const statsFallbackMode = Boolean(usageHistory?.summary.fallback_mode)
+  const statsModeledFallback = Boolean(statsFallbackMode && usageHistory?.summary.modeled_usage_basis)
+  const statsPrimarySeries = statsModeledFallback
+    ? (statsChartMode === 'daily' ? statsDaily : statsCumulative)
+    : (statsFallbackMode
+        ? weeklyUtilizationSeries
+        : (statsChartMode === 'daily' ? statsDaily : statsCumulative))
+  const statsMaxValue = statsModeledFallback
+    ? Math.max(1, ...statsPrimarySeries.map((d: any) => Number((d as any).consumed ?? (d as any).cumulative ?? 0)))
+    : (statsFallbackMode
+        ? 100
+        : Math.max(1, ...statsPrimarySeries.map((d: any) => Number((d as any).consumed ?? (d as any).cumulative ?? 0))))
   const wastedSeries = usageHistory?.series.daily_rollover_wasted || []
   const wastedMaxValue = Math.max(1, ...wastedSeries.map((d) => Number(d.value || 0)))
   const weeklyPercents = accounts
@@ -1241,7 +1249,9 @@ function App() {
           </div>
           {statsFallbackMode ? (
             <div className="fallback-banner">
-              Absolute usage counters unavailable. Showing utilization-based fallback data.
+              {statsModeledFallback
+                ? 'Absolute usage counters unavailable. Showing modeled usage from 10-minute utilization snapshots.'
+                : 'Absolute usage counters unavailable. Showing utilization-based fallback data.'}
             </div>
           ) : null}
           <div className="cards analytics-cards">
@@ -1249,7 +1259,11 @@ function App() {
               <label>{selectedRange === '1d' ? 'Used Today' : 'Consumed In Range'}</label>
               <div className="unit-value"><strong>{fmtNullableNumber(statsSummary?.total_consumed_in_range)}</strong></div>
               <div className="muted small">
-                {statsFallbackMode ? 'Unavailable in fallback mode' : (selectedRange === '1d' ? 'Measured since local midnight' : 'Measured absolute usage')}
+                {statsModeledFallback
+                  ? 'Modeled from utilization deltas since midnight'
+                  : (statsFallbackMode
+                      ? 'Unavailable in fallback mode'
+                      : (selectedRange === '1d' ? 'Measured since local midnight' : 'Measured absolute usage'))}
               </div>
             </div>
             <div>
@@ -1263,14 +1277,18 @@ function App() {
               <label>Current Remaining</label>
               <div className="unit-value"><strong>{fmtNullableNumber(statsSummary?.current_total_remaining)}</strong></div>
               <div className="muted small">
-                {statsFallbackMode ? 'Unavailable in fallback mode' : 'Current remaining across accounts'}
+                {statsModeledFallback
+                  ? 'Normalized remaining capacity across accounts'
+                  : (statsFallbackMode ? 'Unavailable in fallback mode' : 'Current remaining across accounts')}
               </div>
             </div>
             <div className={(aggregate.fleet_efficiency_pct < 80 && !statsFallbackMode) ? 'warn-card' : ''}>
               <label>Current Limit</label>
               <div className="unit-value"><strong>{fmtNullableNumber(statsSummary?.current_total_limit)}</strong></div>
               <div className="muted small">
-                {statsFallbackMode ? 'Unavailable in fallback mode' : 'Current total limit across accounts'}
+                {statsModeledFallback
+                  ? 'Normalized capacity at 100 units per account'
+                  : (statsFallbackMode ? 'Unavailable in fallback mode' : 'Current total limit across accounts')}
               </div>
             </div>
             <div className={aggregate.total_wasted_units > 0 ? 'warn-card' : ''}>
@@ -1284,18 +1302,22 @@ function App() {
           </div>
           <div className="graph-container">
             <div className="graph-label">
-              {statsFallbackMode
-                ? `${chartRangeLabel} Utilization Trend (Fallback)`
-                : (statsChartMode === 'cumulative'
-                  ? `${chartRangeLabel} Cumulative Consumption`
-                  : `${chartRangeLabel} Consumption`)}
+              {statsModeledFallback
+                ? `${chartRangeLabel} Modeled Consumption`
+                : (statsFallbackMode
+                  ? `${chartRangeLabel} Utilization Trend (Fallback)`
+                  : (statsChartMode === 'cumulative'
+                    ? `${chartRangeLabel} Cumulative Consumption`
+                    : `${chartRangeLabel} Consumption`))}
             </div>
             <div className="chart-legend">
               <span className="legend-item">
                 <span className="legend-dot legend-dot-teal" />
-                {statsFallbackMode
-                  ? 'Usage line = weekly utilization % from stored snapshots (absolute counters unavailable)'
-                  : 'Usage line = consumed units (from lifetime deltas), not utilization %'}
+                {statsModeledFallback
+                  ? 'Usage line = normalized units reconstructed from utilization snapshots (100 per account)'
+                  : (statsFallbackMode
+                      ? 'Usage line = weekly utilization % from stored snapshots (absolute counters unavailable)'
+                      : 'Usage line = consumed units (from lifetime deltas), not utilization %')}
               </span>
               <span className="legend-item">
                 <span className="legend-dot legend-dot-amber" />
@@ -1357,7 +1379,7 @@ function App() {
 
           <div className="cards" style={{ marginTop: 16 }}>
             <div>
-              <label>Top Consuming Accounts</label>
+              <label>{statsModeledFallback ? 'Top Consuming Accounts (Modeled)' : 'Top Consuming Accounts'}</label>
               {usageHistory?.sections.top_consuming_accounts_available === false ? (
                 <div className="muted">Unavailable while using utilization fallback data.</div>
               ) : (
@@ -1414,6 +1436,13 @@ function App() {
                 </div>
 
                 <div className="cards analytics-cards" style={{ marginTop: 12 }}>
+                  {(() => {
+                    const accountFallbackMode = Boolean(historyData.summary?.fallback_mode || historyData.consumption_trend.fallback_mode)
+                    const accountModeledFallback = Boolean(
+                      historyData.summary?.modeled_usage_basis || historyData.consumption_trend.modeled_usage_basis,
+                    )
+                    return (
+                      <>
                   <div>
                     <label>Account Type</label>
                     <div className="unit-value"><strong>{historyData.account_type || 'ChatGPT Plus'}</strong></div>
@@ -1423,7 +1452,9 @@ function App() {
                     <label>{accountHistoryRange === '1d' ? 'Used Today' : 'Consumed In Range'}</label>
                     <div className="unit-value"><strong>{fmtNullableNumber(historyData.summary?.total_consumed_in_range ?? historyData.consumption_trend.total_consumed_in_range)}</strong></div>
                     <div className="muted small">
-                      {historyData.summary?.fallback_mode ? 'Unavailable in fallback mode' : 'Measured absolute usage'}
+                      {accountModeledFallback
+                        ? 'Modeled from utilization deltas in stored snapshots'
+                        : (accountFallbackMode ? 'Unavailable in fallback mode' : 'Measured absolute usage')}
                     </div>
                   </div>
                   <div>
@@ -1437,56 +1468,76 @@ function App() {
                     <label>Current Remaining</label>
                     <div className="unit-value"><strong>{fmtNullableNumber(historyData.summary?.current_total_remaining ?? historyData.current_state.remaining)}</strong></div>
                     <div className="muted small">
-                      {historyData.summary?.fallback_mode ? 'Unavailable in fallback mode' : 'Current remaining'}
+                      {accountModeledFallback
+                        ? 'Normalized remaining capacity'
+                        : (accountFallbackMode ? 'Unavailable in fallback mode' : 'Current remaining')}
                     </div>
                   </div>
                   <div>
                     <label>Current Limit</label>
                     <div className="unit-value"><strong>{fmtNullableNumber(historyData.summary?.current_total_limit ?? historyData.current_state.usage_limit)}</strong></div>
                     <div className="muted small">
-                      {historyData.summary?.fallback_mode ? 'Unavailable in fallback mode' : 'Current limit'}
+                      {accountModeledFallback
+                        ? 'Normalized capacity fixed at 100 units'
+                        : (accountFallbackMode ? 'Unavailable in fallback mode' : 'Current limit')}
                     </div>
                   </div>
-                  <div className={(historyData.current_state.efficiency_pct || 100) < 80 ? 'warn-card' : ''}>
+                  <div className={typeof historyData.current_state.efficiency_pct === 'number' && historyData.current_state.efficiency_pct < 80 ? 'warn-card' : ''}>
                     <label>Account Efficiency</label>
-                    <div className="unit-value"><strong>{historyData.current_state.efficiency_pct}%</strong></div>
-                    <div className="muted small">Used vs Waste</div>
+                    <div className="unit-value"><strong>{fmtNullableNumber(historyData.current_state.efficiency_pct, '%')}</strong></div>
+                    <div className="muted small">
+                      {accountFallbackMode ? 'Unavailable in fallback mode' : 'Used vs Waste'}
+                    </div>
                   </div>
                   <div><label>Lifetime Used</label><strong>{fmtNullableNumber(historyData.current_state.lifetime_used)}</strong></div>
                   <div><label>Next 5hr Reset</label><strong>{fmtTs(historyData.current_state.next_reset || null)}</strong></div>
                   <div><label>{historyData.summary?.last_refresh_label || 'Last Refresh'}</label><strong>{fmtTs(historyData.summary?.last_refresh_time || historyData.current_state.last_sync || null)}</strong></div>
+                      </>
+                    )
+                  })()}
                 </div>
 
                 <div className="graph-container" style={{ marginTop: 16 }}>
                   {historyData.summary?.fallback_mode || historyData.consumption_trend.fallback_mode ? (
                     <div className="fallback-banner" style={{ marginBottom: 12 }}>
-                      Absolute usage counters unavailable. Showing utilization-based fallback data.
+                      {historyData.summary?.modeled_usage_basis || historyData.consumption_trend.modeled_usage_basis
+                        ? 'Absolute usage counters unavailable. Showing modeled usage from 10-minute utilization snapshots.'
+                        : 'Absolute usage counters unavailable. Showing utilization-based fallback data.'}
                     </div>
                   ) : null}
                   <div className="graph-label">
-                    {(historyData.summary?.fallback_mode || historyData.consumption_trend.fallback_mode)
-                      ? `${rangeLabel(accountHistoryRange, historyData.range_metadata)} Utilization Trend (Fallback)`
+                    {((historyData.summary?.modeled_usage_basis || historyData.consumption_trend.modeled_usage_basis))
+                      ? `${rangeLabel(accountHistoryRange, historyData.range_metadata)} Modeled Consumption`
+                      : ((historyData.summary?.fallback_mode || historyData.consumption_trend.fallback_mode)
+                        ? `${rangeLabel(accountHistoryRange, historyData.range_metadata)} Utilization Trend (Fallback)`
                       : (accountChartMode === 'cumulative'
                           ? `${rangeLabel(accountHistoryRange, historyData.range_metadata)} Cumulative Consumption`
-                          : `${rangeLabel(accountHistoryRange, historyData.range_metadata)} Consumption`)}
+                          : `${rangeLabel(accountHistoryRange, historyData.range_metadata)} Consumption`))}
                   </div>
                   <div className="graph">
                     {(() => {
                       const accountFallbackMode = Boolean(historyData.summary?.fallback_mode || historyData.consumption_trend.fallback_mode)
-                      const points = accountFallbackMode
-                        ? (accountHistoryRange === '1d'
-                            ? (historyData.consumption_trend.hourly_weekly_utilization || [])
-                            : (historyData.consumption_trend.daily_weekly_utilization || []))
-                        : (accountChartMode === 'cumulative'
+                      const accountModeledFallback = Boolean(
+                        historyData.summary?.modeled_usage_basis || historyData.consumption_trend.modeled_usage_basis,
+                      )
+                      const points = accountModeledFallback
+                        ? (accountChartMode === 'cumulative'
                             ? historyData.consumption_trend.cumulative_usage
                             : historyData.consumption_trend.daily_usage)
+                        : (accountFallbackMode
+                            ? (accountHistoryRange === '1d'
+                                ? (historyData.consumption_trend.hourly_weekly_utilization || [])
+                                : (historyData.consumption_trend.daily_weekly_utilization || []))
+                            : (accountChartMode === 'cumulative'
+                                ? historyData.consumption_trend.cumulative_usage
+                                : historyData.consumption_trend.daily_usage))
                       if (!points.length) return <div className="muted">No history yet for this range.</div>
                       const values = points.map((p: any) => Number((p as any).value ?? (p as any).cumulative ?? (p as any).consumed ?? 0))
                       const maxVal = Math.max(0, ...values)
                       if (maxVal <= 0) {
                         return <div className="muted">No measurable consumption in this range yet.</div>
                       }
-                      const chartMax = accountFallbackMode ? 100 : Math.max(1, maxVal)
+                      const chartMax = (accountFallbackMode && !accountModeledFallback) ? 100 : Math.max(1, maxVal)
                       const width = 1000
                       const height = 220
                       const pad = 24

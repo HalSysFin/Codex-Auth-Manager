@@ -88,6 +88,14 @@ API/auth control:
 - `LOGIN_SESSION_TTL_SECONDS`
 - `ANALYTICS_TIMEZONE` (`1d` / "Today" analytics are computed from local midnight in this timezone)
 - `ANALYTICS_SNAPSHOT_INTERVAL_SECONDS` (default `600`, captures absolute + utilization snapshots every 10 minutes)
+- `MAX_ASSIGNABLE_UTILIZATION_PERCENT` (default `95`)
+- `ROTATION_REQUEST_THRESHOLD_PERCENT` (default `90`)
+- `EXHAUSTED_UTILIZATION_PERCENT` (default `100`)
+- `MIN_QUOTA_REMAINING` (default `10000`)
+- `ALLOW_CLIENT_INITIATED_ROTATION` (default `true`)
+- `LEASE_DEFAULT_TTL_SECONDS`
+- `LEASE_RENEWAL_MIN_REMAINING_SECONDS`
+- `WEEKLY_RESET_CONFIRMATION_REQUIRED` (default `true`)
 - `TRUSTED_PROXY_IPS`
 - `INTERNAL_NETWORK_CIDRS`
 
@@ -241,3 +249,29 @@ If callback was returned but not processed:
 - `1d` analytics mean `Today`, computed from local midnight to now using `ANALYTICS_TIMEZONE`.
 - When absolute usage counters are unavailable, the dashboard switches to fallback mode and shows utilization-based charts without pretending consumption is `0`.
 - Usage analytics snapshots are captured every `ANALYTICS_SNAPSHOT_INTERVAL_SECONDS` seconds. The default is 10 minutes and captures both absolute usage state (used, limit, remaining/lifetime context) and utilization percentages per account.
+
+## Lease Broker
+
+Auth Manager can now act as a lease broker for approved credentials already stored as saved profiles.
+
+- `POST /api/leases/acquire` selects the best policy-eligible credential and issues a time-bounded lease.
+- `POST /api/leases/{lease_id}/renew` extends an active lease while the credential is still usable.
+- `POST /api/leases/{lease_id}/release` voluntarily releases the lease and returns the credential to the pool if policy allows.
+- `POST /api/leases/{lease_id}/telemetry` stores time-series lease telemetry and updates the latest lease/credential summary.
+- `POST /api/leases/rotate` creates a replacement lease when policy allows and a healthy credential is available.
+- `GET /api/leases/{lease_id}` returns the current lease state with the latest telemetry summary.
+- `POST /api/admin/credentials/{credential_id}/mark-exhausted` forces a credential into exhausted state for testing/admin intervention.
+
+Lifecycle and policy rules:
+
+- A credential is only assignable when it is not already leased and stays below `MAX_ASSIGNABLE_UTILIZATION_PERCENT`.
+- Telemetry at or above `ROTATION_REQUEST_THRESHOLD_PERCENT` marks the active lease as `rotation_required`.
+- Telemetry at or above `EXHAUSTED_UTILIZATION_PERCENT` immediately marks the credential exhausted and revokes active leases using it.
+- Exhausted or over-threshold credentials stay unavailable until the weekly reset boundary has passed and fresh telemetry/reconciliation confirms the credential is back below policy thresholds.
+- Rotation never returns exhausted, revoked, expired, cooldown, already leased, or over-threshold credentials.
+
+Telemetry and reset behavior:
+
+- Lease telemetry is persisted as time-series rows keyed by lease, credential, and machine/agent ownership.
+- The latest telemetry summary is copied onto the active lease and credential for quick reads.
+- Weekly reset confirmation is explicit. Elapsed time alone does not restore assignability when `WEEKLY_RESET_CONFIRMATION_REQUIRED=true`.

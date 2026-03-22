@@ -41,6 +41,14 @@ class Settings(BaseSettings):
     openai_redirect_uri: str | None = None
     analytics_timezone: str = "UTC"
     analytics_snapshot_interval_seconds: int = 600
+    max_assignable_utilization_percent: float = 95.0
+    rotation_request_threshold_percent: float = 90.0
+    exhausted_utilization_percent: float = 100.0
+    min_quota_remaining: int = 10000
+    allow_client_initiated_rotation: bool = True
+    lease_default_ttl_seconds: int = 3600
+    lease_renewal_min_remaining_seconds: int = 300
+    weekly_reset_confirmation_required: bool = True
 
     def codex_auth_file(self) -> Path:
         return _expand(self.codex_auth_path)

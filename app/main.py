@@ -55,6 +55,20 @@ from .account_usage_store import (
     touch_profile_last_used,
     upsert_saved_profile,
 )
+from .lease_broker_store import (
+    ROTATION_REASONS,
+    acquire_broker_lease,
+    get_broker_lease_status,
+    initialize_lease_broker_store,
+    is_credential_assignable,
+    list_broker_credentials,
+    mark_broker_credential_exhausted,
+    record_broker_lease_telemetry,
+    release_broker_lease,
+    renew_broker_lease,
+    rotate_broker_lease,
+    sync_broker_credential,
+)
 from .auth_store import (
     AuthStoreError,
     persist_and_save_label,
@@ -119,9 +133,80 @@ class PersistCurrentAuthResult:
     codex_switch: dict[str, Any] | None
 
 
+def _audit_broker_event(event: str, **fields: Any) -> None:
+    payload = {"event": event}
+    for key, value in fields.items():
+        if value is None:
+            continue
+        payload[key] = value
+    logger.info("broker_audit %s", json.dumps(payload, separators=(",", ":"), sort_keys=True))
+
+
+def _broker_health_score_for_profile(
+    *,
+    utilization_pct: float | None,
+    refresh_status: dict[str, Any] | None,
+) -> float:
+    score = 100.0
+    if utilization_pct is not None:
+        score -= max(0.0, min(utilization_pct, 100.0)) * 0.6
+    if refresh_status and refresh_status.get("is_stale"):
+        score -= 15.0
+    if refresh_status and refresh_status.get("state") == "failed":
+        score -= 30.0
+    return round(max(0.0, min(score, 100.0)), 2)
+
+
+def _sync_broker_credentials_from_profiles() -> list[dict[str, Any]]:
+    profiles = _dedupe_profiles(list_profiles())
+    _touch_profiles_usage(profiles)
+    cached = _build_cached_accounts_snapshot(profiles=profiles)
+    synced: list[dict[str, Any]] = []
+    for account in cached.get("accounts", []):
+        if not isinstance(account, dict):
+            continue
+        account_key = str(account.get("account_key") or "").strip()
+        if not account_key:
+            continue
+        usage = account.get("usage_tracking") or {}
+        refresh_status = account.get("refresh_status") or {}
+        utilization_pct = usage.get("secondary_used_percent")
+        usage_limit = usage.get("usage_limit")
+        usage_in_window = usage.get("usage_in_window")
+        quota_remaining = None
+        if isinstance(usage_limit, (int, float)) and usage_limit > 0 and isinstance(usage_in_window, (int, float)):
+            quota_remaining = max(int(usage_limit) - int(usage_in_window), 0)
+        metadata = {
+            "label": account.get("label"),
+            "display_label": account.get("display_label"),
+            "email": account.get("email"),
+            "account_type": account.get("account_type"),
+        }
+        synced.append(
+            sync_broker_credential(
+                credential_id=account_key,
+                label=str(account.get("display_label") or account.get("label") or account.get("account_key") or ""),
+                utilization_pct=float(utilization_pct) if isinstance(utilization_pct, (int, float)) else None,
+                quota_remaining=quota_remaining,
+                health_score=_broker_health_score_for_profile(
+                    utilization_pct=float(utilization_pct) if isinstance(utilization_pct, (int, float)) else None,
+                    refresh_status=refresh_status,
+                ),
+                weekly_reset_at=(
+                    usage.get("secondary_resets_at")
+                    or usage.get("rate_limit_refresh_at")
+                ),
+                last_telemetry_at=usage.get("last_usage_sync_at") or usage.get("updated_at"),
+                metadata=metadata,
+            )
+        )
+    return synced
+
+
 @app.on_event("startup")
 async def on_startup() -> None:
     initialize_usage_store()
+    initialize_lease_broker_store()
     try:
         migration_result = migrate_legacy_local_state(
             sqlite_usage_path=settings.usage_db_file(),
@@ -1026,6 +1111,195 @@ async def api_next_available_account(
     )
 
 
+@app.post("/api/leases/acquire")
+async def api_lease_acquire(request: Request, payload: dict[str, Any]) -> JSONResponse:
+    _require_internal_auth(request)
+    machine_id = str(payload.get("machine_id") or "").strip()
+    agent_id = str(payload.get("agent_id") or "").strip()
+    if not machine_id or not agent_id:
+        raise HTTPException(status_code=400, detail="machine_id and agent_id are required")
+    _sync_broker_credentials_from_profiles()
+    result = acquire_broker_lease(
+        machine_id=machine_id,
+        agent_id=agent_id,
+        requested_ttl_seconds=payload.get("requested_ttl_seconds"),
+        reason=payload.get("reason"),
+    )
+    _audit_broker_event(
+        "lease_acquired" if result["status"] == "ok" else "lease_acquire_denied",
+        lease_id=(result.get("lease") or {}).get("id"),
+        credential_id=(result.get("lease") or {}).get("credential_id"),
+        machine_id=machine_id,
+        agent_id=agent_id,
+        decision=result["status"],
+        reason=result.get("reason") or payload.get("reason"),
+    )
+    return JSONResponse(result, status_code=200 if result["status"] == "ok" else 409)
+
+
+@app.post("/api/leases/{lease_id}/renew")
+async def api_lease_renew(request: Request, lease_id: str, payload: dict[str, Any]) -> JSONResponse:
+    _require_internal_auth(request)
+    machine_id = str(payload.get("machine_id") or "").strip()
+    agent_id = str(payload.get("agent_id") or "").strip()
+    if not machine_id or not agent_id:
+        raise HTTPException(status_code=400, detail="machine_id and agent_id are required")
+    _sync_broker_credentials_from_profiles()
+    result = renew_broker_lease(
+        lease_id=lease_id,
+        machine_id=machine_id,
+        agent_id=agent_id,
+    )
+    _audit_broker_event(
+        "lease_renewed" if result["status"] == "ok" else "lease_renew_denied",
+        lease_id=lease_id,
+        credential_id=((result.get("lease") or {}).get("credential_id")),
+        machine_id=machine_id,
+        agent_id=agent_id,
+        decision=result["status"],
+        reason=result.get("reason"),
+    )
+    return JSONResponse(result, status_code=200 if result["status"] == "ok" else 409)
+
+
+@app.post("/api/leases/{lease_id}/release")
+async def api_lease_release(request: Request, lease_id: str, payload: dict[str, Any]) -> JSONResponse:
+    _require_internal_auth(request)
+    machine_id = str(payload.get("machine_id") or "").strip()
+    agent_id = str(payload.get("agent_id") or "").strip()
+    if not machine_id or not agent_id:
+        raise HTTPException(status_code=400, detail="machine_id and agent_id are required")
+    result = release_broker_lease(
+        lease_id=lease_id,
+        machine_id=machine_id,
+        agent_id=agent_id,
+        reason=payload.get("reason"),
+    )
+    _audit_broker_event(
+        "lease_released" if result["status"] == "ok" else "lease_release_denied",
+        lease_id=lease_id,
+        credential_id=((result.get("lease") or {}).get("credential_id")),
+        machine_id=machine_id,
+        agent_id=agent_id,
+        decision=result["status"],
+        reason=result.get("reason") or payload.get("reason"),
+    )
+    return JSONResponse(result, status_code=200 if result["status"] == "ok" else 409)
+
+
+@app.post("/api/leases/{lease_id}/telemetry")
+async def api_lease_telemetry(request: Request, lease_id: str, payload: dict[str, Any]) -> JSONResponse:
+    _require_internal_auth(request)
+    machine_id = str(payload.get("machine_id") or "").strip()
+    agent_id = str(payload.get("agent_id") or "").strip()
+    captured_at = str(payload.get("captured_at") or "").strip()
+    if not machine_id or not agent_id or not captured_at:
+        raise HTTPException(status_code=400, detail="machine_id, agent_id, and captured_at are required")
+    result = record_broker_lease_telemetry(
+        lease_id=lease_id,
+        machine_id=machine_id,
+        agent_id=agent_id,
+        captured_at=captured_at,
+        requests_count=payload.get("requests_count"),
+        tokens_in=payload.get("tokens_in"),
+        tokens_out=payload.get("tokens_out"),
+        utilization_pct=payload.get("utilization_pct"),
+        quota_remaining=payload.get("quota_remaining"),
+        rate_limit_remaining=payload.get("rate_limit_remaining"),
+        status=payload.get("status"),
+        last_success_at=payload.get("last_success_at"),
+        last_error_at=payload.get("last_error_at"),
+        error_rate_1h=payload.get("error_rate_1h"),
+        metadata=payload.get("metadata") if isinstance(payload.get("metadata"), dict) else None,
+    )
+    event_name = "lease_telemetry_ingested" if result["status"] == "ok" else "lease_telemetry_denied"
+    result_lease = result.get("lease") or {}
+    result_credential = result.get("credential") or {}
+    if result["status"] == "ok" and result_credential.get("state") == "exhausted":
+        _audit_broker_event(
+            "credential_marked_exhausted",
+            lease_id=lease_id,
+            credential_id=result_credential.get("id"),
+            machine_id=machine_id,
+            agent_id=agent_id,
+            decision="ok",
+            reason="credential_exhausted",
+        )
+    _audit_broker_event(
+        event_name,
+        lease_id=lease_id,
+        credential_id=result_lease.get("credential_id"),
+        machine_id=machine_id,
+        agent_id=agent_id,
+        decision=result["status"],
+        reason=result.get("reason") or payload.get("status"),
+    )
+    return JSONResponse(result, status_code=200 if result["status"] == "ok" else 409)
+
+
+@app.post("/api/leases/rotate")
+async def api_lease_rotate(request: Request, payload: dict[str, Any]) -> JSONResponse:
+    _require_internal_auth(request)
+    lease_id = str(payload.get("lease_id") or "").strip()
+    machine_id = str(payload.get("machine_id") or "").strip()
+    agent_id = str(payload.get("agent_id") or "").strip()
+    reason = str(payload.get("reason") or "").strip()
+    if not lease_id or not machine_id or not agent_id or not reason:
+        raise HTTPException(status_code=400, detail="lease_id, machine_id, agent_id, and reason are required")
+    if reason not in ROTATION_REASONS:
+        raise HTTPException(status_code=400, detail="invalid rotation reason")
+    _sync_broker_credentials_from_profiles()
+    result = rotate_broker_lease(
+        lease_id=lease_id,
+        machine_id=machine_id,
+        agent_id=agent_id,
+        reason=reason,
+    )
+    _audit_broker_event(
+        "rotation_approved" if result["status"] == "ok" else "rotation_denied",
+        lease_id=lease_id,
+        credential_id=((result.get("lease") or {}).get("credential_id")),
+        machine_id=machine_id,
+        agent_id=agent_id,
+        decision=result["status"],
+        reason=result.get("reason") or reason,
+    )
+    return JSONResponse(result, status_code=200 if result["status"] == "ok" else 409)
+
+
+@app.get("/api/leases/{lease_id}")
+async def api_lease_status(request: Request, lease_id: str) -> JSONResponse:
+    _require_internal_auth(request)
+    _sync_broker_credentials_from_profiles()
+    status = get_broker_lease_status(lease_id)
+    if status is None:
+        raise HTTPException(status_code=404, detail="Lease not found")
+    return JSONResponse(status)
+
+
+@app.post("/api/admin/credentials/{credential_id}/mark-exhausted")
+async def api_admin_mark_credential_exhausted(
+    request: Request,
+    credential_id: str,
+    payload: dict[str, Any] | None = None,
+) -> JSONResponse:
+    _require_internal_auth(request)
+    _sync_broker_credentials_from_profiles()
+    result = mark_broker_credential_exhausted(
+        credential_id,
+        reason=str((payload or {}).get("reason") or "admin_marked_exhausted"),
+    )
+    if result is None:
+        raise HTTPException(status_code=404, detail="Credential not found")
+    _audit_broker_event(
+        "credential_marked_exhausted",
+        credential_id=credential_id,
+        decision="ok",
+        reason=str((payload or {}).get("reason") or "admin_marked_exhausted"),
+    )
+    return JSONResponse({"status": "ok", "credential": result})
+
+
 @app.get("/api/accounts/stream")
 async def api_accounts_stream(request: Request) -> StreamingResponse:
     _require_internal_auth_or_query(request)
@@ -1323,6 +1597,12 @@ async def api_usage_history(request: Request, range: str = "30d") -> JSONRespons
         account_id=None,
         hours=_history_hours_for_range(selected_range),
     )
+    modeled_per_account_daily = _compute_modeled_consumption_per_account(
+        snapshots=usage_snapshots,
+        since_dt=since_dt,
+        tz=analytics_tz,
+        metric="secondary_used_percent",
+    )
     daily_weekly_utilization = _compute_daily_utilization_series(
         snapshots=usage_snapshots,
         since_dt=since_dt,
@@ -1371,14 +1651,55 @@ async def api_usage_history(request: Request, range: str = "30d") -> JSONRespons
     )
     fallback_mode = (not absolute_usage_available) and bool(fallback_series)
     if fallback_mode:
-        daily_series = []
+        cluster_modeled_daily: dict[str, float] = {}
+        for _, day_map in modeled_per_account_daily.items():
+            for day, consumed in day_map.items():
+                cluster_modeled_daily[day] = cluster_modeled_daily.get(day, 0.0) + float(consumed)
+        daily_series = [
+            {"day": day, "consumed": round(cluster_modeled_daily[day], 2)}
+            for day in sorted(cluster_modeled_daily.keys())
+        ]
+        running_modeled = 0.0
         cumulative_series = []
-        consumed_total = None
-        avg_daily = None
-        current_total_used_value = None
-        current_total_limit_value = None
-        current_total_remaining_value = None
-        top_accounts_payload: list[dict[str, Any]] = []
+        for item in daily_series:
+            running_modeled += float(item["consumed"])
+            cumulative_series.append(
+                {
+                    "day": item["day"],
+                    "cumulative": round(running_modeled, 2),
+                    "consumed": float(item["consumed"]),
+                }
+            )
+        consumed_total = round(sum(float(item["consumed"]) for item in daily_series), 2) if daily_series else 0.0
+        avg_daily = round(consumed_total / selected_days, 2) if selected_days > 0 else 0.0
+        modeled_current_values = [
+            float((account.get("usage_tracking") or {}).get("secondary_used_percent"))
+            for account in cached["accounts"]
+            if (account.get("usage_tracking") or {}).get("secondary_used_percent") is not None
+        ]
+        current_total_used_value = round(sum(modeled_current_values), 2) if modeled_current_values else None
+        current_total_limit_value = float(len(modeled_current_values) * 100) if modeled_current_values else None
+        current_total_remaining_value = (
+            round(current_total_limit_value - current_total_used_value, 2)
+            if current_total_limit_value is not None and current_total_used_value is not None
+            else None
+        )
+        consumed_by_account = {
+            account_key: round(sum(float(v) for v in day_map.values()), 2)
+            for account_key, day_map in modeled_per_account_daily.items()
+        }
+        top_accounts = sorted(consumed_by_account.items(), key=lambda item: item[1], reverse=True)[:10]
+        top_accounts_payload = [
+            {
+                "account_key": account_key,
+                "label": account_label_by_key.get(account_key, account_key),
+                "display_label": account_display_by_key.get(account_key, account_key),
+                "email": account_email_by_key.get(account_key),
+                "consumed": float(consumed),
+            }
+            for account_key, consumed in top_accounts
+        ]
+        top_accounts_available = True
     else:
         current_total_used_value = current_total_used
         current_total_limit_value = current_total_limit
@@ -1393,6 +1714,7 @@ async def api_usage_history(request: Request, range: str = "30d") -> JSONRespons
             }
             for account_key, consumed in top_accounts
         ]
+        top_accounts_available = True
     if fallback_mode:
         coverage_start = None
         coverage_end = None
@@ -1429,6 +1751,11 @@ async def api_usage_history(request: Request, range: str = "30d") -> JSONRespons
                 "last_refresh_label": (
                     "Last snapshot refresh" if fallback_mode else "Last absolute usage refresh"
                 ),
+                "modeled_usage_basis": (
+                    "normalized_100_units_from_utilization_snapshots"
+                    if fallback_mode
+                    else None
+                ),
                 "weekly_utilization_now": weekly_utilization_now,
                 "average_weekly_utilization_in_range": avg_weekly_utilization_in_range,
             },
@@ -1442,7 +1769,7 @@ async def api_usage_history(request: Request, range: str = "30d") -> JSONRespons
             },
             "sections": {
                 "top_consuming_accounts": top_accounts_payload,
-                "top_consuming_accounts_available": not fallback_mode,
+                "top_consuming_accounts_available": top_accounts_available,
                 "stale_accounts": stale_accounts,
                 "failed_accounts": failed_accounts,
                 "recent_rollovers": recent_rollovers,
@@ -1504,6 +1831,12 @@ async def api_account_history(request: Request, label: str, range: str = "30d") 
         account_id=profile.account_key,
         hours=_history_hours_for_range(selected_range),
     )
+    modeled_day_map = _compute_modeled_consumption_per_account(
+        snapshots=usage_snapshots,
+        since_dt=since_dt,
+        tz=analytics_tz,
+        metric="secondary_used_percent",
+    ).get(profile.account_key, {})
     daily_weekly_utilization = _compute_daily_utilization_series(
         snapshots=usage_snapshots,
         since_dt=since_dt,
@@ -1531,14 +1864,33 @@ async def api_account_history(request: Request, label: str, range: str = "30d") 
     stale_account_count = 1 if status.get("is_stale") else 0
     failed_account_count = 1 if status.get("state") == "failed" else 0
     if fallback_mode:
-        daily_series = []
+        daily_series = [
+            {"day": day, "consumed": round(float(modeled_day_map[day]), 2)}
+            for day in sorted(modeled_day_map.keys())
+        ]
+        running_modeled = 0.0
         cumulative_series = []
-        total_consumed_in_range = None
-        avg_daily = None
-        current_used_value = None
-        current_limit_value = None
-        remaining_value = None
-        utilization_value = None
+        for item in daily_series:
+            running_modeled += float(item["consumed"])
+            cumulative_series.append(
+                {
+                    "day": item["day"],
+                    "cumulative": round(running_modeled, 2),
+                    "consumed": float(item["consumed"]),
+                }
+            )
+        total_consumed_in_range = (
+            round(sum(float(item["consumed"]) for item in daily_series), 2) if daily_series else 0.0
+        )
+        avg_daily = round((total_consumed_in_range / selected_days), 2) if selected_days > 0 else 0.0
+        current_used_value = _current_modeled_usage_from_percent(usage.get("secondary_used_percent"))
+        current_limit_value = 100.0 if current_used_value is not None else None
+        remaining_value = (
+            round(max(current_limit_value - current_used_value, 0.0), 2)
+            if current_limit_value is not None and current_used_value is not None
+            else None
+        )
+        utilization_value = current_used_value
         coverage_start = str(fallback_series[0].get("day") or fallback_series[0].get("t") or "") if fallback_series else None
         coverage_end = str(fallback_series[-1].get("day") or fallback_series[-1].get("t") or "") if fallback_series else None
         last_refresh_time = _latest_captured_at(usage_snapshots) or status.get("last_success_at") or usage.get("last_usage_sync_at") or usage.get("updated_at")
@@ -1564,7 +1916,16 @@ async def api_account_history(request: Request, label: str, range: str = "30d") 
         row["utilization_percent"] = round((used / limit) * 100, 2) if limit > 0 else None
 
     sec_used = float(usage.get("secondary_used_percent") or 0.0)
-    efficiency = round((total_consumed_in_range / (total_consumed_in_range + wasted_total)) * 100, 2) if (total_consumed_in_range + wasted_total) > 0 else 100.0
+    if fallback_mode:
+        efficiency = None
+    elif total_consumed_in_range is None:
+        efficiency = None
+    else:
+        efficiency = (
+            round((total_consumed_in_range / (total_consumed_in_range + wasted_total)) * 100, 2)
+            if (total_consumed_in_range + wasted_total) > 0
+            else 100.0
+        )
 
     return JSONResponse(
         {
@@ -1590,6 +1951,11 @@ async def api_account_history(request: Request, label: str, range: str = "30d") 
                 "fallback_mode": fallback_mode,
                 "fallback_reason": (
                     "absolute_usage_unavailable_using_weekly_utilization"
+                    if fallback_mode
+                    else None
+                ),
+                "modeled_usage_basis": (
+                    "normalized_100_units_from_utilization_snapshots"
                     if fallback_mode
                     else None
                 ),
@@ -1625,6 +1991,11 @@ async def api_account_history(request: Request, label: str, range: str = "30d") 
                 "average_daily_consumption": avg_daily,
                 "absolute_usage_available": absolute_usage_available,
                 "fallback_mode": fallback_mode,
+                "modeled_usage_basis": (
+                    "normalized_100_units_from_utilization_snapshots"
+                    if fallback_mode
+                    else None
+                ),
                 "daily_weekly_utilization": daily_weekly_utilization,
                 "hourly_weekly_utilization": hourly_weekly_utilization,
             },
@@ -3117,15 +3488,81 @@ def _compute_daily_consumption_per_account(
     return out
 
 
+def _compute_modeled_consumption_per_account(
+    *,
+    snapshots: list[dict[str, Any]],
+    since_dt: datetime | None,
+    tz: ZoneInfo | None = None,
+    metric: str = "secondary_used_percent",
+) -> dict[str, dict[str, float]]:
+    analytics_tz = tz or _analytics_tzinfo()
+    by_account: dict[str, list[tuple[datetime, float]]] = {}
+    for row in snapshots:
+        account_id = str(row.get("account_id") or "").strip()
+        captured_dt = _parse_captured_at(row.get("captured_at"))
+        raw = row.get(metric)
+        if not account_id or captured_dt is None or raw is None:
+            continue
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            continue
+        if not (0.0 <= value <= 100.0):
+            continue
+        by_account.setdefault(account_id, []).append((captured_dt, value))
+
+    out: dict[str, dict[str, float]] = {}
+    for account_id, points in by_account.items():
+        points.sort(key=lambda item: item[0])
+        prev_dt: datetime | None = None
+        prev_value: float | None = None
+        acc_day: dict[str, float] = {}
+        for captured_dt, value in points:
+            if prev_value is None:
+                prev_dt = captured_dt
+                prev_value = value
+                continue
+            delta = value - prev_value
+            if delta < 0:
+                prev_dt = captured_dt
+                prev_value = value
+                continue
+            if since_dt is not None and captured_dt < since_dt:
+                prev_dt = captured_dt
+                prev_value = value
+                continue
+            if since_dt is not None and prev_dt is not None and prev_dt < since_dt <= captured_dt:
+                # We have a point spanning the boundary, so treat the delta after the boundary as in-range.
+                day = captured_dt.astimezone(analytics_tz).date().isoformat()
+                acc_day[day] = acc_day.get(day, 0.0) + delta
+            elif since_dt is None or (prev_dt is not None and prev_dt >= since_dt):
+                day = captured_dt.astimezone(analytics_tz).date().isoformat()
+                acc_day[day] = acc_day.get(day, 0.0) + delta
+            prev_dt = captured_dt
+            prev_value = value
+        out[account_id] = {day: round(value, 2) for day, value in acc_day.items()}
+    return out
+
+
+def _current_modeled_usage_from_percent(raw: Any) -> float | None:
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return None
+    if not (0.0 <= value <= 100.0):
+        return None
+    return round(value, 2)
+
+
 def _history_hours_for_range(selected_range: str) -> int:
     if selected_range == "1d":
-        return 24
+        return 48
     if selected_range == "7d":
-        return 24 * 7
+        return 24 * 8
     if selected_range == "30d":
-        return 24 * 30
+        return 24 * 31
     if selected_range == "90d":
-        return 24 * 90
+        return 24 * 91
     # "all" can be large; cap to last year for bounded query cost.
     return 24 * 365
 
