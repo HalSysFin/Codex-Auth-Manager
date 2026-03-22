@@ -436,13 +436,57 @@ def list_usage_rollovers(
         _ensure_schema(conn)
         rows = conn.execute(
             """
-            SELECT id, account_id, window_started_at, window_ended_at, usage_limit, usage_used, usage_wasted, rolled_over_at
+            SELECT id, account_id, window_started_at, window_ended_at, usage_limit, usage_used, usage_wasted,
+                   primary_percent_at_reset, secondary_percent_at_reset, rolled_over_at
             FROM usage_rollovers
             WHERE account_id = ?
             ORDER BY window_ended_at ASC, id ASC
             """,
             (account_id,),
         ).fetchall()
+        return [dict(row) for row in rows]
+
+
+def record_percentage_snapshot(
+    account_id: str,
+    primary_used_percent: float | None,
+    secondary_used_percent: float | None,
+    now: datetime | None = None,
+    db_path: Path | None = None,
+) -> None:
+    """Record a periodic snapshot of utilization percentages for time-series graphing."""
+    now_dt = _as_utc(now)
+    now_iso = _to_iso(now_dt)
+    with _connect(db_path) as conn:
+        _ensure_schema(conn)
+        conn.execute(
+            """
+            INSERT INTO usage_snapshots (account_id, primary_used_percent, secondary_used_percent, captured_at)
+            VALUES (?, ?, ?, ?)
+            """,
+            (account_id, primary_used_percent, secondary_used_percent, now_iso),
+        )
+
+
+def list_usage_snapshots(
+    account_id: str | None = None,
+    hours: int = 168,
+    db_path: Path | None = None,
+) -> list[dict[str, Any]]:
+    """Return percentage snapshots for an account (or all accounts) over the last N hours."""
+    cutoff = _to_iso(_as_utc(None) - timedelta(hours=hours))
+    with _connect(db_path) as conn:
+        _ensure_schema(conn)
+        if account_id:
+            rows = conn.execute(
+                "SELECT * FROM usage_snapshots WHERE account_id = ? AND captured_at >= ? ORDER BY captured_at ASC",
+                (account_id, cutoff),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT * FROM usage_snapshots WHERE captured_at >= ? ORDER BY captured_at ASC",
+                (cutoff,),
+            ).fetchall()
         return [dict(row) for row in rows]
 
 
@@ -603,6 +647,8 @@ def _refresh_account_window_if_needed_locked(
     window_type = _normalize_window_type(str(row["rate_limit_window_type"]))
     usage_limit = max(int(row["usage_limit"]), 0)
     usage_in_window = max(int(row["usage_in_window"]), 0)
+    primary_pct = row["primary_used_percent"] if row["primary_used_percent"] is not None else None
+    secondary_pct = row["secondary_used_percent"] if row["secondary_used_percent"] is not None else None
     last_refreshed_at = (
         _parse_iso(str(row["rate_limit_last_refreshed_at"]))
         if row["rate_limit_last_refreshed_at"]
@@ -625,8 +671,10 @@ def _refresh_account_window_if_needed_locked(
                 usage_limit,
                 usage_used,
                 usage_wasted,
+                primary_percent_at_reset,
+                secondary_percent_at_reset,
                 rolled_over_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 account_id,
@@ -635,6 +683,8 @@ def _refresh_account_window_if_needed_locked(
                 usage_limit,
                 usage_in_window,
                 wasted,
+                primary_pct,
+                secondary_pct,
                 now_iso,
             ),
         )
@@ -745,6 +795,33 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_usage_rollovers_window_ended_at ON usage_rollovers(window_ended_at)"
     )
+
+    # Percentage snapshots time-series table
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS usage_snapshots (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            account_id TEXT NOT NULL,
+            primary_used_percent REAL NULL,
+            secondary_used_percent REAL NULL,
+            captured_at TEXT NOT NULL,
+            FOREIGN KEY(account_id) REFERENCES accounts(id)
+        )
+        """
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_usage_snapshots_account_captured ON usage_snapshots(account_id, captured_at)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_usage_snapshots_captured ON usage_snapshots(captured_at)"
+    )
+
+    # Add percentage columns to rollovers if missing
+    rollover_cols = {str(row["name"]) for row in conn.execute("PRAGMA table_info(usage_rollovers)").fetchall()}
+    if "primary_percent_at_reset" not in rollover_cols:
+        conn.execute("ALTER TABLE usage_rollovers ADD COLUMN primary_percent_at_reset REAL NULL")
+    if "secondary_percent_at_reset" not in rollover_cols:
+        conn.execute("ALTER TABLE usage_rollovers ADD COLUMN secondary_percent_at_reset REAL NULL")
 
     # Backfill any legacy/partial rows with consistent UTC defaults.
     now_iso = _to_iso(datetime.now(timezone.utc))

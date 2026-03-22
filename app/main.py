@@ -17,7 +17,7 @@ from urllib.parse import parse_qs, urlparse
 
 import httpx
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 from .accounts import AccountProfile, list_profiles
@@ -34,10 +34,12 @@ from .account_usage_store import (
     get_account,
     initialize_usage_store,
     list_usage_rollovers,
+    list_usage_snapshots,
     merge_account_data,
     migrate_account_ids,
     rename_account_data,
     record_account_usage,
+    record_percentage_snapshot,
     reconcile_due_accounts,
     sync_account_rate_limit_percentages,
     sync_account_usage_snapshot,
@@ -157,47 +159,61 @@ async def health() -> dict[str, str]:
 
 
 @app.get("/login")
-async def login_page() -> JSONResponse:
-    return JSONResponse(
-        {"detail": "Backend UI login is disabled. Use the React frontend and API authentication."},
-        status_code=410,
-    )
+async def login_page(next: str = "/") -> HTMLResponse:
+    return HTMLResponse(_render_login(next))
 
 
 @app.post("/login")
-async def login_submit() -> JSONResponse:
-    return JSONResponse(
-        {"detail": "Backend UI login is disabled. Use the React frontend and API authentication."},
-        status_code=410,
-    )
+async def login_submit(request: Request) -> JSONResponse:
+    if not _web_login_enabled():
+        raise HTTPException(status_code=503, detail="Web login is not configured")
+
+    content_type = request.headers.get("content-type", "")
+    username = ""
+    password = ""
+    next_path = "/"
+
+    if "application/json" in content_type:
+        payload = await request.json()
+        if isinstance(payload, dict):
+            username = str(payload.get("username", "")).strip()
+            password = str(payload.get("password", ""))
+            next_path = str(payload.get("next", "/")) or "/"
+    else:
+        raw = (await request.body()).decode("utf-8", errors="replace")
+        parsed = parse_qs(raw, keep_blank_values=True)
+        username = (parsed.get("username", [""])[0] or "").strip()
+        password = parsed.get("password", [""])[0] or ""
+        next_path = parsed.get("next", ["/"])[0] or "/"
+
+    if not _verify_web_credentials(username, password):
+        raise HTTPException(status_code=401, detail="Invalid username or password")
+
+    response = JSONResponse({"ok": True, "next": _safe_next_path(next_path)})
+    _set_web_session_cookie(request, response)
+    return response
 
 
 @app.post("/logout")
-async def logout() -> JSONResponse:
-    return JSONResponse(
-        {"detail": "Backend UI logout is disabled. Use the React frontend session flow."},
-        status_code=410,
-    )
+async def logout(request: Request) -> JSONResponse:
+    response = JSONResponse({"ok": True})
+    response.delete_cookie(settings.web_login_cookie_name, path="/")
+    return response
 
 
 @app.get("/")
-async def index() -> JSONResponse:
-    return JSONResponse(
-        {
-            "service": "codex-auth-manager-api",
-            "ui": "Use the React frontend service for UI.",
-            "health": "/health",
-            "docs": "/docs",
-        }
-    )
+async def index() -> HTMLResponse:
+    return _spa_or_legacy_index()
 
 
 @app.get("/ui")
-async def ui() -> JSONResponse:
-    return JSONResponse(
-        {"detail": "Backend UI is disabled. Use the React frontend service."},
-        status_code=410,
-    )
+async def ui() -> HTMLResponse:
+    return _spa_or_legacy_index()
+
+
+@app.get("/v1")
+async def v1_legacy_ui() -> HTMLResponse:
+    return HTMLResponse(_render_index())
 
 
 @app.get("/ui/accounts/{label}")
@@ -1128,6 +1144,78 @@ async def api_usage_aggregate(request: Request) -> JSONResponse:
     return JSONResponse({"aggregate": snapshot["aggregate"], "current_label": snapshot["current_label"]})
 
 
+@app.get("/api/usage/snapshots")
+async def api_usage_snapshots(request: Request) -> JSONResponse:
+    """Return cluster-wide hourly utilization trend from percentage snapshots."""
+    _require_internal_auth(request)
+    snapshots = list_usage_snapshots(account_id=None, hours=168)  # 7 days
+
+    # Bucket by hour across all accounts
+    hourly: dict[str, dict[str, Any]] = {}
+    for snap in snapshots:
+        ts = str(snap.get("captured_at") or "")[:13]  # YYYY-MM-DDTHH
+        if len(ts) < 13:
+            continue
+        bucket = hourly.setdefault(ts, {"p1_sum": 0, "p2_sum": 0, "count": 0})
+        bucket["p1_sum"] += float(snap.get("primary_used_percent") or 0)
+        bucket["p2_sum"] += float(snap.get("secondary_used_percent") or 0)
+        bucket["count"] += 1
+
+    points = []
+    for hour_key in sorted(hourly.keys()):
+        b = hourly[hour_key]
+        n = max(b["count"], 1)
+        points.append({
+            "t": hour_key + ":00:00",
+            "avg_primary_pct": round(b["p1_sum"] / n, 1),
+            "avg_secondary_pct": round(b["p2_sum"] / n, 1),
+            "samples": b["count"],
+        })
+
+    return JSONResponse({"trend": points})
+
+
+@app.get("/api/accounts/{label}/snapshots")
+async def api_account_snapshots(request: Request, label: str) -> JSONResponse:
+    """Return per-account hourly utilization trend from percentage snapshots."""
+    _require_internal_auth(request)
+    profile = _profile_for_label(label)
+    if profile is None:
+        raise HTTPException(status_code=404, detail="Label not found")
+
+    snapshots = list_usage_snapshots(account_id=profile.account_key, hours=168)
+
+    hourly: dict[str, dict[str, Any]] = {}
+    for snap in snapshots:
+        ts = str(snap.get("captured_at") or "")[:13]
+        if len(ts) < 13:
+            continue
+        bucket = hourly.setdefault(ts, {"p1_sum": 0, "p2_sum": 0, "count": 0})
+        bucket["p1_sum"] += float(snap.get("primary_used_percent") or 0)
+        bucket["p2_sum"] += float(snap.get("secondary_used_percent") or 0)
+        bucket["count"] += 1
+
+    points = []
+    for hour_key in sorted(hourly.keys()):
+        b = hourly[hour_key]
+        n = max(b["count"], 1)
+        points.append({
+            "t": hour_key + ":00:00",
+            "avg_primary_pct": round(b["p1_sum"] / n, 1),
+            "avg_secondary_pct": round(b["p2_sum"] / n, 1),
+            "samples": b["count"],
+        })
+
+    # Also include rollovers with percentage data
+    rollovers = list_usage_rollovers(profile.account_key)
+
+    return JSONResponse({
+        "label": profile.label,
+        "trend": points,
+        "rollovers": rollovers,
+    })
+
+
 @app.get("/api/public-stats")
 async def api_public_stats() -> JSONResponse:
     profiles = _dedupe_profiles(list_profiles())
@@ -1292,6 +1380,8 @@ async def _exchange_code_for_token(
 
 
 def _require_internal_auth(request: Request) -> None:
+    if _web_login_enabled() and _has_valid_web_session(request):
+        return
     configured_token = (settings.internal_api_token or "").strip()
     if not configured_token:
         raise HTTPException(
@@ -1329,6 +1419,8 @@ def _has_valid_internal_api_token(request: Request) -> bool:
 
 
 def _require_internal_auth_or_query(request: Request) -> None:
+    if _web_login_enabled() and _has_valid_web_session(request):
+        return
     if _has_valid_internal_api_token(request):
         return
     configured_token = (settings.internal_api_token or "").strip()
@@ -1625,7 +1717,7 @@ def _safe_next_path(next_path: str) -> str:
     return candidate
 
 
-def _set_web_session_cookie(request: Request, response: RedirectResponse) -> None:
+def _set_web_session_cookie(request: Request, response: Response) -> None:
     secure = request.headers.get("x-forwarded-proto", request.url.scheme) == "https"
     response.set_cookie(
         key=settings.web_login_cookie_name,
@@ -1841,6 +1933,18 @@ def _sync_profile_usage_from_session_limits(profile: AccountProfile, rate_info: 
             )
         except Exception:
             logger.exception("Unable to sync percentage limits for key=%s", profile.account_key)
+
+        # Record a point-in-time snapshot for time-series graphing
+        if primary_percent is not None or secondary_percent is not None:
+            try:
+                record_percentage_snapshot(
+                    profile.account_key,
+                    primary_used_percent=primary_percent,
+                    secondary_used_percent=secondary_percent,
+                    now=datetime.now(timezone.utc),
+                )
+            except Exception:
+                logger.exception("Unable to record percentage snapshot for key=%s", profile.account_key)
 
     if (
         snapshot["usage_limit"] is None
