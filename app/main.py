@@ -1130,11 +1130,35 @@ async def api_account_usage_history(request: Request, label: str) -> JSONRespons
             "account_key": profile.account_key,
             "display_label": _display_label(profile.label, profile.email),
             "email": profile.email,
+            "account_type": _infer_account_type(profile),
             "usage_tracking": usage,
             "rollovers": rollovers,
             "summary": summary,
         }
     )
+
+
+def _rollover_summary(rollovers: list[dict[str, Any]], usage: dict[str, Any] | None) -> dict[str, Any]:
+    weekly_rollovers = [r for r in rollovers if _is_weekly_rollover(r)]
+    total_wasted = sum(float(item.get("usage_wasted") or 0.0) for item in weekly_rollovers)
+    total_used_completed = sum(float(item.get("usage_used") or 0.0) for item in weekly_rollovers)
+    window_count = len(weekly_rollovers)
+    
+    avg_efficiency = None
+    if (total_used_completed + total_wasted) > 0:
+        avg_efficiency = round((total_used_completed / (total_used_completed + total_wasted)) * 100, 2)
+
+    current_weekly_used = float((usage or {}).get("secondary_used_percent") or 0.0)
+    current_weekly_remaining = max(100.0 - current_weekly_used, 0.0)
+
+    return {
+        "total_wasted_units": total_wasted,
+        "total_used_units": total_used_completed,
+        "window_count": window_count,
+        "avg_efficiency_pct": avg_efficiency,
+        "current_weekly_used": current_weekly_used,
+        "current_weekly_remaining": current_weekly_remaining,
+    }
 
 
 @app.get("/api/usage/stats")
@@ -1295,6 +1319,51 @@ async def api_usage_history(request: Request, range: str = "30d") -> JSONRespons
     avg_daily = round(consumed_total / selected_days, 2) if selected_days > 0 else 0.0
     wasted_total = sum(int(item.get("usage_wasted") or 0) for item in weekly_rollovers)
 
+    # Fallback analytics path when absolute usage counters are unavailable:
+    # use stored weekly utilization percentage snapshots so stats are still informative.
+    usage_snapshots = list_usage_snapshots(
+        account_id=None,
+        hours=_history_hours_for_range(selected_range),
+    )
+    daily_weekly_utilization = _compute_daily_utilization_series(
+        snapshots=usage_snapshots,
+        since_dt=since_dt,
+        metric="secondary_used_percent",
+    )
+    hourly_weekly_utilization = _compute_hourly_utilization_series(
+        snapshots=usage_snapshots,
+        since_dt=since_dt,
+        metric="secondary_used_percent",
+    )
+    fallback_series = (
+        hourly_weekly_utilization if selected_range == "1d" else daily_weekly_utilization
+    )
+    avg_weekly_utilization_in_range = (
+        round(
+            sum(float(item.get("value") or 0) for item in fallback_series)
+            / max(len(fallback_series), 1),
+            2,
+        )
+        if fallback_series
+        else None
+    )
+    live_weekly_percents = [
+        float((account.get("usage_tracking") or {}).get("secondary_used_percent"))
+        for account in cached["accounts"]
+        if (account.get("usage_tracking") or {}).get("secondary_used_percent") is not None
+    ]
+    weekly_utilization_now = (
+        round(sum(live_weekly_percents) / max(len(live_weekly_percents), 1), 2)
+        if live_weekly_percents
+        else None
+    )
+    absolute_unavailable = (
+        consumed_total == 0
+        and int(cached["aggregate"]["total_current_window_used"] or 0) == 0
+        and int(cached["aggregate"]["total_current_window_limit"] or 0) == 0
+    )
+    fallback_mode = absolute_unavailable and bool(fallback_series)
+
     return JSONResponse(
         {
             "range": selected_range,
@@ -1308,12 +1377,22 @@ async def api_usage_history(request: Request, range: str = "30d") -> JSONRespons
                 "stale_account_count": len(stale_accounts),
                 "failed_account_count": len(failed_accounts),
                 "last_refresh_time": cached["aggregate"]["last_refresh_time"],
+                "fallback_mode": fallback_mode,
+                "fallback_reason": (
+                    "absolute_usage_unavailable_using_weekly_utilization"
+                    if fallback_mode
+                    else None
+                ),
+                "weekly_utilization_now": weekly_utilization_now,
+                "average_weekly_utilization_in_range": avg_weekly_utilization_in_range,
             },
             "series": {
                 "cumulative_usage": cumulative_series,
                 "daily_usage": daily_series,
                 "daily_rollover_wasted": wasted_bars,
                 "daily_rollover_used": daily_used_bars,
+                "daily_weekly_utilization": daily_weekly_utilization,
+                "hourly_weekly_utilization": hourly_weekly_utilization,
             },
             "sections": {
                 "top_consuming_accounts": [
@@ -1354,9 +1433,9 @@ async def api_account_history(request: Request, label: str, range: str = "30d") 
     rollovers_all = list_usage_rollovers(profile.account_key)
     rollovers_filtered = _filter_rollovers_by_range(rollovers_all, since_dt)
     weekly_rollovers = [row for row in rollovers_filtered if _is_weekly_rollover(row)]
-    snapshots = list_absolute_usage_snapshots(account_id=profile.account_key)
+    absolute_snapshots = list_absolute_usage_snapshots(account_id=profile.account_key)
     per_account_daily = _compute_daily_consumption_per_account(
-        snapshots=snapshots,
+        snapshots=absolute_snapshots,
         since_dt=since_dt,
     )
     day_map = per_account_daily.get(profile.account_key, {})
@@ -1377,7 +1456,32 @@ async def api_account_history(request: Request, label: str, range: str = "30d") 
     utilization = round((current_used / current_limit) * 100, 2) if current_limit > 0 else None
     wasted_total = sum(int(item.get("usage_wasted") or 0) for item in weekly_rollovers)
     selected_days = _selected_day_count(selected_range, daily_series)
-    avg_daily = round((sum(int(item["consumed"]) for item in daily_series) / selected_days), 2) if selected_days > 0 else 0.0
+    total_consumed_in_range = sum(int(item["consumed"]) for item in daily_series)
+    avg_daily = round((total_consumed_in_range / selected_days), 2) if selected_days > 0 else 0.0
+
+    usage_snapshots = list_usage_snapshots(
+        account_id=profile.account_key,
+        hours=_history_hours_for_range(selected_range),
+    )
+    daily_weekly_utilization = _compute_daily_utilization_series(
+        snapshots=usage_snapshots,
+        since_dt=since_dt,
+        metric="secondary_used_percent",
+    )
+    hourly_weekly_utilization = _compute_hourly_utilization_series(
+        snapshots=usage_snapshots,
+        since_dt=since_dt,
+        metric="secondary_used_percent",
+    )
+    fallback_series = (
+        hourly_weekly_utilization if selected_range == "1d" else daily_weekly_utilization
+    )
+    absolute_unavailable = (
+        total_consumed_in_range == 0
+        and current_used == 0
+        and current_limit == 0
+    )
+    fallback_mode = absolute_unavailable and bool(fallback_series)
 
     completed_windows = sorted(
         weekly_rollovers,
@@ -1389,28 +1493,38 @@ async def api_account_history(request: Request, label: str, range: str = "30d") 
         limit = int(row.get("usage_limit") or 0)
         row["utilization_percent"] = round((used / limit) * 100, 2) if limit > 0 else None
 
+    sec_used = float(usage.get("secondary_used_percent") or 0.0)
+    efficiency = round((total_consumed_in_range / (total_consumed_in_range + wasted_total)) * 100, 2) if (total_consumed_in_range + wasted_total) > 0 else 100.0
+
     return JSONResponse(
         {
             "label": profile.label,
             "account_key": profile.account_key,
             "display_label": _display_label(profile.label, profile.email),
             "email": profile.email,
+            "account_type": _infer_account_type(profile),
             "range": selected_range,
             "current_state": {
                 "usage_in_window": current_used,
                 "usage_limit": current_limit,
                 "remaining": remaining,
                 "utilization_percent": utilization,
-                "next_reset": usage.get("rate_limit_refresh_at"),
+                "weekly_used_units": sec_used,
+                "weekly_remaining_units": max(100.0 - sec_used, 0.0),
+                "next_reset": usage.get("primary_resets_at") or usage.get("rate_limit_refresh_at"),
                 "lifetime_used": int(usage.get("lifetime_used") or 0),
-                "last_sync": usage.get("last_usage_sync_at"),
+                "last_sync": usage.get("last_usage_sync_at") or usage.get("updated_at"),
                 "refresh_status": status,
+                "efficiency_pct": efficiency,
             },
             "consumption_trend": {
                 "cumulative_usage": cumulative_series,
                 "daily_usage": daily_series,
-                "total_consumed_in_range": sum(int(item["consumed"]) for item in daily_series),
+                "total_consumed_in_range": total_consumed_in_range,
                 "average_daily_consumption": avg_daily,
+                "fallback_mode": fallback_mode,
+                "daily_weekly_utilization": daily_weekly_utilization,
+                "hourly_weekly_utilization": hourly_weekly_utilization,
             },
             "completed_windows": [
                 {
@@ -1434,7 +1548,7 @@ async def api_account_history(request: Request, label: str, range: str = "30d") 
             "freshness": {
                 "coverage_start": cumulative_series[0]["day"] if cumulative_series else None,
                 "coverage_end": cumulative_series[-1]["day"] if cumulative_series else None,
-                "snapshot_points": len(snapshots),
+                "snapshot_points": len(absolute_snapshots),
                 "daily_points": len(daily_series),
                 "is_sparse": len(daily_series) < 3,
             },
@@ -1763,6 +1877,14 @@ def _build_cached_accounts_snapshot(
     return {"accounts": accounts, "current_label": current, "aggregate": aggregate}
 
 
+def _infer_account_type(profile: AccountProfile) -> str:
+    n = (profile.name or "").lower()
+    p = (profile.provider_account_id or "").lower()
+    if "business" in n or "team" in n or p.startswith("org-"):
+        return "ChatGPT Business"
+    return "ChatGPT Plus"
+
+
 def _account_payload(
     profile: AccountProfile,
     current_label_name: str | None,
@@ -1807,6 +1929,7 @@ def _account_payload(
         "display_label": _display_label(profile.label, profile.email),
         "email": profile.email,
         "is_current": profile.label == current_label_name,
+        "account_type": _infer_account_type(profile),
         "rate_limits": rate_limits,
         "usage_tracking": usage_tracking,
         "refresh_status": refresh_status,
@@ -1822,11 +1945,19 @@ def _compute_aggregate(accounts: list[dict[str, Any]]) -> dict[str, Any]:
     failed_count = 0
     last_refresh: str | None = None
 
+    fleet_capacity_units = len(accounts) * 100
+    fleet_used_units = 0.0
+
     for account in accounts:
         usage = account.get("usage_tracking") or {}
         total_used += int(usage.get("usage_in_window") or 0)
         total_limit += int(usage.get("usage_limit") or 0)
         lifetime_used += int(usage.get("lifetime_used") or 0)
+        
+        sec_limits = account.get("rate_limits", {}).get("secondary")
+        if isinstance(sec_limits, dict):
+            fleet_used_units += float(sec_limits.get("percent") or 0.0)
+        
         refresh_status = account.get("refresh_status") or {}
         if refresh_status.get("is_stale"):
             stale_count += 1
@@ -1837,18 +1968,27 @@ def _compute_aggregate(accounts: list[dict[str, Any]]) -> dict[str, Any]:
             if last_refresh is None or last_success_at > last_refresh:
                 last_refresh = last_success_at
         rollovers = list_usage_rollovers(str(account.get("account_key") or ""))
-        total_wasted += sum(int(item.get("usage_wasted") or 0) for item in rollovers)
+        total_wasted += sum(int(item.get("usage_wasted") or 0) for item in rollovers if _is_weekly_rollover(item))
 
     remaining = max(total_limit - total_used, 0)
     utilization = round((total_used / total_limit) * 100, 2) if total_limit > 0 else 0.0
+    
+    fleet_utilization_pct = round((fleet_used_units / fleet_capacity_units) * 100, 2) if fleet_capacity_units > 0 else 0.0
+    fleet_efficiency_pct = round((fleet_used_units / (fleet_used_units + total_wasted)) * 100, 2) if (fleet_used_units + total_wasted) > 0 else 100.0
+
     return {
         "accounts": len(accounts),
+        "fleet_capacity_units": fleet_capacity_units,
+        "fleet_used_units": round(fleet_used_units, 2),
+        "fleet_remaining_units": round(max(fleet_capacity_units - fleet_used_units, 0), 2),
+        "fleet_utilization_pct": fleet_utilization_pct,
+        "fleet_efficiency_pct": fleet_efficiency_pct,
         "total_current_window_used": total_used,
         "total_current_window_limit": total_limit,
         "total_remaining": remaining,
         "aggregate_utilization_percent": utilization,
         "lifetime_total_used": lifetime_used,
-        "total_wasted": total_wasted,
+        "total_wasted_units": total_wasted,
         "stale_accounts": stale_count,
         "failed_accounts": failed_count,
         "last_refresh_time": _LAST_REFRESH_COMPLETED_AT or last_refresh,
@@ -2679,31 +2819,6 @@ def _profile_identity_key(profile: AccountProfile) -> str:
     return f"label:{profile.label}"
 
 
-def _rollover_summary(rollovers: list[dict[str, Any]], usage: dict[str, Any] | None) -> dict[str, Any]:
-    total_wasted = sum(int(item.get("usage_wasted") or 0) for item in rollovers)
-    total_used_completed = sum(int(item.get("usage_used") or 0) for item in rollovers)
-    total_limit_completed = sum(int(item.get("usage_limit") or 0) for item in rollovers)
-    window_count = len(rollovers)
-    avg_completed_utilization_percent = None
-    if total_limit_completed > 0:
-        avg_completed_utilization_percent = round(
-            (total_used_completed / total_limit_completed) * 100, 2
-        )
-
-    current_limit = int((usage or {}).get("usage_limit") or 0)
-    current_used = int((usage or {}).get("usage_in_window") or 0)
-    current_wasted_if_rollover_now = max(current_limit - current_used, 0)
-
-    return {
-        "window_count": window_count,
-        "total_wasted": total_wasted,
-        "total_used_completed": total_used_completed,
-        "total_limit_completed": total_limit_completed,
-        "avg_completed_utilization_percent": avg_completed_utilization_percent,
-        "current_wasted_if_rollover_now": current_wasted_if_rollover_now,
-    }
-
-
 def _daily_rollover_trend(rollovers: list[dict[str, Any]]) -> list[dict[str, Any]]:
     buckets: dict[str, dict[str, int]] = {}
     for item in rollovers:
@@ -2742,6 +2857,8 @@ def _daily_rollover_trend(rollovers: list[dict[str, Any]]) -> list[dict[str, Any
 def _parse_history_range(value: str | None) -> tuple[str, datetime | None]:
     raw = (value or "30d").strip().lower()
     now = datetime.now(timezone.utc)
+    if raw in {"1d", "1", "day", "24h"}:
+        return ("1d", now - timedelta(days=1))
     if raw in {"7d", "7", "week"}:
         return ("7d", now - timedelta(days=7))
     if raw in {"30d", "30", "1m", "month"}:
@@ -2794,6 +2911,96 @@ def _compute_daily_consumption_per_account(
     return out
 
 
+def _history_hours_for_range(selected_range: str) -> int:
+    if selected_range == "1d":
+        return 24
+    if selected_range == "7d":
+        return 24 * 7
+    if selected_range == "30d":
+        return 24 * 30
+    if selected_range == "90d":
+        return 24 * 90
+    # "all" can be large; cap to last year for bounded query cost.
+    return 24 * 365
+
+
+def _compute_daily_utilization_series(
+    *,
+    snapshots: list[dict[str, Any]],
+    since_dt: datetime | None,
+    metric: str,
+) -> list[dict[str, Any]]:
+    since_day = since_dt.date().isoformat() if since_dt else None
+    buckets: dict[str, dict[str, float]] = {}
+    for row in snapshots:
+        captured_at = str(row.get("captured_at") or "").strip()
+        if len(captured_at) < 10:
+            continue
+        day = captured_at[:10]
+        if since_day is not None and day < since_day:
+            continue
+        raw = row.get(metric)
+        if raw is None:
+            continue
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            continue
+        bucket = buckets.setdefault(day, {"sum": 0.0, "count": 0.0})
+        bucket["sum"] += value
+        bucket["count"] += 1.0
+
+    series: list[dict[str, Any]] = []
+    for day in sorted(buckets.keys()):
+        b = buckets[day]
+        if b["count"] <= 0:
+            continue
+        series.append({"day": day, "value": round(b["sum"] / b["count"], 2)})
+    return series
+
+
+def _compute_hourly_utilization_series(
+    *,
+    snapshots: list[dict[str, Any]],
+    since_dt: datetime | None,
+    metric: str,
+) -> list[dict[str, Any]]:
+    buckets: dict[str, dict[str, float]] = {}
+    for row in snapshots:
+        captured_at = str(row.get("captured_at") or "").strip()
+        if not captured_at:
+            continue
+        try:
+            captured_dt = datetime.fromisoformat(captured_at.replace("Z", "+00:00"))
+        except ValueError:
+            continue
+        if captured_dt.tzinfo is None:
+            captured_dt = captured_dt.replace(tzinfo=timezone.utc)
+        else:
+            captured_dt = captured_dt.astimezone(timezone.utc)
+        if since_dt is not None and captured_dt < since_dt:
+            continue
+        raw = row.get(metric)
+        if raw is None:
+            continue
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            continue
+        hour_key = captured_dt.strftime("%Y-%m-%dT%H:00:00Z")
+        bucket = buckets.setdefault(hour_key, {"sum": 0.0, "count": 0.0})
+        bucket["sum"] += value
+        bucket["count"] += 1.0
+
+    series: list[dict[str, Any]] = []
+    for hour_key in sorted(buckets.keys()):
+        b = buckets[hour_key]
+        if b["count"] <= 0:
+            continue
+        series.append({"t": hour_key, "value": round(b["sum"] / b["count"], 2)})
+    return series
+
+
 def _filter_rollovers_by_range(
     rollovers: list[dict[str, Any]], since_dt: datetime | None
 ) -> list[dict[str, Any]]:
@@ -2808,6 +3015,8 @@ def _filter_rollovers_by_range(
 
 
 def _is_weekly_rollover(row: dict[str, Any]) -> bool:
+    if row.get("window_type") == "weekly":
+        return True
     start_raw = str(row.get("window_started_at") or "")
     end_raw = str(row.get("window_ended_at") or "")
     if not start_raw or not end_raw:
@@ -2843,6 +3052,8 @@ def _group_rollover_metric_by_day(
 
 
 def _selected_day_count(selected_range: str, daily_series: list[dict[str, Any]]) -> int:
+    if selected_range == "1d":
+        return 1
     if selected_range == "7d":
         return 7
     if selected_range == "30d":
@@ -3122,5 +3333,3 @@ def _render_login(next_path: str) -> str:
     </div>
   </body>
 </html>"""
-
-

@@ -38,6 +38,7 @@ type Account = {
   display_label: string | null
   email: string | null
   is_current: boolean
+  account_type?: string | null
   rate_limits?: {
     primary?: Limit | null
     secondary?: Limit | null
@@ -51,12 +52,17 @@ type Account = {
 
 type Aggregate = {
   accounts: number
+  fleet_capacity_units: number
+  fleet_used_units: number
+  fleet_remaining_units: number
+  fleet_utilization_pct: number
+  fleet_efficiency_pct: number
   total_current_window_used: number
   total_current_window_limit: number
   total_remaining: number
   aggregate_utilization_percent: number
   lifetime_total_used: number
-  total_wasted: number
+  total_wasted_units: number
   stale_accounts: number
   failed_accounts: number
   last_refresh_time: string | null
@@ -76,19 +82,23 @@ type StreamSnapshot = {
 }
 
 type ViewMode = 'manager' | 'stats'
-type RangeKey = '7d' | '30d' | '90d' | 'all'
+type RangeKey = '1d' | '7d' | '30d' | '90d' | 'all'
 
 type AccountHistoryResponse = {
   label: string
   account_key: string
   display_label: string | null
   email: string | null
+  account_type?: string | null
   range: RangeKey
   current_state: {
     usage_in_window: number
     usage_limit: number
     remaining: number
     utilization_percent?: number | null
+    weekly_used_units?: number | null
+    weekly_remaining_units?: number | null
+    efficiency_pct?: number | null
     next_reset?: string | null
     lifetime_used: number
     last_sync?: string | null
@@ -99,6 +109,9 @@ type AccountHistoryResponse = {
     daily_usage: Array<{ day: string; consumed: number }>
     total_consumed_in_range: number
     average_daily_consumption: number
+    fallback_mode?: boolean
+    daily_weekly_utilization?: Array<{ day: string; value: number }>
+    hourly_weekly_utilization?: Array<{ t: string; value: number }>
   }
   completed_windows: Array<{
     window_start?: string
@@ -137,12 +150,18 @@ type UsageHistoryResponse = {
     stale_account_count: number
     failed_account_count: number
     last_refresh_time: string | null
+    fallback_mode?: boolean
+    fallback_reason?: string | null
+    weekly_utilization_now?: number | null
+    average_weekly_utilization_in_range?: number | null
   }
   series: {
     cumulative_usage: Array<{ day: string; cumulative: number; consumed: number }>
     daily_usage: Array<{ day: string; consumed: number }>
     daily_rollover_wasted: Array<{ day: string; value: number }>
     daily_rollover_used: Array<{ day: string; value: number }>
+    daily_weekly_utilization?: Array<{ day: string; value: number }>
+    hourly_weekly_utilization?: Array<{ t: string; value: number }>
   }
   sections: {
     top_consuming_accounts: Array<{
@@ -195,12 +214,17 @@ type SessionStatus = {
 
 const defaultAggregate: Aggregate = {
   accounts: 0,
+  fleet_capacity_units: 0,
+  fleet_used_units: 0,
+  fleet_remaining_units: 0,
+  fleet_utilization_pct: 0,
+  fleet_efficiency_pct: 100,
   total_current_window_used: 0,
   total_current_window_limit: 0,
   total_remaining: 0,
   aggregate_utilization_percent: 0,
   lifetime_total_used: 0,
-  total_wasted: 0,
+  total_wasted_units: 0,
   stale_accounts: 0,
   failed_accounts: 0,
   last_refresh_time: null,
@@ -416,8 +440,16 @@ function App() {
 
   const statsDaily = usageHistory?.series.daily_usage || []
   const statsCumulative = usageHistory?.series.cumulative_usage || []
-  const statsPrimarySeries = statsChartMode === 'daily' ? statsDaily : statsCumulative
-  const statsMaxValue = Math.max(1, ...statsPrimarySeries.map((d: any) => Number((d as any).consumed ?? (d as any).cumulative ?? 0)))
+  const weeklyUtilizationSeries = selectedRange === '1d'
+    ? (usageHistory?.series.hourly_weekly_utilization || [])
+    : (usageHistory?.series.daily_weekly_utilization || [])
+  const statsFallbackMode = Boolean(usageHistory?.summary.fallback_mode && weeklyUtilizationSeries.length)
+  const statsPrimarySeries = statsFallbackMode
+    ? weeklyUtilizationSeries
+    : (statsChartMode === 'daily' ? statsDaily : statsCumulative)
+  const statsMaxValue = statsFallbackMode
+    ? 100
+    : Math.max(1, ...statsPrimarySeries.map((d: any) => Number((d as any).consumed ?? (d as any).cumulative ?? 0)))
   const wastedSeries = usageHistory?.series.daily_rollover_wasted || []
   const wastedMaxValue = Math.max(1, ...wastedSeries.map((d) => Number(d.value || 0)))
   const weeklyPercents = accounts
@@ -1079,7 +1111,7 @@ function App() {
                       </button>
                       {badge ? <span className="pill" style={badge.style}>{badge.text}</span> : null}
                     </div>
-                    <div className="muted">{a.email || 'email unavailable'}</div>
+                    <div className="muted">{a.email || 'email unavailable'} · <span className="mono">{a.account_type || 'ChatGPT Plus'}</span></div>
                     <div className="muted mono">Profile label: {a.label}</div>
                   </div>
                   <div>
@@ -1123,7 +1155,7 @@ function App() {
             <p className="muted">Consumption over time across all accounts (absolute usage).</p>
           </div>
           <div className="top-actions" style={{ marginBottom: 12 }}>
-            {(['7d', '30d', '90d', 'all'] as RangeKey[]).map((r) => (
+            {(['1d', '7d', '30d', '90d', 'all'] as RangeKey[]).map((r) => (
               <button key={r} className={`btn btn-sm ${selectedRange === r ? 'primary' : ''}`} onClick={() => setSelectedRange(r)}>
                 {r}
               </button>
@@ -1131,27 +1163,50 @@ function App() {
             <button className={`btn btn-sm ${statsChartMode === 'cumulative' ? 'primary' : ''}`} onClick={() => setStatsChartMode('cumulative')}>Cumulative</button>
             <button className={`btn btn-sm ${statsChartMode === 'daily' ? 'primary' : ''}`} onClick={() => setStatsChartMode('daily')}>Daily</button>
           </div>
-          <div className="cards">
-            <div><label>Total Consumed ({selectedRange})</label><strong>{usageHistory?.summary.total_consumed_in_range ?? 0}</strong></div>
-            <div><label>Avg Daily Consumption</label><strong>{usageHistory?.summary.average_daily_consumption ?? 0}</strong></div>
-            <div><label>Current Total Used</label><strong>{usageHistory?.summary.current_total_used ?? aggregate.total_current_window_used}</strong></div>
-            <div><label>Current Total Limit</label><strong>{usageHistory?.summary.current_total_limit ?? aggregate.total_current_window_limit}</strong></div>
-            <div><label>Current Remaining</label><strong>{usageHistory?.summary.current_total_remaining ?? aggregate.total_remaining}</strong></div>
-            <div className={(usageHistory?.summary.total_wasted || 0) > 1000 ? 'warn-card' : ''}><label>Total Wasted</label><strong>{usageHistory?.summary.total_wasted ?? 0}</strong></div>
-            <div><label>Stale Accounts</label><strong>{usageHistory?.summary.stale_account_count ?? 0}</strong></div>
-            <div><label>Failed Accounts</label><strong>{usageHistory?.summary.failed_account_count ?? 0}</strong></div>
-            <div><label>Last Refresh</label><strong>{fmtTs(usageHistory?.summary.last_refresh_time ?? aggregate.last_refresh_time)}</strong></div>
+          <div className="cards analytics-cards">
+            <div>
+              <label>Fleet Capacity Units</label>
+              <div className="unit-value"><strong>{aggregate.fleet_capacity_units}</strong> <span className="u">CU</span></div>
+              <div className="muted small">100 CU per account/week</div>
+            </div>
+            <div>
+              <label>Consumed Capacity</label>
+              <div className="unit-value"><strong>{aggregate.fleet_used_units}</strong> <span className="u">CU</span></div>
+              <div className={`muted small ${pctClass(aggregate.fleet_utilization_pct)}`}>{aggregate.fleet_utilization_pct}% utilization</div>
+            </div>
+            <div>
+              <label>Available Capacity</label>
+              <div className="unit-value"><strong>{aggregate.fleet_remaining_units}</strong> <span className="u">CU</span></div>
+              <div className="muted small">Remaining in weekly cycles</div>
+            </div>
+            <div className={aggregate.fleet_efficiency_pct < 80 ? 'warn-card' : ''}>
+              <label>Fleet Efficiency</label>
+              <div className="unit-value"><strong>{aggregate.fleet_efficiency_pct}%</strong></div>
+              <div className="muted small">Consumed vs Wasted</div>
+            </div>
+            <div className={aggregate.total_wasted_units > 0 ? 'warn-card' : ''}>
+              <label>Quota Leakage</label>
+              <div className="unit-value"><strong>{aggregate.total_wasted_units}</strong> <span className="u">CU</span></div>
+              <div className="muted small">Wasted at weekly reset</div>
+            </div>
+            <div><label>Stale Accounts</label><strong>{aggregate.stale_accounts}</strong></div>
+            <div><label>Failed Accounts</label><strong>{aggregate.failed_accounts}</strong></div>
+            <div><label>Last Refresh</label><strong>{fmtTs(aggregate.last_refresh_time)}</strong></div>
           </div>
           <div className="graph-container">
             <div className="graph-label">
-              {statsChartMode === 'cumulative'
-                ? 'Cumulative Consumed Units Over Time'
-                : 'Daily Consumed Units'}
+              {statsFallbackMode
+                ? 'Weekly Utilization Trend (Fallback)'
+                : (statsChartMode === 'cumulative'
+                  ? 'Cumulative Consumed Units Over Time'
+                  : 'Daily Consumed Units')}
             </div>
             <div className="chart-legend">
               <span className="legend-item">
                 <span className="legend-dot legend-dot-teal" />
-                Usage line = consumed units (from lifetime deltas), not utilization %
+                {statsFallbackMode
+                  ? 'Usage line = weekly utilization % from stored snapshots (absolute counters unavailable)'
+                  : 'Usage line = consumed units (from lifetime deltas), not utilization %'}
               </span>
               <span className="legend-item">
                 <span className="legend-dot legend-dot-amber" />
@@ -1164,7 +1219,7 @@ function App() {
                 <svg viewBox="0 0 1000 220" preserveAspectRatio="none">
                   <line x1="24" y1="196" x2="976" y2="196" stroke="#334155" strokeWidth="1" />
                   <path
-                    d={buildLinePath(statsPrimarySeries.map((p: any) => Number(p.cumulative ?? p.consumed ?? 0)))}
+                    d={buildLinePath(statsPrimarySeries.map((p: any) => Number(p.value ?? p.cumulative ?? p.consumed ?? 0)))}
                     fill="none"
                     stroke="#10b981"
                     strokeWidth="3"
@@ -1172,10 +1227,10 @@ function App() {
                     strokeLinejoin="round"
                   />
                   {statsPrimarySeries.map((point: any, i: number) => {
-                    const value = Number(point.cumulative ?? point.consumed ?? 0)
+                    const value = Number(point.value ?? point.cumulative ?? point.consumed ?? 0)
                     const x = 24 + (i / Math.max(statsPrimarySeries.length - 1, 1)) * (1000 - 48)
                     const y = 196 - (value / statsMaxValue) * (220 - 48)
-                    return <circle key={`${point.day}-${value}-${i}`} cx={x} cy={y} r="3" fill="#10b981" />
+                    return <circle key={`${point.day ?? point.t ?? i}-${value}-${i}`} cx={x} cy={y} r="3" fill="#10b981" />
                   })}
                 </svg>
               ) : <div className="muted">No usage history yet for this range.</div>}
@@ -1251,7 +1306,7 @@ function App() {
                 <div className="muted"><strong>{historyData.display_label || historyData.label}</strong> · {historyData.email || 'email unavailable'}</div>
 
                 <div className="top-actions" style={{ marginTop: 10 }}>
-                  {(['7d', '30d', '90d', 'all'] as RangeKey[]).map((r) => (
+                  {(['1d', '7d', '30d', '90d', 'all'] as RangeKey[]).map((r) => (
                     <button key={r} className={`btn btn-sm ${accountHistoryRange === r ? 'primary' : ''}`} onClick={() => void reloadAccountHistory(r)}>
                       {r}
                     </button>
@@ -1260,41 +1315,86 @@ function App() {
                   <button className={`btn btn-sm ${accountChartMode === 'daily' ? 'primary' : ''}`} onClick={() => setAccountChartMode('daily')}>Daily</button>
                 </div>
 
-                <div className="cards" style={{ marginTop: 12 }}>
-                  <div><label>Current Used</label><strong>{historyData.current_state.usage_in_window}</strong></div>
-                  <div><label>Current Limit</label><strong>{historyData.current_state.usage_limit}</strong></div>
-                  <div><label>Remaining</label><strong>{historyData.current_state.remaining}</strong></div>
-                  <div><label>Next Reset</label><strong>{fmtTs(historyData.current_state.next_reset || null)}</strong></div>
+                <div className="cards analytics-cards" style={{ marginTop: 12 }}>
+                  <div>
+                    <label>Account Type</label>
+                    <div className="unit-value"><strong>{historyData.account_type || 'ChatGPT Plus'}</strong></div>
+                    <div className="muted small">Plan category</div>
+                  </div>
+                  <div>
+                    <label>Weekly Consumed</label>
+                    <div className="unit-value"><strong>{historyData.current_state.weekly_used_units}</strong> <span className="u">CU</span></div>
+                    <div className="muted small">Quota used this week</div>
+                  </div>
+                  <div>
+                    <label>Weekly Remaining</label>
+                    <div className="unit-value"><strong>{historyData.current_state.weekly_remaining_units}</strong> <span className="u">CU</span></div>
+                    <div className="muted small">Potential before reset</div>
+                  </div>
+                  <div className={(historyData.current_state.efficiency_pct || 100) < 80 ? 'warn-card' : ''}>
+                    <label>Account Efficiency</label>
+                    <div className="unit-value"><strong>{historyData.current_state.efficiency_pct}%</strong></div>
+                    <div className="muted small">Used vs Waste</div>
+                  </div>
                   <div><label>Lifetime Used</label><strong>{historyData.current_state.lifetime_used}</strong></div>
-                  <div><label>Last Sync</label><strong>{fmtTs(historyData.current_state.last_sync || null)}</strong></div>
-                  <div><label>Range Consumed</label><strong>{historyData.consumption_trend.total_consumed_in_range}</strong></div>
-                  <div><label>Avg Daily</label><strong>{historyData.consumption_trend.average_daily_consumption}</strong></div>
-                  <div><label>Data Coverage</label><strong>{historyData.freshness.coverage_start || '--'} → {historyData.freshness.coverage_end || '--'}</strong></div>
+                  <div><label>Next 5hr Reset</label><strong>{fmtTs(historyData.current_state.next_reset || null)}</strong></div>
+                  <div><label>Sync Time</label><strong>{fmtTs(historyData.current_state.last_sync || null)}</strong></div>
                 </div>
 
                 <div className="graph-container" style={{ marginTop: 16 }}>
-                  <div className="graph-label">{accountChartMode === 'cumulative' ? 'Cumulative Consumption' : 'Daily Consumption'}</div>
+                  <div className="graph-label">
+                    {historyData.consumption_trend.fallback_mode
+                      ? 'Weekly Utilization Trend (Fallback)'
+                      : (accountChartMode === 'cumulative' ? 'Cumulative Consumption' : 'Daily Consumption')}
+                  </div>
                   <div className="graph">
                     {(() => {
-                      const points = accountChartMode === 'cumulative'
-                        ? historyData.consumption_trend.cumulative_usage
-                        : historyData.consumption_trend.daily_usage
+                      const accountFallbackMode = Boolean(historyData.consumption_trend.fallback_mode)
+                      const points = accountFallbackMode
+                        ? (accountHistoryRange === '1d'
+                            ? (historyData.consumption_trend.hourly_weekly_utilization || [])
+                            : (historyData.consumption_trend.daily_weekly_utilization || []))
+                        : (accountChartMode === 'cumulative'
+                            ? historyData.consumption_trend.cumulative_usage
+                            : historyData.consumption_trend.daily_usage)
                       if (!points.length) return <div className="muted">No history yet for this range.</div>
-                      const maxVal = Math.max(1, ...points.map((p: any) => Number((p as any).cumulative ?? (p as any).consumed ?? 0)))
+                      const values = points.map((p: any) => Number((p as any).value ?? (p as any).cumulative ?? (p as any).consumed ?? 0))
+                      const maxVal = Math.max(0, ...values)
+                      if (maxVal <= 0) {
+                        return <div className="muted">No measurable consumption in this range yet.</div>
+                      }
+                      const chartMax = accountFallbackMode ? 100 : Math.max(1, maxVal)
+                      const width = 1000
+                      const height = 220
+                      const pad = 24
+                      const usableW = width - pad * 2
+                      const usableH = height - pad * 2
+                      const path = points
+                        .map((p: any, i: number) => {
+                          const value = Number((p as any).value ?? (p as any).cumulative ?? (p as any).consumed ?? 0)
+                          const x = pad + (i / Math.max(points.length - 1, 1)) * usableW
+                          const y = height - pad - (value / chartMax) * usableH
+                          return `${i === 0 ? 'M' : 'L'} ${x.toFixed(2)} ${y.toFixed(2)}`
+                        })
+                        .join(' ')
                       return (
-                        <div style={{ display: 'grid', gap: 6 }}>
-                          {points.slice(-30).map((p: any) => {
-                            const value = Number((p as any).cumulative ?? (p as any).consumed ?? 0)
-                            const pct = Math.max(2, Math.round((value / maxVal) * 100))
-                            return (
-                              <div key={`${p.day}-${value}`} style={{ display: 'grid', gridTemplateColumns: '84px 1fr 88px', gap: 8, alignItems: 'center' }}>
-                                <span className="muted mono">{p.day}</span>
-                                <div className="bar"><span className="fill ok" style={{ width: `${pct}%` }} /></div>
-                                <span className="mono">{value}</span>
-                              </div>
-                            )
+                        <svg viewBox="0 0 1000 220" preserveAspectRatio="none">
+                          <line x1="24" y1="196" x2="976" y2="196" stroke="#334155" strokeWidth="1" />
+                          <path
+                            d={path}
+                            fill="none"
+                            stroke="#10b981"
+                            strokeWidth="3"
+                            strokeLinecap="round"
+                            strokeLinejoin="round"
+                          />
+                          {points.map((p: any, i: number) => {
+                            const value = Number((p as any).value ?? (p as any).cumulative ?? (p as any).consumed ?? 0)
+                            const x = 24 + (i / Math.max(points.length - 1, 1)) * (1000 - 48)
+                            const y = 196 - (value / chartMax) * (220 - 48)
+                            return <circle key={`${p.day ?? p.t ?? i}-${value}-${i}`} cx={x} cy={y} r="3" fill="#10b981" />
                           })}
-                        </div>
+                        </svg>
                       )
                     })()}
                   </div>

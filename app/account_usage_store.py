@@ -1253,6 +1253,7 @@ def _refresh_account_window_if_needed_locked(
         else None
     )
 
+    # Primary window (e.g. 5-hour) reconciliation
     changed = False
     while now_dt >= refresh_at:
         window_started = last_refreshed_at or _previous_boundary(refresh_at, window_type)
@@ -1263,27 +1264,13 @@ def _refresh_account_window_if_needed_locked(
         conn.execute(
             """
             INSERT OR IGNORE INTO usage_rollovers (
-                account_id,
-                window_started_at,
-                window_ended_at,
-                usage_limit,
-                usage_used,
-                usage_wasted,
-                primary_percent_at_reset,
-                secondary_percent_at_reset,
-                rolled_over_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                account_id, window_started_at, window_ended_at, usage_limit, usage_used, usage_wasted,
+                primary_percent_at_reset, secondary_percent_at_reset, rolled_over_at, window_type
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
-                account_id,
-                window_started_iso,
-                window_ended_iso,
-                usage_limit,
-                usage_in_window,
-                wasted,
-                primary_pct,
-                secondary_pct,
-                now_iso,
+                account_id, window_started_iso, window_ended_iso, usage_limit, usage_in_window, wasted,
+                primary_pct, secondary_pct, now_iso, 'short',
             ),
         )
 
@@ -1291,6 +1278,40 @@ def _refresh_account_window_if_needed_locked(
         refresh_at = _next_boundary(refresh_at, window_type)
         usage_in_window = 0
         changed = True
+
+    # Secondary (Weekly) window wastage recording
+    # This is where we capture the "leftover" at the end of the 168-hour week.
+    sec_resets_at_str = row["secondary_resets_at"]
+    if sec_resets_at_str:
+        sec_resets_at = _parse_iso(str(sec_resets_at_str))
+        if now_dt >= sec_resets_at:
+            # record wastage based on secondary_used_percent (representing the weekly quota bucket)
+            sec_used = float(secondary_pct) if secondary_pct is not None else 0.0
+            sec_wasted = max(100.0 - sec_used, 0.0)
+            
+            # Record the rollover event for the weekly boundary
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO usage_rollovers (
+                    account_id, window_started_at, window_ended_at, usage_limit, usage_used, usage_wasted,
+                    primary_percent_at_reset, secondary_percent_at_reset, rolled_over_at, window_type
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    account_id, 
+                    sec_resets_at_str, # Using reset time as start point for the NEXT or identifier
+                    sec_resets_at_str, # ended at the reset mark
+                    100, 
+                    sec_used, 
+                    sec_wasted,
+                    primary_pct, 
+                    secondary_pct, 
+                    now_iso, 
+                    'weekly'
+                ),
+            )
+            # Note: Weekly reset cycle management is typically handled by sync, 
+            # but we record the 'wasted' artifact here when time passes the boundary.
 
     if changed:
         conn.execute(
@@ -1397,6 +1418,7 @@ def _ensure_schema_postgres(conn: Any) -> None:
             usage_used BIGINT NOT NULL,
             usage_wasted BIGINT NOT NULL,
             rolled_over_at TEXT NOT NULL,
+            window_type TEXT NOT NULL DEFAULT 'short',
             primary_percent_at_reset DOUBLE PRECISION NULL,
             secondary_percent_at_reset DOUBLE PRECISION NULL
         )
@@ -1640,6 +1662,8 @@ def _ensure_schema_sqlite(conn: Any) -> None:
         conn.execute("ALTER TABLE usage_rollovers ADD COLUMN primary_percent_at_reset REAL NULL")
     if "secondary_percent_at_reset" not in rollover_cols:
         conn.execute("ALTER TABLE usage_rollovers ADD COLUMN secondary_percent_at_reset REAL NULL")
+    if "window_type" not in rollover_cols:
+        conn.execute("ALTER TABLE usage_rollovers ADD COLUMN window_type TEXT NOT NULL DEFAULT 'short'")
 
     # Backfill any legacy/partial rows with consistent UTC defaults.
     now_iso = _to_iso(datetime.now(timezone.utc))
