@@ -15,9 +15,8 @@ services:
     restart: unless-stopped
 
   auth-manager:
-    build:
-      context: .
-      dockerfile: Dockerfile
+    image: ${AUTH_MANAGER_IMAGE:-ghcr.io/halsysfin/codex-auth-manager:latest}
+    pull_policy: always
     ports:
       - "8080:8080"
     environment:

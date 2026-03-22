@@ -117,7 +117,8 @@ npm run dev
 ## Docker Run
 
 ```bash
-docker compose up --build
+docker compose pull auth-manager
+docker compose up -d
 ```
 
 Services:
@@ -132,33 +133,36 @@ This project supports both:
 
 The GitHub workflow builds and publishes multi-arch images to GHCR.
 
-### Option A: Build locally with Docker Compose
+### Option A: Use published multi-arch image (default compose behavior)
 
-Use this when running from source in this repo:
+The included `docker-compose.yml` pulls:
+
+- `ghcr.io/halsysfin/codex-auth-manager:latest` for backend (AMD64 + ARM64 manifest)
+- builds frontend locally from `frontend/Dockerfile.dev`
 
 ```bash
-docker compose up --build
+docker compose pull auth-manager
+docker compose up -d
 ```
 
-Docker will build for your host architecture automatically.
+Docker automatically pulls the correct backend architecture variant for your host.
 
-### Option B: Use published image (recommended for servers)
+### Option B: Build backend locally from source (dev/test)
 
-Set the `auth-manager` service image in `docker-compose.yml`:
+Temporarily switch `auth-manager` in `docker-compose.yml` from `image:` to:
 
 ```yaml
 auth-manager:
-  image: ghcr.io/halsysfin/codex-auth-manager:latest
+  build:
+    context: .
+    dockerfile: Dockerfile
 ```
 
 Then run:
 
 ```bash
-docker compose pull
-docker compose up -d
+docker compose up --build
 ```
-
-Docker will pull the correct architecture variant automatically.
 
 ### Force a specific architecture (only if needed)
 
