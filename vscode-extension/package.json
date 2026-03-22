@@ -2,7 +2,7 @@
   "name": "codex-auth-manager-extension",
   "displayName": "Codex Auth Manager",
   "description": "Manages Auth Manager leases and writes leased auth payloads into ~/.codex/auth.json.",
-  "version": "0.1.0",
+  "version": "1.12.0",
   "publisher": "halsysfin",
   "license": "MIT",
   "engines": {
@@ -18,7 +18,9 @@
     "onCommand:authManager.rotateLease",
     "onCommand:authManager.releaseLease",
     "onCommand:authManager.reloadCodexAuth",
+    "onCommand:authManager.reloadWindow",
     "onCommand:authManager.openDashboard",
+    "onCommand:authManager.showLeaseView",
     "onView:authManager.leaseView"
   ],
   "main": "./dist/extension.js",
@@ -45,8 +47,16 @@
         "title": "Auth Manager: Reload Codex Auth"
       },
       {
+        "command": "authManager.reloadWindow",
+        "title": "Auth Manager: Reload Window"
+      },
+      {
         "command": "authManager.openDashboard",
         "title": "Auth Manager: Open Dashboard"
+      },
+      {
+        "command": "authManager.showLeaseView",
+        "title": "Auth Manager: Show Lease View"
       }
     ],
     "viewsContainers": {

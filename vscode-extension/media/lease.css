@@ -41,9 +41,14 @@ h1 {
 }
 
 .pill.revoked,
-.pill.unavailable {
+.pill.backend_unavailable {
   background: rgba(239, 68, 68, 0.2);
   color: #ef4444;
+}
+
+.pill.no_lease {
+  background: rgba(148, 163, 184, 0.2);
+  color: #cbd5e1;
 }
 
 .actions {

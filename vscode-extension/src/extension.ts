@@ -1,8 +1,8 @@
 import * as vscode from 'vscode'
-import { AuthManagerClient, type AuthPayload, type LeaseAcquireResponse, type LeaseStatusResponse } from './authManagerClient'
-import { authFileExists, readAuthFile, writeAuthFile } from './authFile'
+import { AuthManagerClient, AuthManagerClientError, type AuthPayload, type LeaseStatusResponse } from './authManagerClient'
+import { authFileExists, writeAuthFile } from './authFile'
 import { deriveLeaseHealthState, needsReacquire, shouldRenewLease, shouldRotateLease, type LeaseHealthState } from './leaseLifecycle'
-import { LeaseStateStore, defaultLeaseState, type LeaseState } from './leaseStateStore'
+import { LeaseStateStore, type LeaseState } from './leaseStateStore'
 import { buildLeaseTelemetryPayload } from './telemetry'
 import { LeaseWebviewProvider, type LeaseViewModel } from './views/leaseWebview'
 
@@ -28,11 +28,12 @@ class AuthManagerController {
       onRenew: () => void this.renewLease(),
       onRotate: () => void this.rotateLease(),
       onRelease: () => void this.releaseLease(),
-      onReloadWindow: () => void this.reloadCodexAuth(),
+      onReloadAuth: () => void this.reloadCodexAuth(),
+      onReloadWindow: () => void this.reloadWindow(),
       onOpenDashboard: () => void this.openDashboard(),
       onVisible: () => void this.refreshLease('refresh'),
     })
-    this.statusBar.command = 'authManager.refreshLease'
+    this.statusBar.command = 'authManager.showLeaseView'
     this.statusBar.show()
   }
 
@@ -67,7 +68,9 @@ class AuthManagerController {
       vscode.commands.registerCommand('authManager.rotateLease', async () => this.rotateLease()),
       vscode.commands.registerCommand('authManager.releaseLease', async () => this.releaseLease()),
       vscode.commands.registerCommand('authManager.reloadCodexAuth', async () => this.reloadCodexAuth()),
+      vscode.commands.registerCommand('authManager.reloadWindow', async () => this.reloadWindow()),
       vscode.commands.registerCommand('authManager.openDashboard', async () => this.openDashboard()),
+      vscode.commands.registerCommand('authManager.showLeaseView', async () => this.showLeaseView()),
     )
   }
 
@@ -112,11 +115,14 @@ class AuthManagerController {
   }
 
   private currentHealthState(): LeaseHealthState {
+    if (!this.backendReachable && this.state.lastErrorAt) {
+      return 'backend_unavailable'
+    }
     if (!this.state.leaseId || !this.state.leaseState) {
-      return 'unavailable'
+      return 'no_lease'
     }
     if (!this.state.expiresAt) {
-      return 'unavailable'
+      return 'no_lease'
     }
     return deriveLeaseHealthState({
       state: this.state.leaseState,
@@ -136,6 +142,8 @@ class AuthManagerController {
         return 'Rotate'
       case 'revoked':
         return 'Revoked'
+      case 'backend_unavailable':
+        return 'Backend Down'
       default:
         return 'No Lease'
     }
@@ -169,6 +177,12 @@ class AuthManagerController {
         status = await this.client.getLease(this.state.leaseId)
         this.backendReachable = true
       } catch (error) {
+        if (this.shouldReacquireAfterLookupError(error)) {
+          this.log(`Stored lease ${this.state.leaseId} is gone; reacquiring`)
+          this.state = await this.stateStore.clear(this.state.machineId, this.state.agentId)
+          await this.acquireAndMaterializeLease('startup reacquire missing lease')
+          return
+        }
         this.backendReachable = false
         await this.handleBackendError(error, 'Failed to refresh current lease on startup')
         return
@@ -207,6 +221,12 @@ class AuthManagerController {
       const status = await this.client.getLease(this.state.leaseId)
       this.backendReachable = true
       this.state = await this.stateStore.updateFromLeaseStatus(this.state, status)
+      if (needsReacquire(status)) {
+        this.log(`Lease ${status.lease_id} is no longer usable during refresh; reacquiring`)
+        this.state = await this.stateStore.clear(this.state.machineId, this.state.agentId)
+        await this.acquireAndMaterializeLease('refresh reacquire')
+        return
+      }
       if (shouldRotateLease(status, vscode.workspace.getConfiguration().get<boolean>('authManager.autoRotate', true))) {
         await this.rotateLease()
         return
@@ -216,6 +236,12 @@ class AuthManagerController {
       }
       this.setMessage(`Lease refreshed at ${new Date().toLocaleTimeString()}.`)
     } catch (error) {
+      if (this.shouldReacquireAfterLookupError(error)) {
+        this.log(`Stored lease ${this.state.leaseId} was not found during refresh; reacquiring`)
+        this.state = await this.stateStore.clear(this.state.machineId, this.state.agentId)
+        await this.acquireAndMaterializeLease('refresh reacquire missing lease')
+        return
+      }
       this.backendReachable = false
       await this.handleBackendError(error, 'Unable to refresh lease state')
     } finally {
@@ -322,6 +348,10 @@ class AuthManagerController {
     }
   }
 
+  async reloadWindow(): Promise<void> {
+    await vscode.commands.executeCommand('workbench.action.reloadWindow')
+  }
+
   async openDashboard(): Promise<void> {
     const config = vscode.workspace.getConfiguration()
     const baseUrl = config.get<string>('authManager.baseUrl', 'http://127.0.0.1:8080').replace(/\/+$/, '')
@@ -391,6 +421,15 @@ class AuthManagerController {
 
   private authFilePath(): string {
     return vscode.workspace.getConfiguration().get<string>('authManager.authFilePath', '~/.codex/auth.json')
+  }
+
+  private async showLeaseView(): Promise<void> {
+    await vscode.commands.executeCommand('workbench.view.extension.authManager')
+    await vscode.commands.executeCommand('authManager.leaseView.focus')
+  }
+
+  private shouldReacquireAfterLookupError(error: unknown): boolean {
+    return error instanceof AuthManagerClientError && error.status === 404
   }
 
   private async handleBackendError(error: unknown, userMessage: string, showPopup = true): Promise<void> {

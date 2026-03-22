@@ -53,4 +53,5 @@ test('LeaseStateStore persists lease metadata', async () => {
   assert.equal(state.leaseId, 'lease-1')
   assert.equal(state.credentialId, 'cred-1')
   assert.equal(state.latestUtilizationPct, 12)
+  assert.ok(state.lastBackendRefreshAt)
 })

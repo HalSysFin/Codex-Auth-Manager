@@ -63,6 +63,17 @@ If your backend does not yet support `POST /api/leases/{lease_id}/materialize`, 
 
 If `machineId` or `agentId` are blank, the extension generates stable defaults and persists them in extension global state.
 
+## Commands
+
+- `authManager.ensureLease`
+- `authManager.refreshLease`
+- `authManager.rotateLease`
+- `authManager.releaseLease`
+- `authManager.reloadCodexAuth`
+- `authManager.reloadWindow`
+- `authManager.openDashboard`
+- `authManager.showLeaseView`
+
 ## Auth file behavior
 
 The extension writes the leased auth payload to `~/.codex/auth.json` by default.
@@ -91,6 +102,7 @@ The extension does not keep the full auth payload in extension state unless the 
   - rotate when replacement is required or recommended and auto-rotate is enabled
   - renew when close to expiry and auto-renew is enabled
   - reacquire when the lease is revoked or expired
+  - reacquire when the backend reports the stored lease no longer exists
 
 ## Local development
 

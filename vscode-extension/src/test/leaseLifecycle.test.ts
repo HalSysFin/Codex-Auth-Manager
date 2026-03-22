@@ -20,6 +20,16 @@ test('startup with revoked lease needs reacquire', () => {
   assert.equal(needsReacquire({ state: 'revoked' }), true)
 })
 
+test('expired lease shows revoked health state', () => {
+  const state = deriveLeaseHealthState({
+    state: 'expired',
+    replacement_required: false,
+    rotation_recommended: false,
+    expires_at: '2026-03-22T00:00:00.000Z',
+  }, new Date('2026-03-22T00:00:00.000Z'))
+  assert.equal(state, 'revoked')
+})
+
 test('replacement required handling prefers rotate', () => {
   assert.equal(shouldRotateLease({
     state: 'active',

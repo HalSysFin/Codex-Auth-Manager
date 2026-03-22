@@ -1,6 +1,6 @@
 import type { LeaseStatusResponse } from './authManagerClient'
 
-export type LeaseHealthState = 'active' | 'expiring' | 'rotation_required' | 'revoked' | 'unavailable'
+export type LeaseHealthState = 'active' | 'expiring' | 'rotation_required' | 'revoked' | 'no_lease' | 'backend_unavailable'
 
 export function secondsUntilExpiry(expiresAt: string, now = new Date()): number {
   return Math.max(0, Math.floor((new Date(expiresAt).getTime() - now.getTime()) / 1000))

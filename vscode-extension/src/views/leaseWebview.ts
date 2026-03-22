@@ -1,5 +1,3 @@
-import * as fs from 'node:fs'
-import * as path from 'node:path'
 import * as vscode from 'vscode'
 import type { LeaseHealthState } from '../leaseLifecycle'
 import type { LeaseState } from '../leaseStateStore'
@@ -18,25 +16,10 @@ export interface LeaseWebviewCommandHandlers {
   onRenew(): void
   onRotate(): void
   onRelease(): void
+  onReloadAuth(): void
   onReloadWindow(): void
   onOpenDashboard(): void
   onVisible(): void
-}
-
-function escapeHtml(value: string | null | undefined): string {
-  return (value || '')
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;')
-    .replace(/'/g, '&#39;')
-}
-
-function fmt(value: string | number | boolean | null | undefined): string {
-  if (value === null || value === undefined || value === '') {
-    return 'Unavailable'
-  }
-  return String(value)
 }
 
 export class LeaseWebviewProvider implements vscode.WebviewViewProvider {
@@ -70,6 +53,9 @@ export class LeaseWebviewProvider implements vscode.WebviewViewProvider {
           break
         case 'release':
           this.handlers.onRelease()
+          break
+        case 'reloadAuth':
+          this.handlers.onReloadAuth()
           break
         case 'reloadWindow':
           this.handlers.onReloadWindow()
@@ -119,6 +105,7 @@ export class LeaseWebviewProvider implements vscode.WebviewViewProvider {
         <button data-command="rotate">Rotate</button>
         <button data-command="release">Release</button>
         <button data-command="openDashboard">Open Dashboard</button>
+        <button data-command="reloadAuth">Reload Codex Auth</button>
         <button data-command="reloadWindow">Reload Window</button>
       </div>
       <div id="message" class="message"></div>
@@ -141,7 +128,15 @@ export class LeaseWebviewProvider implements vscode.WebviewViewProvider {
         const healthPill = document.getElementById('healthPill');
         const details = document.getElementById('details');
         const message = document.getElementById('message');
-        healthPill.textContent = payload.healthState.replace(/_/g, ' ');
+        const titleMap = {
+          active: 'Active',
+          expiring: 'Expiring',
+          rotation_required: 'Rotation Required',
+          revoked: 'Revoked',
+          no_lease: 'No Lease',
+          backend_unavailable: 'Backend Unavailable',
+        };
+        healthPill.textContent = titleMap[payload.healthState] || payload.healthState.replace(/_/g, ' ');
         healthPill.className = 'pill ' + payload.healthState;
         message.textContent = payload.lastMessage || '';
         message.style.display = payload.lastMessage ? 'block' : 'none';

@@ -120,6 +120,7 @@ export class LeaseStateStore {
       latestTelemetryAt: lease.last_telemetry_at,
       latestUtilizationPct: lease.latest_utilization_pct,
       latestQuotaRemaining: lease.latest_quota_remaining,
+      lastBackendRefreshAt: new Date().toISOString(),
     }
     await this.save(next)
     return next
