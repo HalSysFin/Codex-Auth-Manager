@@ -149,19 +149,13 @@ Docker automatically pulls the correct backend architecture variant for your hos
 
 ### Option B: Build backend locally from source (dev/test)
 
-Temporarily switch `auth-manager` in `docker-compose.yml` from `image:` to:
-
-```yaml
-auth-manager:
-  build:
-    context: .
-    dockerfile: Dockerfile
-```
+Use the included local override file (`docker-compose.local.yml`) which swaps
+`auth-manager` to a local build.
 
 Then run:
 
 ```bash
-docker compose up --build
+docker compose -f docker-compose.yml -f docker-compose.local.yml up --build
 ```
 
 ### Force a specific architecture (only if needed)

@@ -1,0 +1,7 @@
+services:
+  auth-manager:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: codex-auth-manager:local
+    pull_policy: never
