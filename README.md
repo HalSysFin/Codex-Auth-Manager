@@ -86,6 +86,8 @@ Web login/session:
 API/auth control:
 - `INTERNAL_API_TOKEN`
 - `LOGIN_SESSION_TTL_SECONDS`
+- `ANALYTICS_TIMEZONE` (`1d` / "Today" analytics are computed from local midnight in this timezone)
+- `ANALYTICS_SNAPSHOT_INTERVAL_SECONDS` (default `600`, captures absolute + utilization snapshots every 10 minutes)
 - `TRUSTED_PROXY_IPS`
 - `INTERNAL_NETWORK_CIDRS`
 
@@ -236,3 +238,6 @@ If callback was returned but not processed:
 
 - DB is source of truth; active auth file is materialized for runtime integration.
 - Cached-first UI means page loads from persisted state first, then refreshes live.
+- `1d` analytics mean `Today`, computed from local midnight to now using `ANALYTICS_TIMEZONE`.
+- When absolute usage counters are unavailable, the dashboard switches to fallback mode and shows utilization-based charts without pretending consumption is `0`.
+- Usage analytics snapshots are captured every `ANALYTICS_SNAPSHOT_INTERVAL_SECONDS` seconds. The default is 10 minutes and captures both absolute usage state (used, limit, remaining/lifetime context) and utilization percentages per account.

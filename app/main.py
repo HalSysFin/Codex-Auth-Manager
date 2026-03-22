@@ -14,6 +14,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import httpx
 from fastapi import FastAPI, HTTPException, Request
@@ -45,6 +46,7 @@ from .account_usage_store import (
     rename_saved_profile,
     rename_account_data,
     record_account_usage,
+    record_absolute_usage_snapshot,
     record_percentage_snapshot,
     reconcile_due_accounts,
     set_active_profile_label,
@@ -90,7 +92,7 @@ from .login_sessions import (
 
 app = FastAPI(title="Codex Auth Manager", version="0.2.0")
 logger = logging.getLogger(__name__)
-_RECONCILE_INTERVAL_SECONDS = 600
+_RECONCILE_INTERVAL_SECONDS = max(int(settings.analytics_snapshot_interval_seconds or 600), 60)
 _LIVE_REFRESH_CONCURRENCY = 4
 _USAGE_STALE_SECONDS = 1800
 _reconcile_task: asyncio.Task[None] | None = None
@@ -152,6 +154,7 @@ async def _periodic_reconcile_usage_windows() -> None:
             refreshed = reconcile_due_accounts(now=datetime.now(timezone.utc))
             if refreshed:
                 logger.info("usage reconciliation refreshed %s account window(s)", refreshed)
+            _capture_periodic_usage_snapshots(now=datetime.now(timezone.utc))
         except Exception:
             logger.exception("usage reconciliation failed")
 
@@ -518,11 +521,14 @@ async def auth_login_cancel(request: Request, payload: dict[str, Any] | None = N
 async def auth_relay_callback(payload: dict[str, Any]) -> JSONResponse:
     session_id = str(payload.get("session_id", "")).strip()
     relay_token = str(payload.get("relay_token", "")).strip()
-    code = payload.get("code")
-    state = payload.get("state")
-    error = payload.get("error")
-    error_description = payload.get("error_description")
     full_url = str(payload.get("full_url", "")).strip()
+    parsed_callback = _parse_callback_payload(full_url)
+    code = payload.get("code") or parsed_callback.get("code")
+    state = payload.get("state") or parsed_callback.get("state")
+    error = payload.get("error") or parsed_callback.get("error")
+    error_description = payload.get("error_description") or parsed_callback.get(
+        "error_description"
+    )
 
     if not session_id or not relay_token:
         logger.warning("relay-callback rejected: missing session_id or relay_token")
@@ -1047,57 +1053,47 @@ async def api_accounts_stream(request: Request) -> StreamingResponse:
 
         latest_by_label = {item["label"]: dict(item) for item in snapshot["accounts"]}
         baseline_auth = _safe_read_current_auth()
-        session_limits_by_label = _fetch_session_limits_for_profiles(profiles, baseline_auth)
+        baseline_label = get_active_profile_label()
         completed = 0
         failed = 0
 
-        for profile in profiles:
-            rate_info = session_limits_by_label.get(profile.label) or {"error": "No rate-limit data returned"}
-            try:
-                if isinstance(rate_info, dict) and isinstance(rate_info.get("error"), str):
-                    error_msg = str(rate_info.get("error"))
-                    _mark_refresh_status(profile.account_key, ok=False, error=error_msg)
-                    usage = _usage_tracking_payload(profile.account_key)
-                    account_payload = _account_payload(profile, snapshot["current_label"], usage_tracking=usage)
-                    account_payload["rate_limits"] = {"error": error_msg}
-                    ok = False
-                else:
-                    if isinstance(rate_info, dict):
-                        _sync_profile_usage_from_session_limits(profile, rate_info)
-                    usage = _usage_tracking_payload(profile.account_key)
-                    account_payload = _account_payload(profile, snapshot["current_label"], usage_tracking=usage)
-                    if isinstance(rate_info, dict):
-                        account_payload["rate_limits"] = rate_info
-                    _mark_refresh_status(profile.account_key, ok=True, error=None)
-                    ok = True
-            except Exception as exc:
-                _mark_refresh_status(profile.account_key, ok=False, error=str(exc))
-                usage = _usage_tracking_payload(profile.account_key)
-                account_payload = _account_payload(profile, snapshot["current_label"], usage_tracking=usage)
-                account_payload["rate_limits"] = {"error": str(exc)}
-                ok = False
-
-            latest_by_label[profile.label] = account_payload
-            completed += 1
-            if not ok:
-                failed += 1
-                rate_obj = account_payload.get("rate_limits")
-                error_msg = None
-                if isinstance(rate_obj, dict):
-                    maybe_error = rate_obj.get("error")
-                    if isinstance(maybe_error, str):
-                        error_msg = maybe_error
-                yield _sse_event(
-                    "error",
-                    {
-                        "label": profile.label,
-                        "account_key": account_payload.get("account_key"),
-                        "message": error_msg,
-                    },
+        try:
+            for profile in profiles:
+                account_payload, ok = _refresh_profile_session_limits(
+                    profile,
+                    current_label_name=snapshot["current_label"],
                 )
-            aggregate = _compute_aggregate(list(latest_by_label.values()))
-            yield _sse_event("account_update", {"account": account_payload, "ok": ok})
-            yield _sse_event("aggregate_update", aggregate)
+
+                latest_by_label[profile.label] = account_payload
+                completed += 1
+                if not ok:
+                    failed += 1
+                    rate_obj = account_payload.get("rate_limits")
+                    error_msg = None
+                    if isinstance(rate_obj, dict):
+                        maybe_error = rate_obj.get("error")
+                        if isinstance(maybe_error, str):
+                            error_msg = maybe_error
+                    yield _sse_event(
+                        "error",
+                        {
+                            "label": profile.label,
+                            "account_key": account_payload.get("account_key"),
+                            "message": error_msg,
+                        },
+                    )
+                aggregate = _compute_aggregate(list(latest_by_label.values()))
+                yield _sse_event("account_update", {"account": account_payload, "ok": ok})
+                yield _sse_event("aggregate_update", aggregate)
+        finally:
+            if baseline_auth is not None:
+                try:
+                    persist_current_auth(baseline_auth)
+                except AuthStoreError:
+                    pass
+            if baseline_label:
+                with suppress(Exception):
+                    set_active_profile_label(baseline_label)
 
         _mark_refresh_completed()
         yield _sse_event("complete", {"completed": completed, "failed": failed})
@@ -1229,7 +1225,8 @@ async def api_usage_aggregate(request: Request) -> JSONResponse:
 async def api_usage_history(request: Request, range: str = "30d") -> JSONResponse:
     _require_internal_auth(request)
     selected_range, since_dt = _parse_history_range(range)
-    since_iso = since_dt.isoformat() if since_dt else None
+    range_meta = _history_range_metadata(selected_range)
+    analytics_tz = _analytics_tzinfo()
 
     profiles = _dedupe_profiles(list_profiles())
     _touch_profiles_usage(profiles)
@@ -1244,6 +1241,7 @@ async def api_usage_history(request: Request, range: str = "30d") -> JSONRespons
     per_account_daily = _compute_daily_consumption_per_account(
         snapshots=snapshots,
         since_dt=since_dt,
+        tz=analytics_tz,
     )
     cluster_daily: dict[str, int] = {}
     for _, day_map in per_account_daily.items():
@@ -1357,31 +1355,79 @@ async def api_usage_history(request: Request, range: str = "30d") -> JSONRespons
         if live_weekly_percents
         else None
     )
-    absolute_unavailable = (
-        consumed_total == 0
-        and int(cached["aggregate"]["total_current_window_used"] or 0) == 0
-        and int(cached["aggregate"]["total_current_window_limit"] or 0) == 0
+    aggregate_summary = cached["aggregate"]
+    current_total_used = int(aggregate_summary["total_current_window_used"] or 0)
+    current_total_limit = int(aggregate_summary["total_current_window_limit"] or 0)
+    current_total_remaining = int(aggregate_summary["total_remaining"] or 0)
+    absolute_snapshot_available = any(
+        any(int(row.get(field) or 0) > 0 for field in ("usage_in_window", "usage_limit", "lifetime_used"))
+        for row in snapshots
     )
-    fallback_mode = absolute_unavailable and bool(fallback_series)
+    absolute_usage_available = bool(
+        current_total_limit > 0
+        or current_total_used > 0
+        or current_total_remaining > 0
+        or absolute_snapshot_available
+    )
+    fallback_mode = (not absolute_usage_available) and bool(fallback_series)
+    if fallback_mode:
+        daily_series = []
+        cumulative_series = []
+        consumed_total = None
+        avg_daily = None
+        current_total_used_value = None
+        current_total_limit_value = None
+        current_total_remaining_value = None
+        top_accounts_payload: list[dict[str, Any]] = []
+    else:
+        current_total_used_value = current_total_used
+        current_total_limit_value = current_total_limit
+        current_total_remaining_value = current_total_remaining
+        top_accounts_payload = [
+            {
+                "account_key": account_key,
+                "label": account_label_by_key.get(account_key, account_key),
+                "display_label": account_display_by_key.get(account_key, account_key),
+                "email": account_email_by_key.get(account_key),
+                "consumed": int(consumed),
+            }
+            for account_key, consumed in top_accounts
+        ]
+    if fallback_mode:
+        coverage_start = None
+        coverage_end = None
+        if fallback_series:
+            first_point = fallback_series[0]
+            last_point = fallback_series[-1]
+            coverage_start = str(first_point.get("day") or first_point.get("t") or "")
+            coverage_end = str(last_point.get("day") or last_point.get("t") or "")
+    else:
+        coverage_start = cumulative_series[0]["day"] if cumulative_series else None
+        coverage_end = cumulative_series[-1]["day"] if cumulative_series else None
 
     return JSONResponse(
         {
             "range": selected_range,
+            "range_metadata": range_meta,
             "summary": {
+                "absolute_usage_available": absolute_usage_available,
                 "total_consumed_in_range": consumed_total,
                 "average_daily_consumption": avg_daily,
-                "current_total_used": cached["aggregate"]["total_current_window_used"],
-                "current_total_limit": cached["aggregate"]["total_current_window_limit"],
-                "current_total_remaining": cached["aggregate"]["total_remaining"],
+                "current_total_used": current_total_used_value,
+                "current_total_limit": current_total_limit_value,
+                "current_total_remaining": current_total_remaining_value,
                 "total_wasted": wasted_total,
                 "stale_account_count": len(stale_accounts),
                 "failed_account_count": len(failed_accounts),
-                "last_refresh_time": cached["aggregate"]["last_refresh_time"],
+                "last_refresh_time": aggregate_summary["last_refresh_time"],
                 "fallback_mode": fallback_mode,
                 "fallback_reason": (
                     "absolute_usage_unavailable_using_weekly_utilization"
                     if fallback_mode
                     else None
+                ),
+                "last_refresh_label": (
+                    "Last snapshot refresh" if fallback_mode else "Last absolute usage refresh"
                 ),
                 "weekly_utilization_now": weekly_utilization_now,
                 "average_weekly_utilization_in_range": avg_weekly_utilization_in_range,
@@ -1395,26 +1441,18 @@ async def api_usage_history(request: Request, range: str = "30d") -> JSONRespons
                 "hourly_weekly_utilization": hourly_weekly_utilization,
             },
             "sections": {
-                "top_consuming_accounts": [
-                    {
-                        "account_key": account_key,
-                        "label": account_label_by_key.get(account_key, account_key),
-                        "display_label": account_display_by_key.get(account_key, account_key),
-                        "email": account_email_by_key.get(account_key),
-                        "consumed": int(consumed),
-                    }
-                    for account_key, consumed in top_accounts
-                ],
+                "top_consuming_accounts": top_accounts_payload,
+                "top_consuming_accounts_available": not fallback_mode,
                 "stale_accounts": stale_accounts,
                 "failed_accounts": failed_accounts,
                 "recent_rollovers": recent_rollovers,
             },
             "freshness": {
-                "coverage_start": cumulative_series[0]["day"] if cumulative_series else None,
-                "coverage_end": cumulative_series[-1]["day"] if cumulative_series else None,
-                "snapshot_points": len(snapshots),
-                "daily_points": len(daily_series),
-                "is_sparse": len(daily_series) < 3,
+                "coverage_start": coverage_start,
+                "coverage_end": coverage_end,
+                "snapshot_points": len(usage_snapshots) if fallback_mode else len(snapshots),
+                "daily_points": len(fallback_series) if fallback_mode else len(daily_series),
+                "is_sparse": (len(fallback_series) if fallback_mode else len(daily_series)) < 3,
             },
         }
     )
@@ -1428,6 +1466,8 @@ async def api_account_history(request: Request, label: str, range: str = "30d") 
         raise HTTPException(status_code=404, detail="Label not found")
 
     selected_range, since_dt = _parse_history_range(range)
+    range_meta = _history_range_metadata(selected_range)
+    analytics_tz = _analytics_tzinfo()
     _touch_account_usage(profile=profile)
     usage = _usage_tracking_payload(profile.account_key) or {}
     rollovers_all = list_usage_rollovers(profile.account_key)
@@ -1437,6 +1477,7 @@ async def api_account_history(request: Request, label: str, range: str = "30d") 
     per_account_daily = _compute_daily_consumption_per_account(
         snapshots=absolute_snapshots,
         since_dt=since_dt,
+        tz=analytics_tz,
     )
     day_map = per_account_daily.get(profile.account_key, {})
     daily_series = [{"day": day, "consumed": day_map[day]} for day in sorted(day_map.keys())]
@@ -1476,12 +1517,41 @@ async def api_account_history(request: Request, label: str, range: str = "30d") 
     fallback_series = (
         hourly_weekly_utilization if selected_range == "1d" else daily_weekly_utilization
     )
-    absolute_unavailable = (
-        total_consumed_in_range == 0
-        and current_used == 0
-        and current_limit == 0
+    absolute_snapshot_available = any(
+        any(int(row.get(field) or 0) > 0 for field in ("usage_in_window", "usage_limit", "lifetime_used"))
+        for row in absolute_snapshots
     )
-    fallback_mode = absolute_unavailable and bool(fallback_series)
+    absolute_usage_available = bool(
+        current_limit > 0
+        or current_used > 0
+        or remaining > 0
+        or absolute_snapshot_available
+    )
+    fallback_mode = (not absolute_usage_available) and bool(fallback_series)
+    stale_account_count = 1 if status.get("is_stale") else 0
+    failed_account_count = 1 if status.get("state") == "failed" else 0
+    if fallback_mode:
+        daily_series = []
+        cumulative_series = []
+        total_consumed_in_range = None
+        avg_daily = None
+        current_used_value = None
+        current_limit_value = None
+        remaining_value = None
+        utilization_value = None
+        coverage_start = str(fallback_series[0].get("day") or fallback_series[0].get("t") or "") if fallback_series else None
+        coverage_end = str(fallback_series[-1].get("day") or fallback_series[-1].get("t") or "") if fallback_series else None
+        last_refresh_time = _latest_captured_at(usage_snapshots) or status.get("last_success_at") or usage.get("last_usage_sync_at") or usage.get("updated_at")
+        last_refresh_label = "Last snapshot refresh"
+    else:
+        current_used_value = current_used
+        current_limit_value = current_limit
+        remaining_value = remaining
+        utilization_value = utilization
+        coverage_start = cumulative_series[0]["day"] if cumulative_series else None
+        coverage_end = cumulative_series[-1]["day"] if cumulative_series else None
+        last_refresh_time = _latest_captured_at(absolute_snapshots) or usage.get("last_usage_sync_at") or usage.get("updated_at")
+        last_refresh_label = "Last absolute usage refresh"
 
     completed_windows = sorted(
         weekly_rollovers,
@@ -1504,16 +1574,47 @@ async def api_account_history(request: Request, label: str, range: str = "30d") 
             "email": profile.email,
             "account_type": _infer_account_type(profile),
             "range": selected_range,
+            "range_metadata": range_meta,
+            "summary": {
+                "absolute_usage_available": absolute_usage_available,
+                "total_consumed_in_range": total_consumed_in_range,
+                "average_daily_consumption": avg_daily,
+                "current_total_used": current_used_value,
+                "current_total_limit": current_limit_value,
+                "current_total_remaining": remaining_value,
+                "total_wasted": wasted_total,
+                "stale_account_count": stale_account_count,
+                "failed_account_count": failed_account_count,
+                "last_refresh_time": last_refresh_time,
+                "last_refresh_label": last_refresh_label,
+                "fallback_mode": fallback_mode,
+                "fallback_reason": (
+                    "absolute_usage_unavailable_using_weekly_utilization"
+                    if fallback_mode
+                    else None
+                ),
+                "weekly_utilization_now": sec_used if usage.get("secondary_used_percent") is not None else None,
+                "average_weekly_utilization_in_range": (
+                    round(
+                        sum(float(item.get("value") or 0) for item in fallback_series)
+                        / max(len(fallback_series), 1),
+                        2,
+                    )
+                    if fallback_series
+                    else None
+                ),
+            },
             "current_state": {
-                "usage_in_window": current_used,
-                "usage_limit": current_limit,
-                "remaining": remaining,
-                "utilization_percent": utilization,
+                "absolute_usage_available": absolute_usage_available,
+                "usage_in_window": current_used_value,
+                "usage_limit": current_limit_value,
+                "remaining": remaining_value,
+                "utilization_percent": utilization_value,
                 "weekly_used_units": sec_used,
                 "weekly_remaining_units": max(100.0 - sec_used, 0.0),
                 "next_reset": usage.get("primary_resets_at") or usage.get("rate_limit_refresh_at"),
-                "lifetime_used": int(usage.get("lifetime_used") or 0),
-                "last_sync": usage.get("last_usage_sync_at") or usage.get("updated_at"),
+                "lifetime_used": int(usage.get("lifetime_used") or 0) if absolute_usage_available else None,
+                "last_sync": last_refresh_time,
                 "refresh_status": status,
                 "efficiency_pct": efficiency,
             },
@@ -1522,6 +1623,7 @@ async def api_account_history(request: Request, label: str, range: str = "30d") 
                 "daily_usage": daily_series,
                 "total_consumed_in_range": total_consumed_in_range,
                 "average_daily_consumption": avg_daily,
+                "absolute_usage_available": absolute_usage_available,
                 "fallback_mode": fallback_mode,
                 "daily_weekly_utilization": daily_weekly_utilization,
                 "hourly_weekly_utilization": hourly_weekly_utilization,
@@ -1546,11 +1648,11 @@ async def api_account_history(request: Request, label: str, range: str = "30d") 
                 "total_wasted": wasted_total,
             },
             "freshness": {
-                "coverage_start": cumulative_series[0]["day"] if cumulative_series else None,
-                "coverage_end": cumulative_series[-1]["day"] if cumulative_series else None,
-                "snapshot_points": len(absolute_snapshots),
-                "daily_points": len(daily_series),
-                "is_sparse": len(daily_series) < 3,
+                "coverage_start": coverage_start,
+                "coverage_end": coverage_end,
+                "snapshot_points": len(usage_snapshots) if fallback_mode else len(absolute_snapshots),
+                "daily_points": len(fallback_series) if fallback_mode else len(daily_series),
+                "is_sparse": (len(fallback_series) if fallback_mode else len(daily_series)) < 3,
             },
         }
     )
@@ -1746,6 +1848,22 @@ def _store_callback(payload: Any) -> Path:
     return path
 
 
+def _parse_callback_payload(full_url: str) -> dict[str, str]:
+    if not full_url:
+        return {}
+    try:
+        parsed = urlparse(full_url)
+        params = parse_qs(parsed.query, keep_blank_values=True)
+    except Exception:
+        return {}
+    extracted: dict[str, str] = {}
+    for key in ("code", "state", "error", "error_description"):
+        value = params.get(key, [None])[0]
+        if value is not None:
+            extracted[key] = str(value)
+    return extracted
+
+
 def _expected_state_from_auth_url(auth_url: str | None) -> str | None:
     if not auth_url:
         return None
@@ -1878,6 +1996,12 @@ def _build_cached_accounts_snapshot(
 
 
 def _infer_account_type(profile: AccountProfile) -> str:
+    explicit_plan = (profile.plan_type or "").strip().lower()
+    if explicit_plan == "plus":
+        return "ChatGPT Plus"
+    if explicit_plan == "team":
+        return "ChatGPT Business"
+
     n = (profile.name or "").lower()
     p = (profile.provider_account_id or "").lower()
     if "business" in n or "team" in n or p.startswith("org-"):
@@ -2311,41 +2435,84 @@ def _normalize_session_limit_payload(payload: Any) -> dict[str, Any]:
     }
 
 
-def _fetch_session_limits_for_profiles(
-    profiles: list[AccountProfile], baseline_auth: dict[str, Any] | None
-) -> dict[str, dict[str, Any]]:
-    out: dict[str, dict[str, Any]] = {}
-    if not profiles:
-        return out
-
-    baseline_label = get_active_profile_label()
+def _refresh_profile_session_limits(
+    profile: AccountProfile,
+    *,
+    current_label_name: str | None,
+) -> tuple[dict[str, Any], bool]:
     try:
-        for profile in profiles:
-            try:
-                switch_label(profile.label)
-                result = read_rate_limits_via_app_server()
-                out[profile.label] = _normalize_session_limit_payload(result.rate_limits)
-                with suppress(Exception):
-                    _persist_active_auth_db_copy(profile.label)
-            except (CodexSwitchError, CodexCLIError) as exc:
-                out[profile.label] = {"error": str(exc)}
-    finally:
-        if baseline_auth is not None:
-            try:
-                persist_current_auth(baseline_auth)
-            except AuthStoreError:
-                pass
-        if baseline_label:
-            with suppress(Exception):
-                set_active_profile_label(baseline_label)
-
-    return out
+        switch_label(profile.label)
+        result = read_rate_limits_via_app_server()
+        rate_info = _normalize_session_limit_payload(result.rate_limits)
+        _sync_profile_usage_from_session_limits(profile, rate_info)
+        usage = _usage_tracking_payload(profile.account_key)
+        account_payload = _account_payload(
+            profile,
+            current_label_name,
+            usage_tracking=usage,
+        )
+        account_payload["rate_limits"] = rate_info
+        _mark_refresh_status(profile.account_key, ok=True, error=None)
+        with suppress(Exception):
+            _persist_active_auth_db_copy(profile.label)
+        return account_payload, True
+    except (CodexSwitchError, CodexCLIError) as exc:
+        error_msg = str(exc)
+        _mark_refresh_status(profile.account_key, ok=False, error=error_msg)
+        usage = _usage_tracking_payload(profile.account_key)
+        account_payload = _account_payload(
+            profile,
+            current_label_name,
+            usage_tracking=usage,
+        )
+        account_payload["rate_limits"] = {"error": error_msg}
+        return account_payload, False
+    except Exception as exc:
+        error_msg = str(exc)
+        _mark_refresh_status(profile.account_key, ok=False, error=error_msg)
+        usage = _usage_tracking_payload(profile.account_key)
+        account_payload = _account_payload(
+            profile,
+            current_label_name,
+            usage_tracking=usage,
+        )
+        account_payload["rate_limits"] = {"error": error_msg}
+        return account_payload, False
 
 
 def _touch_profiles_usage(profiles: list[AccountProfile]) -> None:
     now = datetime.now(timezone.utc)
     for profile in profiles:
         _touch_account_usage(profile=profile, now=now)
+
+
+def _capture_periodic_usage_snapshots(*, now: datetime) -> None:
+    profiles = _dedupe_profiles(list_profiles())
+    if not profiles:
+        return
+    for profile in profiles:
+        usage = _usage_tracking_payload(profile.account_key) or {}
+        if not usage:
+            continue
+        try:
+            record_absolute_usage_snapshot(
+                profile.account_key,
+                usage_in_window=usage.get("usage_in_window"),
+                usage_limit=usage.get("usage_limit"),
+                lifetime_used=usage.get("lifetime_used"),
+                rate_limit_refresh_at=usage.get("rate_limit_refresh_at"),
+                primary_used_percent=usage.get("primary_used_percent"),
+                secondary_used_percent=usage.get("secondary_used_percent"),
+                now=now,
+            )
+            record_percentage_snapshot(
+                profile.account_key,
+                usage.get("primary_used_percent"),
+                usage.get("secondary_used_percent"),
+                now=now,
+            )
+        except Exception:
+            logger.exception("Unable to capture periodic usage snapshot for key=%s", profile.account_key)
 
 
 def _touch_account_usage(
@@ -2680,6 +2847,7 @@ def _persist_current_auth_to_profile(
         user_id=identity.user_id,
         provider_account_id=identity.account_id,
         name=identity.name,
+        plan_type=identity.plan_type,
         access_token=extract_access_token(resolved_auth),
         email=email,
     )
@@ -2854,11 +3022,21 @@ def _daily_rollover_trend(rollovers: list[dict[str, Any]]) -> list[dict[str, Any
     return points
 
 
+def _analytics_tzinfo() -> ZoneInfo:
+    try:
+        return ZoneInfo(settings.analytics_timezone)
+    except (ZoneInfoNotFoundError, ValueError):
+        return ZoneInfo("UTC")
+
+
 def _parse_history_range(value: str | None) -> tuple[str, datetime | None]:
     raw = (value or "30d").strip().lower()
     now = datetime.now(timezone.utc)
-    if raw in {"1d", "1", "day", "24h"}:
-        return ("1d", now - timedelta(days=1))
+    analytics_tz = _analytics_tzinfo()
+    if raw in {"1d", "1", "day", "24h", "today"}:
+        local_now = now.astimezone(analytics_tz)
+        local_midnight = local_now.replace(hour=0, minute=0, second=0, microsecond=0)
+        return ("1d", local_midnight.astimezone(timezone.utc))
     if raw in {"7d", "7", "week"}:
         return ("7d", now - timedelta(days=7))
     if raw in {"30d", "30", "1m", "month"}:
@@ -2870,43 +3048,71 @@ def _parse_history_range(value: str | None) -> tuple[str, datetime | None]:
     return ("30d", now - timedelta(days=30))
 
 
+def _history_range_metadata(selected_range: str) -> dict[str, Any]:
+    tz = _analytics_tzinfo()
+    if selected_range == "1d":
+        return {
+            "label": "Today",
+            "window_label": "Since midnight",
+            "timezone": getattr(tz, "key", "UTC"),
+            "boundary_mode": "local_day",
+        }
+    return {
+        "label": selected_range,
+        "window_label": selected_range,
+        "timezone": getattr(tz, "key", "UTC"),
+        "boundary_mode": "rolling",
+    }
+
+
+def _parse_captured_at(value: Any) -> datetime | None:
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    try:
+        parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
 def _compute_daily_consumption_per_account(
     *,
     snapshots: list[dict[str, Any]],
     since_dt: datetime | None,
+    tz: ZoneInfo | None = None,
 ) -> dict[str, dict[str, int]]:
-    # Use latest lifetime snapshot per day; day-to-day lifetime deltas become daily consumption.
-    by_account_day_last: dict[str, dict[str, tuple[str, int]]] = {}
+    analytics_tz = tz or _analytics_tzinfo()
+    by_account: dict[str, list[tuple[datetime, int]]] = {}
     for row in snapshots:
         account_id = str(row.get("account_id") or "").strip()
-        captured_at = str(row.get("captured_at") or "").strip()
+        captured_dt = _parse_captured_at(row.get("captured_at"))
         lifetime_raw = row.get("lifetime_used")
-        if not account_id or not captured_at or lifetime_raw is None:
+        if not account_id or captured_dt is None or lifetime_raw is None:
             continue
         try:
             lifetime = int(lifetime_raw)
         except (TypeError, ValueError):
             continue
-        day = captured_at[:10]
-        if len(day) != 10:
-            continue
-        day_map = by_account_day_last.setdefault(account_id, {})
-        current = day_map.get(day)
-        if current is None or captured_at > current[0]:
-            day_map[day] = (captured_at, lifetime)
+        by_account.setdefault(account_id, []).append((captured_dt, lifetime))
 
-    since_day = since_dt.date().isoformat() if since_dt else None
     out: dict[str, dict[str, int]] = {}
-    for account_id, day_map in by_account_day_last.items():
-        day_items = sorted(day_map.items(), key=lambda item: item[0])
+    for account_id, points in by_account.items():
+        points.sort(key=lambda item: item[0])
         prev_lifetime: int | None = None
         acc_day: dict[str, int] = {}
-        for day, (_, lifetime) in day_items:
+        for captured_dt, lifetime in points:
             delta = 0 if prev_lifetime is None else max(lifetime - prev_lifetime, 0)
             prev_lifetime = lifetime
-            if since_day is not None and day < since_day:
+            if since_dt is not None and captured_dt < since_dt:
                 continue
-            acc_day[day] = delta
+            day = captured_dt.astimezone(analytics_tz).date().isoformat()
+            if delta <= 0:
+                acc_day.setdefault(day, 0)
+                continue
+            acc_day[day] = acc_day.get(day, 0) + delta
         out[account_id] = acc_day
     return out
 
@@ -2930,15 +3136,15 @@ def _compute_daily_utilization_series(
     since_dt: datetime | None,
     metric: str,
 ) -> list[dict[str, Any]]:
-    since_day = since_dt.date().isoformat() if since_dt else None
+    analytics_tz = _analytics_tzinfo()
     buckets: dict[str, dict[str, float]] = {}
     for row in snapshots:
-        captured_at = str(row.get("captured_at") or "").strip()
-        if len(captured_at) < 10:
+        captured_dt = _parse_captured_at(row.get("captured_at"))
+        if captured_dt is None:
             continue
-        day = captured_at[:10]
-        if since_day is not None and day < since_day:
+        if since_dt is not None and captured_dt < since_dt:
             continue
+        day = captured_dt.astimezone(analytics_tz).date().isoformat()
         raw = row.get(metric)
         if raw is None:
             continue
@@ -2965,19 +3171,12 @@ def _compute_hourly_utilization_series(
     since_dt: datetime | None,
     metric: str,
 ) -> list[dict[str, Any]]:
+    analytics_tz = _analytics_tzinfo()
     buckets: dict[str, dict[str, float]] = {}
     for row in snapshots:
-        captured_at = str(row.get("captured_at") or "").strip()
-        if not captured_at:
+        captured_dt = _parse_captured_at(row.get("captured_at"))
+        if captured_dt is None:
             continue
-        try:
-            captured_dt = datetime.fromisoformat(captured_at.replace("Z", "+00:00"))
-        except ValueError:
-            continue
-        if captured_dt.tzinfo is None:
-            captured_dt = captured_dt.replace(tzinfo=timezone.utc)
-        else:
-            captured_dt = captured_dt.astimezone(timezone.utc)
         if since_dt is not None and captured_dt < since_dt:
             continue
         raw = row.get(metric)
@@ -2987,7 +3186,8 @@ def _compute_hourly_utilization_series(
             value = float(raw)
         except (TypeError, ValueError):
             continue
-        hour_key = captured_dt.strftime("%Y-%m-%dT%H:00:00Z")
+        local_dt = captured_dt.astimezone(analytics_tz).replace(minute=0, second=0, microsecond=0)
+        hour_key = local_dt.isoformat().replace("+00:00", "Z")
         bucket = buckets.setdefault(hour_key, {"sum": 0.0, "count": 0.0})
         bucket["sum"] += value
         bucket["count"] += 1.0
@@ -3049,6 +3249,17 @@ def _group_rollover_metric_by_day(
             continue
         buckets[day] = buckets.get(day, 0) + int(row.get(metric) or 0)
     return [{"day": day, "value": buckets[day]} for day in sorted(buckets.keys())]
+
+
+def _latest_captured_at(rows: list[dict[str, Any]]) -> str | None:
+    latest: str | None = None
+    for row in rows:
+        captured = str(row.get("captured_at") or "").strip()
+        if not captured:
+            continue
+        if latest is None or captured > latest:
+            latest = captured
+    return latest
 
 
 def _selected_day_count(selected_range: str, daily_series: list[dict[str, Any]]) -> int:

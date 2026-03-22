@@ -91,24 +91,49 @@ type AccountHistoryResponse = {
   email: string | null
   account_type?: string | null
   range: RangeKey
+  range_metadata?: {
+    label?: string
+    window_label?: string
+    timezone?: string
+    boundary_mode?: string
+  }
+  summary?: {
+    absolute_usage_available?: boolean
+    total_consumed_in_range: number | null
+    average_daily_consumption: number | null
+    current_total_used: number | null
+    current_total_limit: number | null
+    current_total_remaining: number | null
+    total_wasted: number
+    stale_account_count: number
+    failed_account_count: number
+    last_refresh_time: string | null
+    last_refresh_label?: string | null
+    fallback_mode?: boolean
+    fallback_reason?: string | null
+    weekly_utilization_now?: number | null
+    average_weekly_utilization_in_range?: number | null
+  }
   current_state: {
-    usage_in_window: number
-    usage_limit: number
-    remaining: number
+    absolute_usage_available?: boolean
+    usage_in_window: number | null
+    usage_limit: number | null
+    remaining: number | null
     utilization_percent?: number | null
     weekly_used_units?: number | null
     weekly_remaining_units?: number | null
     efficiency_pct?: number | null
     next_reset?: string | null
-    lifetime_used: number
+    lifetime_used: number | null
     last_sync?: string | null
     refresh_status?: RefreshStatus
   }
   consumption_trend: {
     cumulative_usage: Array<{ day: string; cumulative: number; consumed: number }>
     daily_usage: Array<{ day: string; consumed: number }>
-    total_consumed_in_range: number
-    average_daily_consumption: number
+    total_consumed_in_range: number | null
+    average_daily_consumption: number | null
+    absolute_usage_available?: boolean
     fallback_mode?: boolean
     daily_weekly_utilization?: Array<{ day: string; value: number }>
     hourly_weekly_utilization?: Array<{ t: string; value: number }>
@@ -140,16 +165,24 @@ type AccountHistoryResponse = {
 
 type UsageHistoryResponse = {
   range: RangeKey
+  range_metadata?: {
+    label?: string
+    window_label?: string
+    timezone?: string
+    boundary_mode?: string
+  }
   summary: {
-    total_consumed_in_range: number
-    average_daily_consumption: number
-    current_total_used: number
-    current_total_limit: number
-    current_total_remaining: number
+    absolute_usage_available?: boolean
+    total_consumed_in_range: number | null
+    average_daily_consumption: number | null
+    current_total_used: number | null
+    current_total_limit: number | null
+    current_total_remaining: number | null
     total_wasted: number
     stale_account_count: number
     failed_account_count: number
     last_refresh_time: string | null
+    last_refresh_label?: string | null
     fallback_mode?: boolean
     fallback_reason?: string | null
     weekly_utilization_now?: number | null
@@ -171,6 +204,7 @@ type UsageHistoryResponse = {
       email: string | null
       consumed: number
     }>
+    top_consuming_accounts_available?: boolean
     stale_accounts: Array<{
       account_key: string
       label: string
@@ -232,6 +266,13 @@ const defaultAggregate: Aggregate = {
 
 const SESSION_TOKEN = '__session__'
 const ACTION_API_KEY_STORAGE = 'auth_manager_action_api_key'
+const RANGE_LABELS: Record<RangeKey, string> = {
+  '1d': 'Today',
+  '7d': '7d',
+  '30d': '30d',
+  '90d': '90d',
+  all: 'All',
+}
 
 function authHeaders(token: string): Record<string, string> {
   if (!token || token === SESSION_TOKEN) return {}
@@ -296,6 +337,16 @@ function fmtTs(value: string | number | null | undefined): string {
     hour: '2-digit',
     minute: '2-digit',
   })
+}
+
+function fmtNullableNumber(value: number | null | undefined, suffix = ''): string {
+  if (value == null || !Number.isFinite(value)) return 'Unavailable'
+  return `${value}${suffix}`
+}
+
+function rangeLabel(range: RangeKey, meta?: { label?: string; window_label?: string }): string {
+  if (range === '1d') return meta?.label || 'Today'
+  return meta?.label || range
 }
 
 function limitPercent(limit?: Limit | null): number | null {
@@ -440,6 +491,8 @@ function App() {
 
   const statsDaily = usageHistory?.series.daily_usage || []
   const statsCumulative = usageHistory?.series.cumulative_usage || []
+  const statsSummary = usageHistory?.summary
+  const statsRangeMeta = usageHistory?.range_metadata
   const weeklyUtilizationSeries = selectedRange === '1d'
     ? (usageHistory?.series.hourly_weekly_utilization || [])
     : (usageHistory?.series.daily_weekly_utilization || [])
@@ -459,6 +512,7 @@ function App() {
     ? Math.round(weeklyPercents.reduce((sum, value) => sum + value, 0) / weeklyPercents.length)
     : null
   const weeklyAtCapCount = weeklyPercents.filter((v) => v >= 100).length
+  const chartRangeLabel = rangeLabel(selectedRange, statsRangeMeta)
 
   const buildLinePath = (values: number[], width = 1000, height = 220, pad = 24) => {
     if (!values.length) return ''
@@ -528,15 +582,15 @@ function App() {
         if (last24h.length) {
           setHistory(last24h)
         } else {
-          const fallback = historyPayload.summary.total_consumed_in_range || payload.aggregate.total_current_window_used || 0
+          const fallback = historyPayload.summary.total_consumed_in_range ?? payload.aggregate.total_current_window_used ?? 0
           setHistory([{ t: Date.now(), value: fallback }])
         }
       } else {
-        const fallback = payload.aggregate.total_current_window_used || 0
+        const fallback = payload.aggregate.total_current_window_used ?? 0
         setHistory([{ t: Date.now(), value: fallback }])
       }
     } catch {
-      const fallback = payload.aggregate.total_current_window_used || 0
+      const fallback = payload.aggregate.total_current_window_used ?? 0
       setHistory([{ t: Date.now(), value: fallback }])
     } finally {
       setHistoryLoading(false)
@@ -755,9 +809,14 @@ function App() {
     setErr(null)
     setAddAccountLoading(true)
     try {
+      const parsedUrl = new URL(fullUrl)
       await requestJson('/auth/relay-callback', apiKey, {
         method: 'POST',
         body: JSON.stringify({
+          code: parsedUrl.searchParams.get('code') || undefined,
+          state: parsedUrl.searchParams.get('state') || undefined,
+          error: parsedUrl.searchParams.get('error') || undefined,
+          error_description: parsedUrl.searchParams.get('error_description') || undefined,
           full_url: fullUrl,
           relay_token: addRelayToken,
           session_id: addSessionId,
@@ -1102,6 +1161,15 @@ function App() {
               const rateError = typeof a.rate_limits?.error === 'string' ? a.rate_limits.error : ''
               const scopeError = rateError.includes('Missing scopes') ? 'Live rate-limit scopes are missing for this account.' : rateError
               const badge = refreshBadge(secondary, null, undefined)
+              const refreshState = a.refresh_status?.state || 'idle'
+              const refreshLabel =
+                refreshState === 'refreshing'
+                  ? 'Refreshing'
+                  : refreshState === 'failed'
+                    ? 'Failed'
+                    : refreshState === 'ok'
+                      ? 'Updated'
+                      : 'Cached'
               return (
                 <div className="row" key={`${a.account_key}:${a.label}`}>
                   <div>
@@ -1109,6 +1177,10 @@ function App() {
                       <button className="profile-link-btn" onClick={() => void openAccountHistory(a.label)}>
                         {a.display_label || a.label}
                       </button>
+                      <span className={`refresh-indicator ${refreshState}`}>
+                        <span className="refresh-dot" />
+                        {refreshLabel}
+                      </span>
                       {badge ? <span className="pill" style={badge.style}>{badge.text}</span> : null}
                     </div>
                     <div className="muted">{a.email || 'email unavailable'} · <span className="mono">{a.account_type || 'ChatGPT Plus'}</span></div>
@@ -1152,54 +1224,71 @@ function App() {
         <section className="aggregate panel">
           <div className="aggregate-header">
             <h2>Aggregated Usage Analytics</h2>
-            <p className="muted">Consumption over time across all accounts (absolute usage).</p>
+            <p className="muted">
+              {selectedRange === '1d'
+                ? `${chartRangeLabel} usage since midnight${statsRangeMeta?.timezone ? ` (${statsRangeMeta.timezone})` : ''}.`
+                : 'Consumption over time across all accounts.'}
+            </p>
           </div>
           <div className="top-actions" style={{ marginBottom: 12 }}>
-            {(['1d', '7d', '30d', '90d', 'all'] as RangeKey[]).map((r) => (
-              <button key={r} className={`btn btn-sm ${selectedRange === r ? 'primary' : ''}`} onClick={() => setSelectedRange(r)}>
-                {r}
-              </button>
-            ))}
+                {(['1d', '7d', '30d', '90d', 'all'] as RangeKey[]).map((r) => (
+                  <button key={r} className={`btn btn-sm ${selectedRange === r ? 'primary' : ''}`} onClick={() => setSelectedRange(r)}>
+                    {RANGE_LABELS[r]}
+                  </button>
+                ))}
             <button className={`btn btn-sm ${statsChartMode === 'cumulative' ? 'primary' : ''}`} onClick={() => setStatsChartMode('cumulative')}>Cumulative</button>
             <button className={`btn btn-sm ${statsChartMode === 'daily' ? 'primary' : ''}`} onClick={() => setStatsChartMode('daily')}>Daily</button>
           </div>
+          {statsFallbackMode ? (
+            <div className="fallback-banner">
+              Absolute usage counters unavailable. Showing utilization-based fallback data.
+            </div>
+          ) : null}
           <div className="cards analytics-cards">
             <div>
-              <label>Fleet Capacity Units</label>
-              <div className="unit-value"><strong>{aggregate.fleet_capacity_units}</strong> <span className="u">CU</span></div>
-              <div className="muted small">100 CU per account/week</div>
+              <label>{selectedRange === '1d' ? 'Used Today' : 'Consumed In Range'}</label>
+              <div className="unit-value"><strong>{fmtNullableNumber(statsSummary?.total_consumed_in_range)}</strong></div>
+              <div className="muted small">
+                {statsFallbackMode ? 'Unavailable in fallback mode' : (selectedRange === '1d' ? 'Measured since local midnight' : 'Measured absolute usage')}
+              </div>
             </div>
             <div>
-              <label>Consumed Capacity</label>
-              <div className="unit-value"><strong>{aggregate.fleet_used_units}</strong> <span className="u">CU</span></div>
-              <div className={`muted small ${pctClass(aggregate.fleet_utilization_pct)}`}>{aggregate.fleet_utilization_pct}% utilization</div>
+              <label>Current Used</label>
+              <div className="unit-value"><strong>{fmtNullableNumber(statsSummary?.current_total_used)}</strong></div>
+              <div className={`muted small ${pctClass(statsSummary?.weekly_utilization_now || 0)}`}>
+                {statsSummary?.weekly_utilization_now == null ? 'No live utilization snapshot' : `${statsSummary.weekly_utilization_now}% weekly utilization now`}
+              </div>
             </div>
             <div>
-              <label>Available Capacity</label>
-              <div className="unit-value"><strong>{aggregate.fleet_remaining_units}</strong> <span className="u">CU</span></div>
-              <div className="muted small">Remaining in weekly cycles</div>
+              <label>Current Remaining</label>
+              <div className="unit-value"><strong>{fmtNullableNumber(statsSummary?.current_total_remaining)}</strong></div>
+              <div className="muted small">
+                {statsFallbackMode ? 'Unavailable in fallback mode' : 'Current remaining across accounts'}
+              </div>
             </div>
-            <div className={aggregate.fleet_efficiency_pct < 80 ? 'warn-card' : ''}>
-              <label>Fleet Efficiency</label>
-              <div className="unit-value"><strong>{aggregate.fleet_efficiency_pct}%</strong></div>
-              <div className="muted small">Consumed vs Wasted</div>
+            <div className={(aggregate.fleet_efficiency_pct < 80 && !statsFallbackMode) ? 'warn-card' : ''}>
+              <label>Current Limit</label>
+              <div className="unit-value"><strong>{fmtNullableNumber(statsSummary?.current_total_limit)}</strong></div>
+              <div className="muted small">
+                {statsFallbackMode ? 'Unavailable in fallback mode' : 'Current total limit across accounts'}
+              </div>
             </div>
             <div className={aggregate.total_wasted_units > 0 ? 'warn-card' : ''}>
               <label>Quota Leakage</label>
-              <div className="unit-value"><strong>{aggregate.total_wasted_units}</strong> <span className="u">CU</span></div>
+              <div className="unit-value"><strong>{statsSummary?.total_wasted ?? 0}</strong> <span className="u">CU</span></div>
               <div className="muted small">Wasted at weekly reset</div>
             </div>
-            <div><label>Stale Accounts</label><strong>{aggregate.stale_accounts}</strong></div>
-            <div><label>Failed Accounts</label><strong>{aggregate.failed_accounts}</strong></div>
-            <div><label>Last Refresh</label><strong>{fmtTs(aggregate.last_refresh_time)}</strong></div>
+            <div><label>Stale Accounts</label><strong>{statsSummary?.stale_account_count ?? aggregate.stale_accounts}</strong></div>
+            <div><label>Failed Accounts</label><strong>{statsSummary?.failed_account_count ?? aggregate.failed_accounts}</strong></div>
+            <div><label>{statsSummary?.last_refresh_label || 'Last Refresh'}</label><strong>{fmtTs(statsSummary?.last_refresh_time || aggregate.last_refresh_time)}</strong></div>
           </div>
           <div className="graph-container">
             <div className="graph-label">
               {statsFallbackMode
-                ? 'Weekly Utilization Trend (Fallback)'
+                ? `${chartRangeLabel} Utilization Trend (Fallback)`
                 : (statsChartMode === 'cumulative'
-                  ? 'Cumulative Consumed Units Over Time'
-                  : 'Daily Consumed Units')}
+                  ? `${chartRangeLabel} Cumulative Consumption`
+                  : `${chartRangeLabel} Consumption`)}
             </div>
             <div className="chart-legend">
               <span className="legend-item">
@@ -1269,11 +1358,15 @@ function App() {
           <div className="cards" style={{ marginTop: 16 }}>
             <div>
               <label>Top Consuming Accounts</label>
-              {(usageHistory?.sections.top_consuming_accounts || []).slice(0, 5).map((item) => (
-                <div key={item.account_key} className="muted" style={{ marginTop: 4 }}>
-                  {(item.display_label || item.label)}: <span className="mono">{item.consumed}</span>
-                </div>
-              ))}
+              {usageHistory?.sections.top_consuming_accounts_available === false ? (
+                <div className="muted">Unavailable while using utilization fallback data.</div>
+              ) : (
+                (usageHistory?.sections.top_consuming_accounts || []).slice(0, 5).map((item) => (
+                  <div key={item.account_key} className="muted" style={{ marginTop: 4 }}>
+                    {(item.display_label || item.label)}: <span className="mono">{item.consumed}</span>
+                  </div>
+                ))
+              )}
             </div>
             <div>
               <label>Stale / Failed Accounts</label>
@@ -1304,11 +1397,16 @@ function App() {
             {historyData ? (
               <div>
                 <div className="muted"><strong>{historyData.display_label || historyData.label}</strong> · {historyData.email || 'email unavailable'}</div>
+                <div className="muted" style={{ marginTop: 4 }}>
+                  {accountHistoryRange === '1d'
+                    ? `${rangeLabel(accountHistoryRange, historyData.range_metadata)} since midnight${historyData.range_metadata?.timezone ? ` (${historyData.range_metadata.timezone})` : ''}.`
+                    : `Usage history for ${rangeLabel(accountHistoryRange, historyData.range_metadata)}.`}
+                </div>
 
                 <div className="top-actions" style={{ marginTop: 10 }}>
                   {(['1d', '7d', '30d', '90d', 'all'] as RangeKey[]).map((r) => (
                     <button key={r} className={`btn btn-sm ${accountHistoryRange === r ? 'primary' : ''}`} onClick={() => void reloadAccountHistory(r)}>
-                      {r}
+                      {RANGE_LABELS[r]}
                     </button>
                   ))}
                   <button className={`btn btn-sm ${accountChartMode === 'cumulative' ? 'primary' : ''}`} onClick={() => setAccountChartMode('cumulative')}>Cumulative</button>
@@ -1322,34 +1420,59 @@ function App() {
                     <div className="muted small">Plan category</div>
                   </div>
                   <div>
-                    <label>Weekly Consumed</label>
-                    <div className="unit-value"><strong>{historyData.current_state.weekly_used_units}</strong> <span className="u">CU</span></div>
-                    <div className="muted small">Quota used this week</div>
+                    <label>{accountHistoryRange === '1d' ? 'Used Today' : 'Consumed In Range'}</label>
+                    <div className="unit-value"><strong>{fmtNullableNumber(historyData.summary?.total_consumed_in_range ?? historyData.consumption_trend.total_consumed_in_range)}</strong></div>
+                    <div className="muted small">
+                      {historyData.summary?.fallback_mode ? 'Unavailable in fallback mode' : 'Measured absolute usage'}
+                    </div>
                   </div>
                   <div>
-                    <label>Weekly Remaining</label>
-                    <div className="unit-value"><strong>{historyData.current_state.weekly_remaining_units}</strong> <span className="u">CU</span></div>
-                    <div className="muted small">Potential before reset</div>
+                    <label>Current Used</label>
+                    <div className="unit-value"><strong>{fmtNullableNumber(historyData.summary?.current_total_used ?? historyData.current_state.usage_in_window)}</strong></div>
+                    <div className="muted small">
+                      {historyData.summary?.weekly_utilization_now == null ? 'No live utilization snapshot' : `${historyData.summary.weekly_utilization_now}% weekly utilization now`}
+                    </div>
+                  </div>
+                  <div>
+                    <label>Current Remaining</label>
+                    <div className="unit-value"><strong>{fmtNullableNumber(historyData.summary?.current_total_remaining ?? historyData.current_state.remaining)}</strong></div>
+                    <div className="muted small">
+                      {historyData.summary?.fallback_mode ? 'Unavailable in fallback mode' : 'Current remaining'}
+                    </div>
+                  </div>
+                  <div>
+                    <label>Current Limit</label>
+                    <div className="unit-value"><strong>{fmtNullableNumber(historyData.summary?.current_total_limit ?? historyData.current_state.usage_limit)}</strong></div>
+                    <div className="muted small">
+                      {historyData.summary?.fallback_mode ? 'Unavailable in fallback mode' : 'Current limit'}
+                    </div>
                   </div>
                   <div className={(historyData.current_state.efficiency_pct || 100) < 80 ? 'warn-card' : ''}>
                     <label>Account Efficiency</label>
                     <div className="unit-value"><strong>{historyData.current_state.efficiency_pct}%</strong></div>
                     <div className="muted small">Used vs Waste</div>
                   </div>
-                  <div><label>Lifetime Used</label><strong>{historyData.current_state.lifetime_used}</strong></div>
+                  <div><label>Lifetime Used</label><strong>{fmtNullableNumber(historyData.current_state.lifetime_used)}</strong></div>
                   <div><label>Next 5hr Reset</label><strong>{fmtTs(historyData.current_state.next_reset || null)}</strong></div>
-                  <div><label>Sync Time</label><strong>{fmtTs(historyData.current_state.last_sync || null)}</strong></div>
+                  <div><label>{historyData.summary?.last_refresh_label || 'Last Refresh'}</label><strong>{fmtTs(historyData.summary?.last_refresh_time || historyData.current_state.last_sync || null)}</strong></div>
                 </div>
 
                 <div className="graph-container" style={{ marginTop: 16 }}>
+                  {historyData.summary?.fallback_mode || historyData.consumption_trend.fallback_mode ? (
+                    <div className="fallback-banner" style={{ marginBottom: 12 }}>
+                      Absolute usage counters unavailable. Showing utilization-based fallback data.
+                    </div>
+                  ) : null}
                   <div className="graph-label">
-                    {historyData.consumption_trend.fallback_mode
-                      ? 'Weekly Utilization Trend (Fallback)'
-                      : (accountChartMode === 'cumulative' ? 'Cumulative Consumption' : 'Daily Consumption')}
+                    {(historyData.summary?.fallback_mode || historyData.consumption_trend.fallback_mode)
+                      ? `${rangeLabel(accountHistoryRange, historyData.range_metadata)} Utilization Trend (Fallback)`
+                      : (accountChartMode === 'cumulative'
+                          ? `${rangeLabel(accountHistoryRange, historyData.range_metadata)} Cumulative Consumption`
+                          : `${rangeLabel(accountHistoryRange, historyData.range_metadata)} Consumption`)}
                   </div>
                   <div className="graph">
                     {(() => {
-                      const accountFallbackMode = Boolean(historyData.consumption_trend.fallback_mode)
+                      const accountFallbackMode = Boolean(historyData.summary?.fallback_mode || historyData.consumption_trend.fallback_mode)
                       const points = accountFallbackMode
                         ? (accountHistoryRange === '1d'
                             ? (historyData.consumption_trend.hourly_weekly_utilization || [])

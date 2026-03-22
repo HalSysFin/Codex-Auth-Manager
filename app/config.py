@@ -39,6 +39,8 @@ class Settings(BaseSettings):
     openai_client_id: str | None = None
     openai_client_secret: str | None = None
     openai_redirect_uri: str | None = None
+    analytics_timezone: str = "UTC"
+    analytics_snapshot_interval_seconds: int = 600
 
     def codex_auth_file(self) -> Path:
         return _expand(self.codex_auth_path)
