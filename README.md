@@ -66,8 +66,8 @@ Core runtime:
 - `CODEX_CLI_BIN`
 - `CODEX_AUTH_PATH`
 - `CALLBACK_STORE_DIR`
-- `CODEX_PROFILES_DIR`
-- `USAGE_DB_PATH`
+- `CODEX_PROFILES_DIR` (legacy migration source only)
+- `USAGE_DB_PATH` (legacy migration source only)
 - `DATABASE_URL`
 - `AUTH_ENCRYPTION_KEY` (optional)
 
@@ -123,6 +123,71 @@ docker compose up --build
 Services:
 - API/backend: `http://localhost:8080`
 - Frontend dev server: `http://localhost:5173`
+
+## AMD64 / ARM64 Installation Notes
+
+This project supports both:
+- `linux/amd64` (x86_64)
+- `linux/arm64` (aarch64, e.g. Apple Silicon / Graviton)
+
+The GitHub workflow builds and publishes multi-arch images to GHCR.
+
+### Option A: Build locally with Docker Compose
+
+Use this when running from source in this repo:
+
+```bash
+docker compose up --build
+```
+
+Docker will build for your host architecture automatically.
+
+### Option B: Use published image (recommended for servers)
+
+Set the `auth-manager` service image in `docker-compose.yml`:
+
+```yaml
+auth-manager:
+  image: ghcr.io/halsysfin/codex-auth-manager:latest
+```
+
+Then run:
+
+```bash
+docker compose pull
+docker compose up -d
+```
+
+Docker will pull the correct architecture variant automatically.
+
+### Force a specific architecture (only if needed)
+
+If you need to force one explicitly:
+
+```yaml
+auth-manager:
+  platform: linux/amd64
+```
+
+or
+
+```yaml
+auth-manager:
+  platform: linux/arm64
+```
+
+### Verify image architecture
+
+```bash
+docker image inspect ghcr.io/halsysfin/codex-auth-manager:latest --format '{{.Architecture}}/{{.Os}}'
+```
+
+Container defaults:
+- Active auth file: `/root/.codex/auth.json`
+- App state volume root: `/var/lib/auth-manager`
+  - callbacks: `/var/lib/auth-manager/callbacks`
+  - legacy profile migration source: `/var/lib/auth-manager/legacy/profiles`
+  - legacy sqlite migration source: `/var/lib/auth-manager/legacy/auth-manager.sqlite3`
 
 ## Chrome Extension
 

@@ -20,10 +20,12 @@ services:
       - "8080:8080"
     environment:
       CODEX_CLI_BIN: ${CODEX_CLI_BIN:-codex}
+      # Keep active Codex auth where Codex CLI expects it.
       CODEX_AUTH_PATH: ${CODEX_AUTH_PATH:-/root/.codex/auth.json}
-      CALLBACK_STORE_DIR: ${CALLBACK_STORE_DIR:-/root/.codex-switch/callbacks}
-      CODEX_PROFILES_DIR: ${CODEX_PROFILES_DIR:-/root/.codex-switch/profiles}
-      USAGE_DB_PATH: ${USAGE_DB_PATH:-/root/.codex-switch/auth-manager.sqlite3}
+      # App-managed state and legacy migration sources live under /var/lib/auth-manager.
+      CALLBACK_STORE_DIR: ${CALLBACK_STORE_DIR:-/var/lib/auth-manager/callbacks}
+      CODEX_PROFILES_DIR: ${CODEX_PROFILES_DIR:-/var/lib/auth-manager/legacy/profiles}
+      USAGE_DB_PATH: ${USAGE_DB_PATH:-/var/lib/auth-manager/legacy/auth-manager.sqlite3}
       DATABASE_URL: ${DATABASE_URL:-postgresql://auth_manager:auth_manager@postgres:5432/auth_manager}
       AUTH_ENCRYPTION_KEY: ${AUTH_ENCRYPTION_KEY:-}
       LOGIN_SESSION_TTL_SECONDS: ${LOGIN_SESSION_TTL_SECONDS:-600}
@@ -42,28 +44,29 @@ services:
       OPENAI_CLIENT_SECRET: ${OPENAI_CLIENT_SECRET:-}
       OPENAI_REDIRECT_URI: ${OPENAI_REDIRECT_URI:-http://localhost:1455/auth/callback}
     volumes:
+      # Active in-container Codex auth (named volume, not host ~/.codex).
       - codex_auth:/root/.codex
-      - codex_switch:/root/.codex-switch
+      # Auth-manager state (callbacks + legacy migration sources).
+      - auth_manager_state:/var/lib/auth-manager
     depends_on:
       postgres:
         condition: service_healthy
     restart: unless-stopped
 
   frontend:
-    image: node:20-alpine
-    working_dir: /frontend
-    command: sh -c "npm install && npm run dev -- --host 0.0.0.0 --port 5173"
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile.dev
     environment:
-      VITE_API_BASE_URL: ${VITE_API_BASE_URL:-http://auth-manager:8080}
-    volumes:
-      - ./frontend:/frontend
+      VITE_API_BASE_URL: "${VITE_API_BASE_URL:-http://auth-manager:8080}"
     ports:
       - "5173:5173"
     depends_on:
-      - auth-manager
+      auth-manager:
+        condition: service_started
     restart: unless-stopped
 
 volumes:
   postgres_data:
   codex_auth:
-  codex_switch:
+  auth_manager_state:

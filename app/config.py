@@ -17,9 +17,9 @@ class Settings(BaseSettings):
 
     codex_cli_bin: str = "codex"
     codex_auth_path: str = "/root/.codex/auth.json"
-    callback_store_dir: str = "/root/.codex-switch/callbacks"
-    codex_profiles_dir: str = "/root/.codex-switch/profiles"
-    usage_db_path: str = "/root/.codex-switch/auth-manager.sqlite3"
+    callback_store_dir: str = "/var/lib/auth-manager/callbacks"
+    codex_profiles_dir: str = "/var/lib/auth-manager/legacy/profiles"
+    usage_db_path: str = "/var/lib/auth-manager/legacy/auth-manager.sqlite3"
     database_url: str | None = None
     auth_encryption_key: str | None = None
     login_session_ttl_seconds: int = 600
