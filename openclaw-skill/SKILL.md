@@ -1,6 +1,6 @@
 ---
 name: openclaw-codex-lease
-description: broker-managed codex auth lease handling for openclaw. use when chatgpt needs to acquire, inspect, renew, rotate, or repair an auth manager lease for openclaw or codex, materialize the leased auth payload, write ~/.codex/auth.json, report lease consumption or status, and react to revoked, expired, or replacement-required lease states using an auth manager api key and broker endpoints.
+description: broker-managed codex auth lease handling for openclaw. use when chatgpt needs to acquire, inspect, renew, rotate, or repair an auth manager lease for openclaw or codex, materialize the leased auth payload, write ~/.codex/auth.json, report lease consumption or status, and react to revoked, expired, or replacement-required lease states using an auth manager internal API token and broker endpoints.
 ---
 
 # OpenClaw Codex Lease
@@ -11,7 +11,7 @@ Use this skill to manage a Codex auth lease for OpenClaw through Auth Manager.
 This skill assumes these defaults unless the user says otherwise:
 
 - Auth Manager base URL comes from `AUTH_MANAGER_BASE_URL`
-- API key comes from `AUTH_MANAGER_API_KEY`
+- internal API token comes from `AUTH_MANAGER_INTERNAL_API_TOKEN`
 - `machine_id` defaults to hostname
 - `agent_id` defaults to `openclaw`
 - auth file path defaults to `~/.codex/auth.json`
@@ -25,7 +25,7 @@ This skill assumes these defaults unless the user says otherwise:
 Read these environment variables first:
 
 - `AUTH_MANAGER_BASE_URL`
-- `AUTH_MANAGER_API_KEY`
+- `AUTH_MANAGER_INTERNAL_API_TOKEN`
 - `AUTH_MANAGER_MACHINE_ID` (optional)
 - `AUTH_MANAGER_AGENT_ID` (optional)
 - `CODEX_AUTH_PATH` (optional)
@@ -37,7 +37,7 @@ If machine or agent IDs are missing, derive them with the helper script.
 Call Auth Manager to inspect the current lease or acquire one if none exists.
 Use the bearer token header:
 
-- `Authorization: Bearer <AUTH_MANAGER_API_KEY>`
+- `Authorization: Bearer <AUTH_MANAGER_INTERNAL_API_TOKEN>`
 
 Important states to handle exactly like the other clients:
 

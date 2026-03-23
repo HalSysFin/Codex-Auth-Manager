@@ -62,7 +62,7 @@ export class OpenClawAuthManagerPlugin {
   constructor(options: AuthManagerPluginOptions) {
     this.client = new AuthManagerTelemetryClient({
       baseUrl: options.baseUrl,
-      apiKey: options.apiKey,
+      internalApiToken: options.internalApiToken,
       fetchImpl: options.fetchImpl,
     })
     this.logger = options.logger ?? console

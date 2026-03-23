@@ -3,7 +3,7 @@
 ## Defaults
 
 - Base URL: `AUTH_MANAGER_BASE_URL`
-- API key: `AUTH_MANAGER_API_KEY`
+- Internal API token: `AUTH_MANAGER_INTERNAL_API_TOKEN`
 - Machine ID: `AUTH_MANAGER_MACHINE_ID` or hostname
 - Agent ID: `AUTH_MANAGER_AGENT_ID` or `openclaw`
 - Auth path: `CODEX_AUTH_PATH` or `~/.codex/auth.json`
@@ -13,7 +13,7 @@
 Use bearer auth:
 
 ```http
-Authorization: Bearer <AUTH_MANAGER_API_KEY>
+Authorization: Bearer <AUTH_MANAGER_INTERNAL_API_TOKEN>
 Content-Type: application/json
 ```
 

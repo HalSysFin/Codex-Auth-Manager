@@ -39,7 +39,7 @@ test('plugin aggregates usage and posts telemetry', async () => {
   let postedBody: Record<string, unknown> | null = null
   const plugin = createOpenClawAuthManagerPlugin({
     baseUrl: 'http://127.0.0.1:8080',
-    apiKey: 'test-token',
+    internalApiToken: 'test-token',
     context: {
       leaseId: 'lease_123',
       machineId: 'machine-a',

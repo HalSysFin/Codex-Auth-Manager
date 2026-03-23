@@ -67,7 +67,7 @@ def main() -> int:
     if args.print_defaults:
         print(json.dumps({
             "base_url_env": "AUTH_MANAGER_BASE_URL",
-            "api_key_env": "AUTH_MANAGER_API_KEY",
+            "internal_api_token_env": "AUTH_MANAGER_INTERNAL_API_TOKEN",
             "machine_id": default_machine_id(),
             "agent_id": default_agent_id(),
             "auth_path": str(expand_auth_path(args.output)),

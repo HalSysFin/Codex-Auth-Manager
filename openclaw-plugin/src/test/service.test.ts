@@ -8,7 +8,7 @@ test('service flushes after request threshold', async () => {
   let postedBody: Record<string, unknown> | null = null
   const service = createOpenClawLeaseTelemetryService({
     baseUrl: 'http://127.0.0.1:8080',
-    apiKey: 'secret',
+    internalApiToken: 'secret',
     context: {
       leaseId: 'lease_1',
       machineId: 'machine-a',
@@ -39,7 +39,7 @@ test('changing lease context resets pending totals before the next flush', async
   const leasePosts: Array<{ leaseId: string; body: Record<string, unknown> }> = []
   const service = createOpenClawLeaseTelemetryService({
     baseUrl: 'http://127.0.0.1:8080',
-    apiKey: 'secret',
+    internalApiToken: 'secret',
     context: {
       leaseId: 'lease_1',
       machineId: 'machine-a',

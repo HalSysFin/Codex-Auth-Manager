@@ -55,7 +55,7 @@ export type TelemetryPostBody = {
 
 export type AuthManagerPluginOptions = {
   baseUrl: string
-  apiKey: string
+  internalApiToken: string
   context?: LeaseTelemetryContext
   fetchImpl?: typeof fetch
   logger?: Pick<Console, 'info' | 'warn' | 'error'>
@@ -63,7 +63,7 @@ export type AuthManagerPluginOptions = {
 
 export type AuthManagerLeasePluginConfig = {
   baseUrl: string
-  apiKey: string
+  internalApiToken: string
   machineId: string
   agentId: string
   leaseId?: string

@@ -59,6 +59,12 @@ The app persists these settings locally:
 
 If machine ID or agent ID are blank, the app generates stable defaults and saves them.
 
+Backend auth is always sent as:
+
+```http
+Authorization: Bearer <internalApiToken>
+```
+
 ## Auth file writing
 
 The app writes `~/.codex/auth.json` by:

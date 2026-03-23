@@ -141,6 +141,12 @@ node dist/headless-client/src/cli.js ensure
 - inspect `~/.local/state/auth-manager-agent/state.json`
 - verify backend token/base URL in config or environment
 
+Backend auth is always sent as:
+
+```http
+Authorization: Bearer <AUTH_MANAGER_INTERNAL_API_TOKEN>
+```
+
 ## Known limitations
 
 - Linux-focused first version only

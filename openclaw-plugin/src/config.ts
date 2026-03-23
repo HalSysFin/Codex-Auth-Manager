@@ -33,7 +33,12 @@ export function resolvePluginConfig(
   env: NodeJS.ProcessEnv = process.env,
 ): AuthManagerLeasePluginConfig {
   const baseUrl = asString(rawConfig?.baseUrl) ?? asString(env.AUTH_MANAGER_BASE_URL) ?? ''
-  const apiKey = asString(rawConfig?.apiKey) ?? asString(env.AUTH_MANAGER_API_KEY) ?? ''
+  const internalApiToken =
+    asString(rawConfig?.internalApiToken) ??
+    asString(rawConfig?.apiKey) ??
+    asString(env.AUTH_MANAGER_INTERNAL_API_TOKEN) ??
+    asString(env.AUTH_MANAGER_API_KEY) ??
+    ''
   const machineId = asString(rawConfig?.machineId) ?? asString(env.AUTH_MANAGER_MACHINE_ID) ?? ''
   const agentId = asString(rawConfig?.agentId) ?? asString(env.AUTH_MANAGER_AGENT_ID) ?? 'openclaw'
   const leaseId = asString(rawConfig?.leaseId) ?? asString(env.AUTH_MANAGER_LEASE_ID)
@@ -51,7 +56,7 @@ export function resolvePluginConfig(
 
   return {
     baseUrl,
-    apiKey,
+    internalApiToken,
     machineId,
     agentId,
     leaseId,
@@ -64,7 +69,7 @@ export function resolvePluginConfig(
 export function validatePluginConfig(config: AuthManagerLeasePluginConfig): string[] {
   const errors: string[] = []
   if (!config.baseUrl) errors.push('baseUrl is required')
-  if (!config.apiKey) errors.push('apiKey is required')
+  if (!config.internalApiToken) errors.push('internalApiToken is required')
   if (!config.machineId) errors.push('machineId is required')
   if (!config.agentId) errors.push('agentId is required')
   if (config.flushIntervalMs < 1_000) errors.push('flushIntervalMs must be at least 1000')

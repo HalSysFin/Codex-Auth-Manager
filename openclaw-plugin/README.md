@@ -64,7 +64,7 @@ import { createOpenClawAuthManagerPlugin } from './src/index.js'
 
 const plugin = createOpenClawAuthManagerPlugin({
   baseUrl: process.env.AUTH_MANAGER_BASE_URL!,
-  apiKey: process.env.AUTH_MANAGER_API_KEY!,
+  internalApiToken: process.env.AUTH_MANAGER_INTERNAL_API_TOKEN!,
   context: {
     leaseId: process.env.AUTH_MANAGER_LEASE_ID!,
     machineId: process.env.AUTH_MANAGER_MACHINE_ID || 'my-host',
@@ -84,6 +84,14 @@ plugin.observeUsage({
 
 await plugin.flushTelemetry()
 ```
+
+The plugin authenticates to Auth Manager with:
+
+```http
+Authorization: Bearer <AUTH_MANAGER_INTERNAL_API_TOKEN>
+```
+
+Use `internalApiToken` in plugin code/config and `AUTH_MANAGER_INTERNAL_API_TOKEN` in env-based setups. The older `apiKey` and `AUTH_MANAGER_API_KEY` names are kept only as compatibility fallbacks.
 
 ## Plugin-Ready Entry Surface
 

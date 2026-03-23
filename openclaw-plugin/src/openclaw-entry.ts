@@ -25,7 +25,7 @@ export function createAuthManagerOpenClawEntry(): OpenClawPluginLikeDefinition {
     register(api) {
       let service = createOpenClawLeaseTelemetryService({
         baseUrl: 'http://127.0.0.1:8080',
-        apiKey: 'unset',
+        internalApiToken: 'unset',
         logger: api.logger,
       })
 
@@ -40,7 +40,7 @@ export function createAuthManagerOpenClawEntry(): OpenClawPluginLikeDefinition {
           }
           service = createOpenClawLeaseTelemetryService({
             baseUrl: config.baseUrl,
-            apiKey: config.apiKey,
+            internalApiToken: config.internalApiToken,
             logger: api.logger,
             flushIntervalMs: config.flushIntervalMs,
             flushEveryRequests: config.flushEveryRequests,
@@ -81,7 +81,7 @@ export function buildUsageObserver(service = createOpenClawLeaseTelemetryService
     attach(params) {
       const instance = service({
         baseUrl: params.config.baseUrl,
-        apiKey: params.config.apiKey,
+        internalApiToken: params.config.internalApiToken,
         logger: params.logger,
         flushIntervalMs: params.config.flushIntervalMs,
         flushEveryRequests: params.config.flushEveryRequests,

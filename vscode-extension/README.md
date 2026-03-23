@@ -84,6 +84,12 @@ If your backend does not yet support `POST /api/leases/{lease_id}/materialize`, 
 
 If `machineId` or `agentId` are blank, the extension generates stable defaults and persists them in extension global state.
 
+Backend auth is always sent as:
+
+```http
+Authorization: Bearer <authManager.internalApiToken>
+```
+
 ## Commands
 
 - `authManager.ensureLease`

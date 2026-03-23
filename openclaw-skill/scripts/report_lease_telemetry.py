@@ -24,8 +24,8 @@ def default_base_url() -> str | None:
     return _env("AUTH_MANAGER_BASE_URL")
 
 
-def default_api_key() -> str | None:
-    return _env("AUTH_MANAGER_API_KEY")
+def default_internal_api_token() -> str | None:
+    return _env("AUTH_MANAGER_INTERNAL_API_TOKEN") or _env("AUTH_MANAGER_API_KEY")
 
 
 def default_machine_id() -> str:
@@ -185,13 +185,13 @@ def build_telemetry_body(
     return body
 
 
-def post_telemetry(base_url: str, api_key: str, lease_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+def post_telemetry(base_url: str, internal_api_token: str, lease_id: str, payload: dict[str, Any]) -> dict[str, Any]:
     url = f"{base_url.rstrip('/')}/api/leases/{lease_id}/telemetry"
     req = request.Request(
         url,
         data=json.dumps(payload).encode("utf-8"),
         headers={
-            "Authorization": f"Bearer {api_key}",
+            "Authorization": f"Bearer {internal_api_token}",
             "Content-Type": "application/json",
         },
         method="POST",
@@ -211,7 +211,8 @@ def main() -> int:
     parser.add_argument("--input", help="Path to observed usage JSON. Reads stdin if omitted.")
     parser.add_argument("--lease-id", help="Lease id. Defaults to AUTH_MANAGER_LEASE_ID.")
     parser.add_argument("--base-url", help="Auth Manager base URL. Defaults to AUTH_MANAGER_BASE_URL.")
-    parser.add_argument("--api-key", help="Auth Manager API key. Defaults to AUTH_MANAGER_API_KEY.")
+    parser.add_argument("--internal-api-token", help="Auth Manager internal API token. Defaults to AUTH_MANAGER_INTERNAL_API_TOKEN.")
+    parser.add_argument("--api-key", help="Compatibility alias for --internal-api-token.")
     parser.add_argument("--machine-id", help="Machine id. Defaults to AUTH_MANAGER_MACHINE_ID or hostname.")
     parser.add_argument("--agent-id", help="Agent id. Defaults to AUTH_MANAGER_AGENT_ID or openclaw.")
     parser.add_argument("--captured-at", help="Override captured_at timestamp.")
@@ -220,7 +221,7 @@ def main() -> int:
     args = parser.parse_args()
 
     base_url = args.base_url or default_base_url()
-    api_key = args.api_key or default_api_key()
+    internal_api_token = args.internal_api_token or args.api_key or default_internal_api_token()
     lease_id = args.lease_id or default_lease_id()
     machine_id = args.machine_id or default_machine_id()
     agent_id = args.agent_id or default_agent_id()
@@ -230,7 +231,7 @@ def main() -> int:
             json.dumps(
                 {
                     "base_url": base_url,
-                    "api_key_env": "AUTH_MANAGER_API_KEY",
+                    "internal_api_token_env": "AUTH_MANAGER_INTERNAL_API_TOKEN",
                     "lease_id": lease_id,
                     "machine_id": machine_id,
                     "agent_id": agent_id,
@@ -255,12 +256,12 @@ def main() -> int:
 
     if not base_url:
         raise SystemExit("AUTH_MANAGER_BASE_URL or --base-url is required")
-    if not api_key:
-        raise SystemExit("AUTH_MANAGER_API_KEY or --api-key is required")
+    if not internal_api_token:
+        raise SystemExit("AUTH_MANAGER_INTERNAL_API_TOKEN or --internal-api-token is required")
     if not lease_id:
         raise SystemExit("AUTH_MANAGER_LEASE_ID or --lease-id is required")
 
-    result = post_telemetry(base_url=base_url, api_key=api_key, lease_id=lease_id, payload=body)
+    result = post_telemetry(base_url=base_url, internal_api_token=internal_api_token, lease_id=lease_id, payload=body)
     safe = {
         "status": result.get("status"),
         "reason": result.get("reason"),

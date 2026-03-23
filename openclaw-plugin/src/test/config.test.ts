@@ -7,7 +7,7 @@ test('resolvePluginConfig prefers explicit config and applies defaults', () => {
   const config = resolvePluginConfig(
     {
       baseUrl: 'http://127.0.0.1:8080',
-      apiKey: 'secret',
+      internalApiToken: 'secret',
       machineId: 'machine-a',
       flushEveryRequests: 5,
     },
@@ -15,17 +15,28 @@ test('resolvePluginConfig prefers explicit config and applies defaults', () => {
   )
 
   assert.equal(config.baseUrl, 'http://127.0.0.1:8080')
-  assert.equal(config.apiKey, 'secret')
+  assert.equal(config.internalApiToken, 'secret')
   assert.equal(config.machineId, 'machine-a')
   assert.equal(config.agentId, 'openclaw')
   assert.equal(config.flushEveryRequests, 5)
   assert.equal(config.enabled, true)
 })
 
+test('resolvePluginConfig falls back to AUTH_MANAGER_INTERNAL_API_TOKEN env', () => {
+  const config = resolvePluginConfig(undefined, {
+    AUTH_MANAGER_BASE_URL: 'http://127.0.0.1:8080',
+    AUTH_MANAGER_INTERNAL_API_TOKEN: 'env-secret',
+    AUTH_MANAGER_MACHINE_ID: 'machine-a',
+    AUTH_MANAGER_AGENT_ID: 'openclaw',
+  })
+
+  assert.equal(config.internalApiToken, 'env-secret')
+})
+
 test('validatePluginConfig reports missing required fields', () => {
   const errors = validatePluginConfig({
     baseUrl: '',
-    apiKey: '',
+    internalApiToken: '',
     machineId: '',
     agentId: '',
     flushIntervalMs: 500,
@@ -34,7 +45,7 @@ test('validatePluginConfig reports missing required fields', () => {
   })
 
   assert.ok(errors.includes('baseUrl is required'))
-  assert.ok(errors.includes('apiKey is required'))
+  assert.ok(errors.includes('internalApiToken is required'))
   assert.ok(errors.includes('machineId is required'))
   assert.ok(errors.includes('agentId is required'))
 })
