@@ -8,9 +8,10 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+from app.account_identity import extract_account_identity
 from app.accounts import AccountProfile, list_profiles
 from app.codex_switch import CodexSwitchResult
-from app.main import _persist_current_auth_to_profile, auth_switch
+from app.main import _infer_account_type, _persist_current_auth_to_profile, auth_switch
 
 
 class _UsageState:
@@ -37,6 +38,64 @@ def _jwt(claims: dict) -> str:
 
 
 class AccountIdentityTrackingTests(unittest.TestCase):
+    def test_jwt_plan_type_plus_maps_to_chatgpt_plus(self) -> None:
+        auth = {
+            "tokens": {
+                "id_token": _jwt(
+                    {
+                        "sub": "auth0|plus-user",
+                        "https://api.openai.com/auth": {
+                            "chatgpt_plan_type": "plus",
+                        },
+                    }
+                )
+            }
+        }
+        identity = extract_account_identity(auth)
+        self.assertEqual(identity.plan_type, "plus")
+
+        profile = AccountProfile(
+            label="plus-user",
+            path=Path("/tmp/plus-user.json"),
+            auth=auth,
+            plan_type=identity.plan_type,
+        )
+        self.assertEqual(_infer_account_type(profile), "ChatGPT Plus")
+
+    def test_jwt_plan_type_team_maps_to_chatgpt_business(self) -> None:
+        auth = {
+            "tokens": {
+                "id_token": _jwt(
+                    {
+                        "sub": "auth0|team-user",
+                        "https://api.openai.com/auth": {
+                            "chatgpt_plan_type": "team",
+                        },
+                    }
+                )
+            }
+        }
+        identity = extract_account_identity(auth)
+        self.assertEqual(identity.plan_type, "team")
+
+        profile = AccountProfile(
+            label="team-user",
+            path=Path("/tmp/team-user.json"),
+            auth=auth,
+            plan_type=identity.plan_type,
+        )
+        self.assertEqual(_infer_account_type(profile), "ChatGPT Business")
+
+    def test_missing_plan_type_falls_back_to_heuristic(self) -> None:
+        profile = AccountProfile(
+            label="legacy-team",
+            path=Path("/tmp/legacy-team.json"),
+            auth={},
+            name="Systems Finance Team",
+            plan_type=None,
+        )
+        self.assertEqual(_infer_account_type(profile), "ChatGPT Business")
+
     def test_reauth_matches_profile_by_stable_subject(self) -> None:
         existing_profile = AccountProfile(
             label="james",

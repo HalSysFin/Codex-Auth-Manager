@@ -106,7 +106,7 @@ type StreamSnapshot = {
   pending_labels: string[]
 }
 
-type ViewMode = 'manager' | 'stats'
+type ViewMode = 'manager' | 'stats' | 'leases'
 type RangeKey = '1d' | '7d' | '30d' | '90d' | 'all'
 type AccountSortKey =
   | 'consumption_asc'
@@ -279,6 +279,109 @@ type UsageHistoryResponse = {
 type SessionStatus = {
   web_login_enabled: boolean
   session_valid: boolean
+}
+
+type LeaseOverviewResponse = {
+  connected_machines: Array<{
+    machine_id: string
+    agent_ids: string[]
+    active_lease_count: number
+    active_leases: Array<{
+      lease_id: string
+      state?: string | null
+      machine_id: string
+      agent_id: string
+      credential_id: string
+      credential_label?: string | null
+      credential_state?: string | null
+      latest_utilization_pct?: number | null
+      latest_quota_remaining?: number | null
+      issued_at?: string | null
+      expires_at?: string | null
+      updated_at?: string | null
+      reason?: string | null
+    }>
+  }>
+  active_leases: Array<{
+    lease_id: string
+    state?: string | null
+    machine_id: string
+    agent_id: string
+    credential_id: string
+    credential_label?: string | null
+    credential_state?: string | null
+    latest_utilization_pct?: number | null
+    latest_quota_remaining?: number | null
+    issued_at?: string | null
+    expires_at?: string | null
+    updated_at?: string | null
+    reason?: string | null
+  }>
+  credentials: Array<{
+    id: string
+    label?: string | null
+    state?: string | null
+    utilization_pct?: number | null
+    quota_remaining?: number | null
+    weekly_reset_at?: string | null
+    last_assigned_at?: string | null
+    last_telemetry_at?: string | null
+  }>
+  summary: {
+    machine_count: number
+    active_lease_count: number
+    credential_count: number
+  }
+}
+
+type MachineLeaseDetailResponse = {
+  machine_id: string
+  summary: {
+    lease_count: number
+    active_lease_count: number
+    agent_count: number
+    telemetry_points: number
+  }
+  leases: Array<{
+    lease_id: string
+    state?: string | null
+    machine_id?: string | null
+    agent_id?: string | null
+    credential_id?: string | null
+    issued_at?: string | null
+    expires_at?: string | null
+    updated_at?: string | null
+    reason?: string | null
+    latest_utilization_pct?: number | null
+    latest_quota_remaining?: number | null
+    telemetry_count?: number | null
+    telemetry: Array<{
+      captured_at?: string | null
+      status?: string | null
+      utilization_pct?: number | null
+      quota_remaining?: number | null
+      requests_count?: number | null
+      tokens_in?: number | null
+      tokens_out?: number | null
+      error_rate_1h?: number | null
+      last_error_at?: string | null
+      last_success_at?: string | null
+      lease_id?: string | null
+    }>
+  }>
+  telemetry: Array<{
+    lease_id?: string | null
+    captured_at?: string | null
+    status?: string | null
+    utilization_pct?: number | null
+    quota_remaining?: number | null
+    requests_count?: number | null
+    tokens_in?: number | null
+    tokens_out?: number | null
+    error_rate_1h?: number | null
+    last_error_at?: string | null
+    last_success_at?: string | null
+  }>
 }
 
 const defaultAggregate: Aggregate = {
@@ -557,6 +660,12 @@ function App() {
   const [accountChartMode, setAccountChartMode] = useState<'cumulative' | 'daily'>('cumulative')
   const [accountHistoryRange, setAccountHistoryRange] = useState<RangeKey>('30d')
   const [activeHistoryLabel, setActiveHistoryLabel] = useState<string | null>(null)
+  const [leaseOverview, setLeaseOverview] = useState<LeaseOverviewResponse | null>(null)
+  const [leaseLoading, setLeaseLoading] = useState(false)
+  const [machineDetailModalOpen, setMachineDetailModalOpen] = useState(false)
+  const [machineDetailLoading, setMachineDetailLoading] = useState(false)
+  const [machineDetailError, setMachineDetailError] = useState<string | null>(null)
+  const [machineDetail, setMachineDetail] = useState<MachineLeaseDetailResponse | null>(null)
   const streamRef = useRef<EventSource | null>(null)
   const currentLabelRef = useRef<string | null>(currentLabel)
   const hasActionApiKey = actionApiKey.trim().length > 0
@@ -730,6 +839,11 @@ function App() {
     setUsageHistory(data)
   }
 
+  const loadLeaseOverview = async (token: string) => {
+    const data = await requestJson<LeaseOverviewResponse>('/api/admin/leases/overview', token)
+    setLeaseOverview(data)
+  }
+
   const loadSessionStatus = async (): Promise<SessionStatus> => {
     const res = await fetch('/api/session/status', { credentials: 'include' })
     if (!res.ok) {
@@ -900,8 +1014,68 @@ function App() {
   const refreshNow = async () => {
     if (!apiKey.trim()) return
     setErr(null)
+    if (mode === 'leases') {
+      setLeaseLoading(true)
+      try {
+        await loadLeaseOverview(apiKey)
+        setStatus('Lease overview refreshed')
+      } finally {
+        setLeaseLoading(false)
+      }
+      return
+    }
     await loadCached(apiKey)
     startStream(apiKey)
+  }
+
+  const adminReleaseLease = async (leaseId: string) => {
+    if (!requireActionApiKey('lease release')) return
+    await requestJson(`/api/admin/leases/${encodeURIComponent(leaseId)}/release`, actionApiKey, {
+      method: 'POST',
+      body: JSON.stringify({ reason: 'admin_released_lease' }),
+    })
+    setStatus(`Released lease ${leaseId}`)
+    if (apiKey.trim()) await loadLeaseOverview(apiKey)
+  }
+
+  const adminRotateLease = async (leaseId: string) => {
+    if (!requireActionApiKey('lease rotation')) return
+    await requestJson(`/api/admin/leases/${encodeURIComponent(leaseId)}/rotate`, actionApiKey, {
+      method: 'POST',
+      body: JSON.stringify({ reason: 'admin_requested_rotation' }),
+    })
+    setStatus(`Rotated lease ${leaseId}`)
+    if (apiKey.trim()) await loadLeaseOverview(apiKey)
+  }
+
+  const adminMarkCredentialExhausted = async (credentialId: string) => {
+    if (!requireActionApiKey('mark exhausted')) return
+    if (!window.confirm(`Mark credential '${credentialId}' as exhausted?`)) return
+    await requestJson(`/api/admin/credentials/${encodeURIComponent(credentialId)}/mark-exhausted`, actionApiKey, {
+      method: 'POST',
+      body: JSON.stringify({ reason: 'admin_marked_exhausted' }),
+    })
+    setStatus(`Credential ${credentialId} marked exhausted`)
+    if (apiKey.trim()) await loadLeaseOverview(apiKey)
+  }
+
+  const openMachineDetail = async (machineId: string) => {
+    if (!apiKey.trim()) return
+    setMachineDetailModalOpen(true)
+    setMachineDetailLoading(true)
+    setMachineDetailError(null)
+    setMachineDetail(null)
+    try {
+      const data = await requestJson<MachineLeaseDetailResponse>(
+        `/api/admin/machines/${encodeURIComponent(machineId)}/detail?lease_limit=500&telemetry_limit_per_lease=40`,
+        apiKey,
+      )
+      setMachineDetail(data)
+    } catch (e) {
+      setMachineDetailError(e instanceof Error ? e.message : 'Failed to load machine details')
+    } finally {
+      setMachineDetailLoading(false)
+    }
   }
 
   const startAddAccount = async () => {
@@ -1211,6 +1385,16 @@ function App() {
     void loadUsageHistory(apiKey, selectedRange).catch(() => {})
   }, [selectedRange])
 
+  useEffect(() => {
+    if (!apiKey.trim()) return
+    if (mode !== 'leases') return
+    stopStream()
+    setLeaseLoading(true)
+    void loadLeaseOverview(apiKey)
+      .catch((e: unknown) => setErr(e instanceof Error ? e.message : 'Failed to load lease overview'))
+      .finally(() => setLeaseLoading(false))
+  }, [mode, apiKey])
+
   if (!apiKey.trim()) {
     return (
       <div className="page">
@@ -1258,9 +1442,21 @@ function App() {
           </button>
           {mode === 'manager' ? <button className="btn primary" onClick={() => void startAddAccount()} disabled={addAccountLoading}>+ Add Account</button> : null}
           {mode === 'manager' ? <button className="btn" onClick={openImportAuthModal} disabled={!hasActionApiKey}>Import Auth</button> : null}
-          <button className="btn" onClick={() => setMode((m) => (m === 'manager' ? 'stats' : 'manager'))}>
-            {mode === 'manager' ? 'Overall Stats' : 'Back to Manager'}
-          </button>
+          {mode !== 'stats' ? (
+            <button className="btn" onClick={() => setMode('stats')}>
+              Overall Stats
+            </button>
+          ) : null}
+          {mode !== 'leases' ? (
+            <button className="btn" onClick={() => setMode('leases')}>
+              Lease Mgmt
+            </button>
+          ) : null}
+          {mode !== 'manager' ? (
+            <button className="btn" onClick={() => setMode('manager')}>
+              Back to Manager
+            </button>
+          ) : null}
           <button className="btn" onClick={() => void refreshNow()} disabled={refreshing}>
             {refreshing ? (
               <span className="btn-with-spinner">
@@ -1426,7 +1622,7 @@ function App() {
             })}
           </section>
         </>
-      ) : (
+      ) : mode === 'stats' ? (
         <section className="aggregate panel">
           <div className="aggregate-header">
             <h2>Aggregated Usage Analytics</h2>
@@ -1603,6 +1799,183 @@ function App() {
             </div>
           </div>
         </section>
+      ) : (
+        <>
+          <section className="panel">
+            <div className="saved-head">
+              <h3>Lease Management</h3>
+              <span className="pill">
+                {leaseOverview?.summary.active_lease_count ?? 0} active lease{(leaseOverview?.summary.active_lease_count ?? 0) === 1 ? '' : 's'}
+              </span>
+            </div>
+            <div className="cards">
+              <div>
+                <label>Connected Machines</label>
+                <strong>{leaseOverview?.summary.machine_count ?? 0}</strong>
+              </div>
+              <div>
+                <label>Active Leases</label>
+                <strong>{leaseOverview?.summary.active_lease_count ?? 0}</strong>
+              </div>
+              <div>
+                <label>Credentials</label>
+                <strong>{leaseOverview?.summary.credential_count ?? 0}</strong>
+              </div>
+              <div>
+                <label>Admin Actions</label>
+                <div className="muted">{hasActionApiKey ? 'Enabled' : 'Read-only (set API key)'}</div>
+              </div>
+            </div>
+          </section>
+
+          <section className="panel">
+            <div className="saved-head">
+              <h3>Connected Machines</h3>
+              <span className="pill">{leaseOverview?.connected_machines?.length ?? 0}</span>
+            </div>
+            <div className="table-head">
+              <span>Machine</span>
+              <span>Agents</span>
+              <span>Status</span>
+              <span>Actions</span>
+            </div>
+            {leaseLoading ? <div className="muted">Loading lease overview...</div> : null}
+            {!leaseLoading && !(leaseOverview?.connected_machines?.length) ? (
+              <div className="empty">No connected machines yet.</div>
+            ) : null}
+            {(leaseOverview?.connected_machines || []).map((machine) => (
+              <div className="row" key={machine.machine_id}>
+                <div>
+                  <div className="profile-title">
+                    <span className="mono">{sensitiveText(machine.machine_id)}</span>
+                  </div>
+                </div>
+                <div>
+                  <div className="muted mono">
+                    {machine.agent_ids.length ? machine.agent_ids.map((id) => sensitiveText(id)).join(', ') : '--'}
+                  </div>
+                </div>
+                <div className="muted">
+                  {machine.active_lease_count} active lease{machine.active_lease_count === 1 ? '' : 's'}
+                  <div className="muted mono">
+                    latest: {fmtTs(machine.active_leases?.[0]?.updated_at || null)}
+                  </div>
+                </div>
+                <div className="actions-col">
+                  <button className="btn btn-sm" onClick={() => void openMachineDetail(machine.machine_id)}>
+                    View Details
+                  </button>
+                </div>
+              </div>
+            ))}
+          </section>
+
+          <section className="panel">
+            <div className="saved-head">
+              <h3>Active Leases</h3>
+              <span className="pill">{leaseOverview?.active_leases?.length ?? 0}</span>
+            </div>
+            <div className="table-head">
+              <span>Lease</span>
+              <span>Credential</span>
+              <span>Timing</span>
+              <span>Actions</span>
+            </div>
+            {leaseLoading ? <div className="muted">Loading active leases...</div> : null}
+            {!leaseLoading && !(leaseOverview?.active_leases?.length) ? (
+              <div className="empty">No active leases.</div>
+            ) : null}
+            {(leaseOverview?.active_leases || []).map((lease) => (
+              <div className="row" key={lease.lease_id}>
+                <div>
+                  <div className="profile-title">
+                    <span className="mono">{sensitiveText(lease.lease_id)}</span>
+                    <span className="pill">{lease.state || 'active'}</span>
+                  </div>
+                  <div className="muted mono">
+                    {sensitiveText(lease.machine_id)} / {sensitiveText(lease.agent_id)}
+                  </div>
+                </div>
+                <div>
+                  <div className="muted">{sensitiveText(lease.credential_label || lease.credential_id)}</div>
+                  <div className="muted mono">state: {lease.credential_state || '--'}</div>
+                  <div className="muted mono">
+                    util: {lease.latest_utilization_pct == null ? '--' : `${Math.round(Number(lease.latest_utilization_pct))}%`} · remaining: {lease.latest_quota_remaining == null ? '--' : lease.latest_quota_remaining}
+                  </div>
+                </div>
+                <div>
+                  <div className="muted mono">issued: {fmtTs(lease.issued_at || null)}</div>
+                  <div className="muted mono">expires: {fmtTs(lease.expires_at || null)}</div>
+                  <div className="muted mono">updated: {fmtTs(lease.updated_at || null)}</div>
+                </div>
+                <div className="actions-col">
+                  <div className="top-actions">
+                    <button
+                      className="btn btn-sm"
+                      onClick={() => void adminRotateLease(lease.lease_id)}
+                      disabled={!hasActionApiKey}
+                    >
+                      Rotate
+                    </button>
+                    <button
+                      className="btn btn-sm danger"
+                      onClick={() => void adminReleaseLease(lease.lease_id)}
+                      disabled={!hasActionApiKey}
+                    >
+                      Release
+                    </button>
+                  </div>
+                </div>
+              </div>
+            ))}
+          </section>
+
+          <section className="panel">
+            <div className="saved-head">
+              <h3>Lease Credentials</h3>
+              <span className="pill">{leaseOverview?.credentials?.length ?? 0}</span>
+            </div>
+            <div className="table-head">
+              <span>Credential</span>
+              <span>State</span>
+              <span>Usage / Reset</span>
+              <span>Actions</span>
+            </div>
+            {leaseLoading ? <div className="muted">Loading credentials...</div> : null}
+            {!leaseLoading && !(leaseOverview?.credentials?.length) ? (
+              <div className="empty">No credentials available.</div>
+            ) : null}
+            {(leaseOverview?.credentials || []).map((cred) => (
+              <div className="row" key={cred.id}>
+                <div>
+                  <div className="profile-title">
+                    <span>{sensitiveText(cred.label || cred.id)}</span>
+                  </div>
+                  <div className="muted mono">{sensitiveText(cred.id)}</div>
+                </div>
+                <div>
+                  <div className="muted mono">{cred.state || '--'}</div>
+                </div>
+                <div>
+                  <div className="muted mono">
+                    util: {cred.utilization_pct == null ? '--' : `${Math.round(Number(cred.utilization_pct))}%`} · remaining: {cred.quota_remaining == null ? '--' : cred.quota_remaining}
+                  </div>
+                  <div className="muted mono">weekly reset: {fmtTs(cred.weekly_reset_at || null)}</div>
+                  <div className="muted mono">telemetry: {fmtTs(cred.last_telemetry_at || null)}</div>
+                </div>
+                <div className="actions-col">
+                  <button
+                    className="btn btn-sm danger"
+                    onClick={() => void adminMarkCredentialExhausted(cred.id)}
+                    disabled={!hasActionApiKey}
+                  >
+                    Mark Exhausted
+                  </button>
+                </div>
+              </div>
+            ))}
+          </section>
+        </>
       )}
 
       {historyModalOpen ? (
@@ -1966,6 +2339,80 @@ function App() {
               </button>
               <button className="btn" onClick={() => setImportAuthModalOpen(false)}>Cancel</button>
             </div>
+          </div>
+        </div>
+      ) : null}
+
+      {machineDetailModalOpen ? (
+        <div className="modal-overlay" onClick={() => setMachineDetailModalOpen(false)}>
+          <div className="modal-card" onClick={(e) => e.stopPropagation()}>
+            <div className="modal-head">
+              <h3>Machine Details</h3>
+              <button className="btn btn-sm" onClick={() => setMachineDetailModalOpen(false)}>Close</button>
+            </div>
+            {machineDetailLoading ? <div className="muted">Loading machine telemetry...</div> : null}
+            {machineDetailError ? <div className="error">{machineDetailError}</div> : null}
+            {machineDetail ? (
+              <div>
+                <div className="muted">
+                  <strong className="mono">{sensitiveText(machineDetail.machine_id)}</strong>
+                </div>
+                <div className="cards analytics-cards" style={{ marginTop: 10 }}>
+                  <div><label>Leases</label><strong>{machineDetail.summary.lease_count}</strong></div>
+                  <div><label>Active</label><strong>{machineDetail.summary.active_lease_count}</strong></div>
+                  <div><label>Agents</label><strong>{machineDetail.summary.agent_count}</strong></div>
+                  <div><label>Telemetry Points</label><strong>{machineDetail.summary.telemetry_points}</strong></div>
+                </div>
+
+                <div className="history-table" style={{ marginTop: 14 }}>
+                  <div className="history-head history-row-7">
+                    <span>Lease</span>
+                    <span>Agent</span>
+                    <span>Credential</span>
+                    <span>Issued</span>
+                    <span>Expires</span>
+                    <span>State</span>
+                    <span>Telemetry</span>
+                  </div>
+                  {machineDetail.leases.length ? machineDetail.leases.map((lease) => (
+                    <div className="history-row history-row-7" key={lease.lease_id}>
+                      <span className="mono">{sensitiveText(lease.lease_id)}</span>
+                      <span className="mono">{sensitiveText(lease.agent_id || '--')}</span>
+                      <span className="mono">{sensitiveText(lease.credential_id || '--')}</span>
+                      <span>{fmtTs(lease.issued_at || null)}</span>
+                      <span>{fmtTs(lease.expires_at || null)}</span>
+                      <span>{lease.state || '--'}</span>
+                      <span className="mono">{lease.telemetry_count ?? lease.telemetry?.length ?? 0}</span>
+                    </div>
+                  )) : <div className="muted" style={{ padding: 12 }}>No lease history for this machine.</div>}
+                </div>
+
+                <div className="history-table" style={{ marginTop: 14 }}>
+                  <div className="history-head history-row-7">
+                    <span>Captured</span>
+                    <span>Lease</span>
+                    <span>Status</span>
+                    <span>Util%</span>
+                    <span>Quota</span>
+                    <span>Req Count</span>
+                    <span>Tokens In/Out</span>
+                  </div>
+                  {machineDetail.telemetry.length ? machineDetail.telemetry.slice(-200).reverse().map((row, idx) => (
+                    <div className="history-row history-row-7" key={`${row.lease_id || 'lease'}-${row.captured_at || idx}-${idx}`}>
+                      <span>{fmtTs(row.captured_at || null)}</span>
+                      <span className="mono">{sensitiveText(row.lease_id || '--')}</span>
+                      <span>{row.status || '--'}</span>
+                      <span className="mono">{row.utilization_pct == null ? '--' : `${Math.round(Number(row.utilization_pct))}%`}</span>
+                      <span className="mono">{row.quota_remaining == null ? '--' : row.quota_remaining}</span>
+                      <span className="mono">{row.requests_count == null ? '--' : row.requests_count}</span>
+                      <span className="mono">
+                        {row.tokens_in == null ? '--' : row.tokens_in} / {row.tokens_out == null ? '--' : row.tokens_out}
+                      </span>
+                    </div>
+                  )) : <div className="muted" style={{ padding: 12 }}>No telemetry received yet for this machine.</div>}
+                </div>
+              </div>
+            ) : null}
           </div>
         </div>
       ) : null}

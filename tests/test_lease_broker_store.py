@@ -428,6 +428,48 @@ class LeaseBrokerStoreTests(unittest.TestCase):
         self.assertEqual(result["status"], "denied")
         self.assertEqual(result["reason"], "lease_not_found_or_not_owned")
 
+    def test_acquire_reuses_existing_active_lease_for_same_machine(self) -> None:
+        self._sync_credential("cred-a", health_score=95.0)
+        self._sync_credential("cred-b", health_score=99.0)
+
+        first = acquire_broker_lease(machine_id="machine-1", agent_id="agent-a", db_path=self.db_path)
+        second = acquire_broker_lease(machine_id="machine-1", agent_id="agent-b", db_path=self.db_path)
+
+        self.assertEqual(first["status"], "ok")
+        self.assertEqual(second["status"], "ok")
+        self.assertEqual(second["reason"], "existing_machine_lease_reused")
+        self.assertEqual(first["lease"]["id"], second["lease"]["id"])
+        self.assertEqual(first["lease"]["credential_id"], second["lease"]["credential_id"])
+
+    def test_acquire_issues_new_lease_after_existing_machine_lease_revoked(self) -> None:
+        self._sync_credential("cred-a", health_score=95.0)
+        self._sync_credential("cred-b", health_score=90.0)
+        first = acquire_broker_lease(machine_id="machine-1", agent_id="agent-a", db_path=self.db_path)
+        first_lease = first["lease"]
+
+        record_broker_lease_telemetry(
+            lease_id=first_lease["id"],
+            machine_id="machine-1",
+            agent_id="agent-a",
+            captured_at="2026-03-22T13:00:00+00:00",
+            requests_count=5,
+            tokens_in=100,
+            tokens_out=50,
+            utilization_pct=100.0,
+            quota_remaining=0,
+            rate_limit_remaining=0,
+            status="ok",
+            last_success_at="2026-03-22T13:00:00+00:00",
+            last_error_at=None,
+            error_rate_1h=0.0,
+            db_path=self.db_path,
+        )
+
+        second = acquire_broker_lease(machine_id="machine-1", agent_id="agent-b", db_path=self.db_path)
+        self.assertEqual(second["status"], "ok")
+        self.assertNotEqual(first_lease["id"], second["lease"]["id"])
+        self.assertNotEqual(first_lease["credential_id"], second["lease"]["credential_id"])
+
 
 if __name__ == "__main__":
     unittest.main()

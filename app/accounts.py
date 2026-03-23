@@ -20,6 +20,7 @@ class AccountProfile:
     user_id: str | None = None
     provider_account_id: str | None = None
     name: str | None = None
+    plan_type: str | None = None
     access_token: str | None = None
     email: str | None = None
     rate_limit_window_type: str | None = None
@@ -66,6 +67,7 @@ def list_profiles() -> list[AccountProfile]:
                     else identity.account_id
                 ),
                 name=str(row.get("name")) if row.get("name") is not None else identity.name,
+                plan_type=identity.plan_type,
                 access_token=access_token,
                 email=str(row.get("email")) if row.get("email") is not None else identity.email,
             )

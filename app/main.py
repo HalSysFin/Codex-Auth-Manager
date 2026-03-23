@@ -58,9 +58,12 @@ from .account_usage_store import (
 from .lease_broker_store import (
     ROTATION_REASONS,
     acquire_broker_lease,
+    get_broker_lease,
     get_broker_lease_status,
     initialize_lease_broker_store,
     is_credential_assignable,
+    list_broker_lease_telemetry,
+    list_broker_leases,
     list_active_broker_leases_by_credential,
     list_broker_credentials,
     mark_broker_credential_exhausted,
@@ -1385,6 +1388,196 @@ async def api_admin_mark_credential_exhausted(
         reason=str((payload or {}).get("reason") or "admin_marked_exhausted"),
     )
     return JSONResponse({"status": "ok", "credential": result})
+
+
+@app.get("/api/admin/leases/overview")
+async def api_admin_leases_overview(request: Request) -> JSONResponse:
+    _require_internal_auth(request)
+    _sync_broker_credentials_from_profiles()
+    credentials = list_broker_credentials()
+    active_leases = list_broker_leases(active_only=True)
+    credential_by_id = {str(c.get("id") or ""): c for c in credentials}
+
+    machines: dict[str, dict[str, Any]] = {}
+    lease_payloads: list[dict[str, Any]] = []
+    for lease in active_leases:
+        machine_id = str(lease.get("machine_id") or "").strip() or "unknown"
+        agent_id = str(lease.get("agent_id") or "").strip() or "unknown"
+        credential_id = str(lease.get("credential_id") or "").strip()
+        cred = credential_by_id.get(credential_id) or {}
+        item = {
+            "lease_id": lease.get("id"),
+            "state": lease.get("state"),
+            "machine_id": machine_id,
+            "agent_id": agent_id,
+            "credential_id": credential_id,
+            "credential_label": cred.get("label") or credential_id,
+            "credential_state": cred.get("state"),
+            "latest_utilization_pct": lease.get("latest_utilization_pct"),
+            "latest_quota_remaining": lease.get("latest_quota_remaining"),
+            "issued_at": lease.get("issued_at"),
+            "expires_at": lease.get("expires_at"),
+            "updated_at": lease.get("updated_at"),
+            "reason": lease.get("reason"),
+        }
+        lease_payloads.append(item)
+        machine = machines.setdefault(
+            machine_id,
+            {"machine_id": machine_id, "agent_ids": set(), "active_leases": []},
+        )
+        machine["agent_ids"].add(agent_id)
+        machine["active_leases"].append(item)
+
+    machine_list = []
+    for machine in machines.values():
+        active = machine["active_leases"]
+        active.sort(key=lambda row: str(row.get("updated_at") or ""), reverse=True)
+        machine_list.append(
+            {
+                "machine_id": machine["machine_id"],
+                "agent_ids": sorted(machine["agent_ids"]),
+                "active_lease_count": len(active),
+                "active_leases": active,
+            }
+        )
+    machine_list.sort(key=lambda row: row["active_lease_count"], reverse=True)
+
+    return JSONResponse(
+        {
+            "connected_machines": machine_list,
+            "active_leases": lease_payloads,
+            "credentials": credentials,
+            "summary": {
+                "machine_count": len(machine_list),
+                "active_lease_count": len(lease_payloads),
+                "credential_count": len(credentials),
+            },
+        }
+    )
+
+
+@app.post("/api/admin/leases/{lease_id}/release")
+async def api_admin_release_lease(
+    request: Request,
+    lease_id: str,
+    payload: dict[str, Any] | None = None,
+) -> JSONResponse:
+    _require_internal_auth(request)
+    lease = get_broker_lease(lease_id)
+    if lease is None:
+        raise HTTPException(status_code=404, detail="Lease not found")
+    result = release_broker_lease(
+        lease_id=lease_id,
+        machine_id=str(lease.get("machine_id") or ""),
+        agent_id=str(lease.get("agent_id") or ""),
+        reason=str((payload or {}).get("reason") or "admin_released_lease"),
+    )
+    status_code = 200 if result.get("status") == "ok" else 409
+    _audit_broker_event(
+        "admin_lease_released" if status_code == 200 else "admin_lease_release_denied",
+        lease_id=lease_id,
+        credential_id=str((lease or {}).get("credential_id") or ""),
+        decision=result.get("status"),
+        reason=result.get("reason") or str((payload or {}).get("reason") or "admin_released_lease"),
+    )
+    return JSONResponse(result, status_code=status_code)
+
+
+@app.post("/api/admin/leases/{lease_id}/rotate")
+async def api_admin_rotate_lease(
+    request: Request,
+    lease_id: str,
+    payload: dict[str, Any] | None = None,
+) -> JSONResponse:
+    _require_internal_auth(request)
+    lease = get_broker_lease(lease_id)
+    if lease is None:
+        raise HTTPException(status_code=404, detail="Lease not found")
+    _sync_broker_credentials_from_profiles()
+    reason = str((payload or {}).get("reason") or "admin_requested_rotation")
+    if reason not in ROTATION_REASONS:
+        reason = "admin_requested_rotation"
+    result = rotate_broker_lease(
+        lease_id=lease_id,
+        machine_id=str(lease.get("machine_id") or ""),
+        agent_id=str(lease.get("agent_id") or ""),
+        reason=reason,
+    )
+    status_code = 200 if result.get("status") == "ok" else 409
+    _audit_broker_event(
+        "admin_rotation_approved" if status_code == 200 else "admin_rotation_denied",
+        lease_id=lease_id,
+        credential_id=str((lease or {}).get("credential_id") or ""),
+        decision=result.get("status"),
+        reason=result.get("reason") or reason,
+    )
+    return JSONResponse(result, status_code=status_code)
+
+
+@app.get("/api/admin/machines/{machine_id}/detail")
+async def api_admin_machine_detail(
+    request: Request,
+    machine_id: str,
+    lease_limit: int = 200,
+    telemetry_limit_per_lease: int = 30,
+) -> JSONResponse:
+    _require_internal_auth(request)
+    _sync_broker_credentials_from_profiles()
+    normalized_machine_id = machine_id.strip()
+    if not normalized_machine_id:
+        raise HTTPException(status_code=400, detail="machine_id is required")
+    capped_lease_limit = max(1, min(int(lease_limit), 1000))
+    capped_telemetry_limit = max(1, min(int(telemetry_limit_per_lease), 500))
+
+    all_leases = list_broker_leases(active_only=False, limit=capped_lease_limit)
+    machine_leases = [row for row in all_leases if str(row.get("machine_id") or "") == normalized_machine_id]
+    machine_leases.sort(key=lambda row: str(row.get("updated_at") or ""), reverse=True)
+
+    leases_payload: list[dict[str, Any]] = []
+    all_telemetry: list[dict[str, Any]] = []
+    for lease in machine_leases:
+        lease_id = str(lease.get("id") or "")
+        telemetry_rows = list_broker_lease_telemetry(lease_id)
+        if capped_telemetry_limit and len(telemetry_rows) > capped_telemetry_limit:
+            telemetry_rows = telemetry_rows[-capped_telemetry_limit:]
+        telemetry_rows.sort(key=lambda row: str(row.get("captured_at") or ""))
+        lease_payload = {
+            "lease_id": lease_id,
+            "state": lease.get("state"),
+            "machine_id": lease.get("machine_id"),
+            "agent_id": lease.get("agent_id"),
+            "credential_id": lease.get("credential_id"),
+            "issued_at": lease.get("issued_at"),
+            "expires_at": lease.get("expires_at"),
+            "updated_at": lease.get("updated_at"),
+            "reason": lease.get("reason"),
+            "latest_utilization_pct": lease.get("latest_utilization_pct"),
+            "latest_quota_remaining": lease.get("latest_quota_remaining"),
+            "telemetry_count": len(telemetry_rows),
+            "telemetry": telemetry_rows,
+        }
+        leases_payload.append(lease_payload)
+        for row in telemetry_rows:
+            merged = dict(row)
+            merged["lease_id"] = lease_id
+            all_telemetry.append(merged)
+
+    all_telemetry.sort(key=lambda row: str(row.get("captured_at") or ""))
+    return JSONResponse(
+        {
+            "machine_id": normalized_machine_id,
+            "summary": {
+                "lease_count": len(leases_payload),
+                "active_lease_count": len(
+                    [row for row in leases_payload if str(row.get("state") or "") in {"active", "rotation_required"}]
+                ),
+                "agent_count": len({str(row.get("agent_id") or "") for row in leases_payload if row.get("agent_id")}),
+                "telemetry_points": len(all_telemetry),
+            },
+            "leases": leases_payload,
+            "telemetry": all_telemetry,
+        }
+    )
 
 
 @app.get("/api/accounts/stream")

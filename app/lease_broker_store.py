@@ -356,6 +356,7 @@ def list_active_broker_leases_by_credential(
     with _connect(db_path) as conn:
         _ensure_schema(conn)
         _ensure_lease_broker_schema(conn)
+        _reconcile_expired_active_leases(conn)
         rows = conn.execute(
             f"""
             SELECT *
@@ -374,6 +375,38 @@ def list_active_broker_leases_by_credential(
         return out
 
 
+def list_broker_leases(
+    *,
+    active_only: bool = False,
+    limit: int | None = None,
+    db_path: Path | None = None,
+) -> list[dict[str, Any]]:
+    with _connect(db_path) as conn:
+        _ensure_schema(conn)
+        _ensure_lease_broker_schema(conn)
+        _reconcile_expired_active_leases(conn)
+        where_sql = ""
+        params: list[Any] = []
+        if active_only:
+            where_sql = f"WHERE state IN ({','.join('?' for _ in ACTIVE_LEASE_STATES)})"
+            params.extend(sorted(ACTIVE_LEASE_STATES))
+        limit_sql = ""
+        if isinstance(limit, int) and limit > 0:
+            limit_sql = " LIMIT ?"
+            params.append(int(limit))
+        rows = conn.execute(
+            f"""
+            SELECT *
+            FROM broker_leases
+            {where_sql}
+            ORDER BY updated_at DESC, issued_at DESC, id DESC
+            {limit_sql}
+            """,
+            tuple(params),
+        ).fetchall()
+        return [_decode_lease_row(dict(row)) for row in rows]
+
+
 def get_broker_credential(
     credential_id: str,
     *,
@@ -387,6 +420,21 @@ def get_broker_credential(
             (credential_id,),
         ).fetchone()
         return _decode_credential_row(dict(row)) if row else None
+
+
+def _reconcile_expired_active_leases(conn: Any, *, now: datetime | None = None) -> None:
+    now_dt = _as_utc(now)
+    rows = conn.execute(
+        f"""
+        SELECT *
+        FROM broker_leases
+        WHERE state IN ({','.join('?' for _ in ACTIVE_LEASE_STATES)})
+        ORDER BY updated_at DESC, issued_at DESC, id DESC
+        """,
+        tuple(sorted(ACTIVE_LEASE_STATES)),
+    ).fetchall()
+    for row in rows:
+        _expire_lease_if_needed(conn, dict(row), now_dt)
 
 
 def acquire_broker_lease(
@@ -405,6 +453,16 @@ def acquire_broker_lease(
         _ensure_schema(conn)
         _ensure_lease_broker_schema(conn)
         conn.execute("BEGIN IMMEDIATE")
+
+        existing_machine_lease = _select_existing_machine_lease(
+            conn,
+            machine_id=machine_id,
+            now_dt=now_dt,
+        )
+        if existing_machine_lease is not None:
+            lease = _decode_lease_row(existing_machine_lease)
+            return {"status": "ok", "reason": "existing_machine_lease_reused", "lease": lease}
+
         credential = _select_best_eligible_credential(conn, now_dt=now_dt)
         if credential is None:
             return {
@@ -451,6 +509,39 @@ def acquire_broker_lease(
             dict(conn.execute("SELECT * FROM broker_leases WHERE id = ?", (lease_id,)).fetchone())
         )
         return {"status": "ok", "reason": None, "lease": lease}
+
+
+def _select_existing_machine_lease(
+    conn: Any,
+    *,
+    machine_id: str,
+    now_dt: datetime,
+) -> dict[str, Any] | None:
+    rows = conn.execute(
+        f"""
+        SELECT * FROM broker_leases
+        WHERE machine_id = ?
+          AND state IN ({','.join('?' for _ in ACTIVE_LEASE_STATES)})
+        ORDER BY updated_at DESC, issued_at DESC, id DESC
+        """,
+        (machine_id, *ACTIVE_LEASE_STATES),
+    ).fetchall()
+    for row in rows:
+        lease = dict(row)
+        _expire_lease_if_needed(conn, lease, now_dt)
+        refreshed = conn.execute(
+            "SELECT * FROM broker_leases WHERE id = ?",
+            (lease["id"],),
+        ).fetchone()
+        if refreshed is None:
+            continue
+        lease = dict(refreshed)
+        if lease.get("state") not in ACTIVE_LEASE_STATES:
+            continue
+        credential = _credential_for_lease(conn, lease)
+        if _credential_is_usable_for_existing_lease(credential, now_dt=now_dt):
+            return lease
+    return None
 
 
 def renew_broker_lease(

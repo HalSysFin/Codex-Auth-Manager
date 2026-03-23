@@ -33,6 +33,7 @@ class AccountIdentity:
     account_id: str | None
     email: str | None
     name: str | None
+    plan_type: str | None
 
 
 def extract_account_identity(auth_json: dict[str, Any]) -> AccountIdentity:
@@ -55,6 +56,10 @@ def extract_account_identity(auth_json: dict[str, Any]) -> AccountIdentity:
         _auth_claim_text(id_claims, "chatgpt_account_id"),
         _auth_claim_text(access_claims, "chatgpt_account_id"),
         _find_first_key(auth_json, ["accountId", "account_id"]),
+    )
+    plan_type = _first_non_empty(
+        _auth_claim_text(id_claims, "chatgpt_plan_type"),
+        _auth_claim_text(access_claims, "chatgpt_plan_type"),
     )
 
     email = extract_email(auth_json)
@@ -81,6 +86,7 @@ def extract_account_identity(auth_json: dict[str, Any]) -> AccountIdentity:
         account_id=account_id,
         email=email_norm,
         name=name,
+        plan_type=plan_type.lower() if isinstance(plan_type, str) else None,
     )
 
 

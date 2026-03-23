@@ -95,7 +95,12 @@ Use `internalApiToken` in plugin code/config and `AUTH_MANAGER_INTERNAL_API_TOKE
 
 ## Plugin-Ready Entry Surface
 
-This repo does not contain the real OpenClaw runtime, but the package now includes the pieces needed to copy into OpenClaw as a real plugin:
+This repo now includes both:
+
+- this reusable telemetry package
+- a working runtime integration prototype wired into a real OpenClaw clone at `/tmp/openclaw`
+
+The package still contains the pieces needed to copy into OpenClaw as a real plugin:
 
 - `src/openclaw-entry.ts`
   plugin-entry style module export
@@ -107,14 +112,33 @@ This repo does not contain the real OpenClaw runtime, but the package now includ
 The intended integration path inside OpenClaw is:
 
 1. load plugin config
-2. start the service
-3. set/update lease context
-4. call `observeUsage(...)` from OpenClaw's existing `recordAssistantUsage(...)` path
-5. flush on timer and shutdown
+2. start the Auth Manager lease service
+3. acquire or refresh a lease, then materialize auth to `~/.codex/auth.json`
+4. set/update lease context from the active lease
+5. call `observeUsage(...)` from OpenClaw's existing assistant-usage path
+6. flush on timer and shutdown
 
 ## Suggested integration points
 
 Wire the plugin into the place where OpenClaw already sees model response usage.
+
+The working prototype uses these exact OpenClaw files:
+
+- `/tmp/openclaw/src/agents/pi-embedded-subscribe.handlers.messages.ts`
+  `handleMessageEnd(...)` forwards assistant `usage` after each real response
+- `/tmp/openclaw/src/agents/assistant-usage-observers.ts`
+  tiny runtime observer registry used by the lease service
+- `/tmp/openclaw/extensions/auth-manager-lease/src/service.ts`
+  lease lifecycle owner: acquire, renew, rotate, reacquire, materialize, persist, and telemetry flush
+
+Lease context is injected by the Auth Manager lease service itself after:
+
+- acquire
+- rotate
+- reacquire
+- lease refresh
+
+That keeps telemetry pinned to the active lease and clears pending counters when a lease ID changes.
 
 Typical flow:
 
@@ -123,13 +147,23 @@ Typical flow:
 3. on a timer or after each request batch, call `flushTelemetry()`
 4. when the lease rotates, update the lease context and keep going
 
+The working prototype flushes:
+
+- on a timer
+- when the per-request threshold is reached
+- during service shutdown
+
+After each telemetry flush it refreshes lease state so `revoked`, `expired`, and `replacement_required` are repaired quickly instead of continuing on a dead lease.
+
 ## Required OpenClaw-side hook
 
-For end users to install this as a real plugin, OpenClaw still needs one runtime integration in its own repo:
+The missing piece used to be the runtime hook. The prototype now proves that hook in a real OpenClaw clone.
 
-- call the service observer from the shared assistant usage path, ideally `recordAssistantUsage(...)`
+What still depends on the external OpenClaw project is shipping that extension in OpenClaw itself:
 
-That is the final piece that turns this package from plugin-ready into user-installable.
+- bundle `extensions/auth-manager-lease/`
+- keep the assistant usage observer hook in the embedded session path
+- expose plugin config through normal OpenClaw plugin installation/config flows
 
 ## Commands
 
@@ -142,5 +176,5 @@ npm run build
 
 ## Limitations
 
-- This repo does not contain the actual OpenClaw runtime, so the final hook point into OpenClaw still needs to be wired in that project.
+- The runtime wiring currently lives in the external OpenClaw clone, not in a published OpenClaw release yet.
 - The plugin intentionally does not invent usage values. If OpenClaw does not expose token counts, nothing should be sent except truthful status/utilization context.
