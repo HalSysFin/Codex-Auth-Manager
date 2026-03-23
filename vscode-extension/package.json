@@ -5,6 +5,10 @@
   "version": "1.12.0",
   "publisher": "halsysfin",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/HalSysFin/codex-auth-manager.git"
+  },
   "engines": {
     "vscode": "^1.90.0"
   },
@@ -25,6 +29,13 @@
     "onView:authManager.leaseView"
   ],
   "main": "./dist/vscode-extension/src/extension.js",
+  "files": [
+    "dist/**",
+    "media/**",
+    "package.json",
+    "README.md",
+    "LICENSE"
+  ],
   "contributes": {
     "commands": [
       {
