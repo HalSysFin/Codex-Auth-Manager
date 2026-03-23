@@ -355,6 +355,15 @@ function fmtNullableNumber(value: number | null | undefined, suffix = ''): strin
   return `${value}${suffix}`
 }
 
+function CodexBadge(): React.ReactElement {
+  return (
+    <span className="codex-badge" aria-label="Codex managed account" title="Codex managed account">
+      <span className="codex-badge-mark" aria-hidden="true" />
+      <span className="codex-badge-text">Codex</span>
+    </span>
+  )
+}
+
 function rangeLabel(range: RangeKey, meta?: { label?: string; window_label?: string }): string {
   if (range === '1d') return meta?.label || 'Today'
   return meta?.label || range
@@ -1199,7 +1208,12 @@ function App() {
                       </span>
                       {badge ? <span className="pill" style={badge.style}>{badge.text}</span> : null}
                     </div>
-                    <div className="muted">{a.email || 'email unavailable'} · <span className="mono">{a.account_type || 'ChatGPT Plus'}</span></div>
+                    <div className="muted account-meta-line">
+                      <span>{a.email || 'email unavailable'}</span>
+                      <span aria-hidden="true">·</span>
+                      <span className="mono">{a.account_type || 'ChatGPT Plus'}</span>
+                      <CodexBadge />
+                    </div>
                     <div className="muted mono">Profile label: {a.label}</div>
                     {a.active_lease ? (
                       <div className="muted mono">
@@ -1458,7 +1472,10 @@ function App() {
                       <>
                   <div>
                     <label>Account Type</label>
-                    <div className="unit-value"><strong>{historyData.account_type || 'ChatGPT Plus'}</strong></div>
+                    <div className="unit-value">
+                      <strong>{historyData.account_type || 'ChatGPT Plus'}</strong>
+                      <CodexBadge />
+                    </div>
                     <div className="muted small">Plan category</div>
                   </div>
                   <div>
