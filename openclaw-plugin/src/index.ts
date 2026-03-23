@@ -1,4 +1,7 @@
 export * from './client.js'
+export * from './config.js'
 export * from './plugin.js'
+export * from './service.js'
 export * from './types.js'
 export * from './usage.js'
+export * from './openclaw-entry.js'

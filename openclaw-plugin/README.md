@@ -1,6 +1,6 @@
 # OpenClaw Auth Manager Plugin
 
-This package is a small Linux-friendly TypeScript plugin/helper for wiring OpenClaw token usage into the existing Auth Manager lease broker.
+This package is a plugin-ready TypeScript module for wiring OpenClaw token usage into the existing Auth Manager lease broker.
 
 It is intended to complement:
 
@@ -16,6 +16,7 @@ It is intended to complement:
 - normalizes common usage payload shapes from OpenClaw/OpenAI-style responses
 - accumulates per-lease counters in process
 - posts truthful lease telemetry back to Auth Manager
+- includes a service wrapper and entry module that can be copied into the real OpenClaw plugin loader
 
 The telemetry goes to:
 
@@ -56,7 +57,7 @@ Direct counters:
 }
 ```
 
-## Example
+## Runtime Example
 
 ```ts
 import { createOpenClawAuthManagerPlugin } from './src/index.js'
@@ -84,6 +85,25 @@ plugin.observeUsage({
 await plugin.flushTelemetry()
 ```
 
+## Plugin-Ready Entry Surface
+
+This repo does not contain the real OpenClaw runtime, but the package now includes the pieces needed to copy into OpenClaw as a real plugin:
+
+- `src/openclaw-entry.ts`
+  plugin-entry style module export
+- `src/service.ts`
+  service wrapper with timer-based flushing
+- `src/config.ts`
+  plugin config/env resolution and validation
+
+The intended integration path inside OpenClaw is:
+
+1. load plugin config
+2. start the service
+3. set/update lease context
+4. call `observeUsage(...)` from OpenClaw's existing `recordAssistantUsage(...)` path
+5. flush on timer and shutdown
+
 ## Suggested integration points
 
 Wire the plugin into the place where OpenClaw already sees model response usage.
@@ -94,6 +114,14 @@ Typical flow:
 2. after each model response, call `observeUsage(responseLikeObject)`
 3. on a timer or after each request batch, call `flushTelemetry()`
 4. when the lease rotates, update the lease context and keep going
+
+## Required OpenClaw-side hook
+
+For end users to install this as a real plugin, OpenClaw still needs one runtime integration in its own repo:
+
+- call the service observer from the shared assistant usage path, ideally `recordAssistantUsage(...)`
+
+That is the final piece that turns this package from plugin-ready into user-installable.
 
 ## Commands
 

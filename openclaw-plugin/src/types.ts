@@ -60,3 +60,19 @@ export type AuthManagerPluginOptions = {
   fetchImpl?: typeof fetch
   logger?: Pick<Console, 'info' | 'warn' | 'error'>
 }
+
+export type AuthManagerLeasePluginConfig = {
+  baseUrl: string
+  apiKey: string
+  machineId: string
+  agentId: string
+  leaseId?: string
+  flushIntervalMs: number
+  flushEveryRequests: number
+  enabled: boolean
+}
+
+export type OpenClawLeaseTelemetryServiceOptions = AuthManagerPluginOptions & {
+  flushIntervalMs?: number
+  flushEveryRequests?: number
+}
