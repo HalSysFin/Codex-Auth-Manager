@@ -78,12 +78,42 @@ test('startup reacquires expired leases', () => {
   }), 'reacquire')
 })
 
+test('startup reacquires released leases', () => {
+  assert.equal(selectStartupAction({
+    leaseId: 'lease-1',
+    leaseStatus: buildLeaseStatus({ state: 'released' }),
+    autoRotate: true,
+    autoRenew: true,
+  }), 'reacquire')
+})
+
 test('startup rotates when replacement is required', () => {
   assert.equal(selectStartupAction({
     leaseId: 'lease-1',
     leaseStatus: buildLeaseStatus({ replacement_required: true }),
     autoRotate: true,
     autoRenew: true,
+  }), 'rotate')
+})
+
+test('startup does not auto-rotate on recommendation alone', () => {
+  assert.equal(selectStartupAction({
+    leaseId: 'lease-1',
+    leaseStatus: buildLeaseStatus({ rotation_recommended: true, replacement_required: false }),
+    autoRotate: true,
+    autoRenew: true,
+    now: new Date('2026-03-23T00:00:00.000Z'),
+  }), 'noop')
+})
+
+test('startup can rotate on recommendation when policy allows it', () => {
+  assert.equal(selectStartupAction({
+    leaseId: 'lease-1',
+    leaseStatus: buildLeaseStatus({ rotation_recommended: true, replacement_required: false }),
+    autoRotate: true,
+    rotationPolicy: 'recommended_or_required',
+    autoRenew: true,
+    now: new Date('2026-03-23T00:00:00.000Z'),
   }), 'rotate')
 })
 
@@ -113,6 +143,12 @@ test('health state reports expiring for near-expiry active leases', () => {
   assert.equal(deriveLeaseHealthState(buildLeaseStatus({
     expires_at: '2026-03-23T00:04:00.000Z',
   }), new Date('2026-03-23T00:00:00.000Z')), 'expiring')
+})
+
+test('health state reports revoked for released leases', () => {
+  assert.equal(deriveLeaseHealthState(buildLeaseStatus({
+    state: 'released',
+  }), new Date('2026-03-23T00:00:00.000Z')), 'revoked')
 })
 
 test('shared startup parity cases stay aligned', () => {

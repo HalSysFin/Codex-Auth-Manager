@@ -79,6 +79,7 @@ If your backend does not yet support `POST /api/leases/{lease_id}/materialize`, 
 - `authManager.telemetryIntervalSeconds`
 - `authManager.autoRenew`
 - `authManager.autoRotate`
+- `authManager.rotationPolicy` (`replacement_required_only` or `recommended_or_required`)
 - `authManager.openDashboardPath`
 - `authManager.allowInsecureLocalhost`
 

@@ -3,7 +3,7 @@ import assert from 'node:assert/strict'
 import * as fs from 'node:fs/promises'
 import * as path from 'node:path'
 import { expandHomePath, validateAuthPayload } from '../authFile'
-import { writeAuthFile } from '../authFile'
+import { deleteAuthFile, writeAuthFile } from '../authFile'
 import { prepareAuthPayloadForWrite } from '../../../packages/lease-runtime/src/authPayload.js'
 
 test('expandHomePath expands leading tilde', () => {
@@ -84,6 +84,27 @@ test('writeAuthFile creates parent directories and rewrites auth contents', asyn
     assert.equal(first.path, authPath)
     assert.equal(second.path, authPath)
     assert.equal(content.tokens.account_id, 'acct-2')
+  } finally {
+    await fs.rm(tempRoot, { recursive: true, force: true })
+  }
+})
+
+test('deleteAuthFile removes auth.json and is idempotent', async () => {
+  const tempRoot = await fs.mkdtemp(path.join(process.cwd(), 'tmp-vscode-auth-delete-'))
+  const authPath = path.join(tempRoot, 'nested', 'auth.json')
+  try {
+    await writeAuthFile(authPath, {
+      auth_mode: 'chatgpt',
+      OPENAI_API_KEY: null,
+      tokens: {
+        id_token: 'id-1',
+        access_token: 'access-1',
+        refresh_token: 'refresh-1',
+        account_id: 'acct-1',
+      },
+    })
+    assert.equal(await deleteAuthFile(authPath), true)
+    assert.equal(await deleteAuthFile(authPath), false)
   } finally {
     await fs.rm(tempRoot, { recursive: true, force: true })
   }

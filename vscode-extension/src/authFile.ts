@@ -54,3 +54,16 @@ export async function writeAuthFile(authFilePath: string, payload: AuthPayload):
   await fs.rename(tempPath, fullPath)
   return { path: fullPath, writtenAt }
 }
+
+export async function deleteAuthFile(authFilePath: string): Promise<boolean> {
+  const fullPath = expandHomePath(authFilePath)
+  try {
+    await fs.unlink(fullPath)
+    return true
+  } catch (error: any) {
+    if (error?.code === 'ENOENT') {
+      return false
+    }
+    throw error
+  }
+}

@@ -122,6 +122,7 @@ export interface RuntimeSettings {
   telemetryIntervalSeconds: number
   autoRenew: boolean
   autoRotate: boolean
+  rotationPolicy?: 'replacement_required_only' | 'recommended_or_required'
   openDashboardPath: string
   allowInsecureLocalhost: boolean
 }

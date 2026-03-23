@@ -298,9 +298,13 @@ type LeaseOverviewResponse = {
       latest_quota_remaining?: number | null
       issued_at?: string | null
       expires_at?: string | null
+      last_seen_at?: string | null
+      seconds_since_seen?: number | null
+      is_stale?: boolean
       updated_at?: string | null
       reason?: string | null
     }>
+    is_stale?: boolean
   }>
   active_leases: Array<{
     lease_id: string
@@ -314,6 +318,9 @@ type LeaseOverviewResponse = {
     latest_quota_remaining?: number | null
     issued_at?: string | null
     expires_at?: string | null
+    last_seen_at?: string | null
+    seconds_since_seen?: number | null
+    is_stale?: boolean
     updated_at?: string | null
     reason?: string | null
   }>
@@ -523,6 +530,18 @@ function rangeLabel(range: RangeKey, meta?: { label?: string; window_label?: str
   return meta?.label || range
 }
 
+function fmtDurationSeconds(seconds?: number | null): string {
+  if (typeof seconds !== 'number' || !Number.isFinite(seconds)) return '--'
+  if (seconds < 60) return `${Math.max(0, Math.round(seconds))}s ago`
+  const mins = Math.floor(seconds / 60)
+  if (mins < 60) return `${mins}m ago`
+  const hrs = Math.floor(mins / 60)
+  const rem = mins % 60
+  if (hrs < 24) return `${hrs}h ${rem}m ago`
+  const days = Math.floor(hrs / 24)
+  return `${days}d ${hrs % 24}h ago`
+}
+
 function limitPercent(limit?: Limit | null): number | null {
   if (!limit) return null
   if (typeof limit.percent === 'number' && Number.isFinite(limit.percent)) return limit.percent
@@ -662,11 +681,13 @@ function App() {
   const [activeHistoryLabel, setActiveHistoryLabel] = useState<string | null>(null)
   const [leaseOverview, setLeaseOverview] = useState<LeaseOverviewResponse | null>(null)
   const [leaseLoading, setLeaseLoading] = useState(false)
+  const [leaseLastRefreshedAt, setLeaseLastRefreshedAt] = useState<string | null>(null)
   const [machineDetailModalOpen, setMachineDetailModalOpen] = useState(false)
   const [machineDetailLoading, setMachineDetailLoading] = useState(false)
   const [machineDetailError, setMachineDetailError] = useState<string | null>(null)
   const [machineDetail, setMachineDetail] = useState<MachineLeaseDetailResponse | null>(null)
   const streamRef = useRef<EventSource | null>(null)
+  const leaseStreamRef = useRef<EventSource | null>(null)
   const currentLabelRef = useRef<string | null>(currentLabel)
   const hasActionApiKey = actionApiKey.trim().length > 0
   const sensitiveText = (value: string | null | undefined): string => (privacyMode ? redactText(value) : (value || ''))
@@ -798,6 +819,13 @@ function App() {
     }
   }
 
+  const stopLeaseStream = () => {
+    if (leaseStreamRef.current) {
+      leaseStreamRef.current.close()
+      leaseStreamRef.current = null
+    }
+  }
+
   const loadCached = async (token: string) => {
     const payload = await requestJson<AccountsCachedResponse>('/api/accounts/cached', token)
     setCurrentLabel(payload.current_label)
@@ -842,6 +870,33 @@ function App() {
   const loadLeaseOverview = async (token: string) => {
     const data = await requestJson<LeaseOverviewResponse>('/api/admin/leases/overview', token)
     setLeaseOverview(data)
+    setLeaseLastRefreshedAt(new Date().toISOString())
+  }
+
+  const startLeaseStream = (token: string) => {
+    if (!token.trim()) return
+    stopLeaseStream()
+    const streamUrl = token === SESSION_TOKEN
+      ? '/api/admin/leases/stream'
+      : `/api/admin/leases/stream?api_key=${encodeURIComponent(token)}`
+    const es = new EventSource(streamUrl)
+    leaseStreamRef.current = es
+
+    es.addEventListener('snapshot', (ev) => {
+      try {
+        const data = JSON.parse((ev as MessageEvent).data) as LeaseOverviewResponse
+        setLeaseOverview(data)
+        setLeaseLastRefreshedAt(new Date().toISOString())
+        setLeaseLoading(false)
+      } catch {
+        // Ignore malformed SSE payloads and keep stream alive.
+      }
+    })
+
+    es.onerror = () => {
+      stopLeaseStream()
+      setStatus('Lease stream disconnected (showing last snapshot)')
+    }
   }
 
   const loadSessionStatus = async (): Promise<SessionStatus> => {
@@ -973,6 +1028,7 @@ function App() {
   const logoutSession = async () => {
     await requestJson('/logout', '', { method: 'POST', body: '{}' })
     stopStream()
+    stopLeaseStream()
     setAccounts([])
     setAggregate(defaultAggregate)
     setHistory([])
@@ -1391,8 +1447,16 @@ function App() {
     stopStream()
     setLeaseLoading(true)
     void loadLeaseOverview(apiKey)
-      .catch((e: unknown) => setErr(e instanceof Error ? e.message : 'Failed to load lease overview'))
-      .finally(() => setLeaseLoading(false))
+      .then(() => {
+        startLeaseStream(apiKey)
+      })
+      .catch((e: unknown) => {
+        setErr(e instanceof Error ? e.message : 'Failed to load lease overview')
+      })
+      .finally(() => {
+        setLeaseLoading(false)
+      })
+    return () => stopLeaseStream()
   }, [mode, apiKey])
 
   if (!apiKey.trim()) {
@@ -1808,6 +1872,9 @@ function App() {
                 {leaseOverview?.summary.active_lease_count ?? 0} active lease{(leaseOverview?.summary.active_lease_count ?? 0) === 1 ? '' : 's'}
               </span>
             </div>
+            <div className="muted" style={{ marginBottom: 10 }}>
+              Live updates via stream{leaseLastRefreshedAt ? ` · last update ${fmtTs(leaseLastRefreshedAt)}` : ''}
+            </div>
             <div className="cards">
               <div>
                 <label>Connected Machines</label>
@@ -1858,8 +1925,9 @@ function App() {
                 <div className="muted">
                   {machine.active_lease_count} active lease{machine.active_lease_count === 1 ? '' : 's'}
                   <div className="muted mono">
-                    latest: {fmtTs(machine.active_leases?.[0]?.updated_at || null)}
+                    {machine.is_stale ? 'last seen' : 'latest'}: {fmtDurationSeconds(machine.active_leases?.[0]?.seconds_since_seen ?? null)}
                   </div>
+                  {machine.is_stale ? <div className="muted mono" style={{ color: 'var(--warn)' }}>status: stale</div> : null}
                 </div>
                 <div className="actions-col">
                   <button className="btn btn-sm" onClick={() => void openMachineDetail(machine.machine_id)}>
@@ -1891,6 +1959,7 @@ function App() {
                   <div className="profile-title">
                     <span className="mono">{sensitiveText(lease.lease_id)}</span>
                     <span className="pill">{lease.state || 'active'}</span>
+                    {lease.is_stale ? <span className="pill" style={{ color: 'var(--warn)' }}>stale</span> : null}
                   </div>
                   <div className="muted mono">
                     {sensitiveText(lease.machine_id)} / {sensitiveText(lease.agent_id)}
@@ -1906,6 +1975,7 @@ function App() {
                 <div>
                   <div className="muted mono">issued: {fmtTs(lease.issued_at || null)}</div>
                   <div className="muted mono">expires: {fmtTs(lease.expires_at || null)}</div>
+                  <div className="muted mono">last seen: {fmtDurationSeconds(lease.seconds_since_seen ?? null)}</div>
                   <div className="muted mono">updated: {fmtTs(lease.updated_at || null)}</div>
                 </div>
                 <div className="actions-col">

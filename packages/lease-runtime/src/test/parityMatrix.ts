@@ -60,6 +60,12 @@ export const startupParityCases: Array<{
     expectedAction: 'reacquire',
   },
   {
+    name: 'released lease reacquires',
+    leaseId: 'lease-1',
+    leaseStatus: buildLeaseStatus({ state: 'released', credential_state: 'leased' }),
+    expectedAction: 'reacquire',
+  },
+  {
     name: 'replacement required rotates',
     leaseId: 'lease-1',
     leaseStatus: buildLeaseStatus({ replacement_required: true }),
@@ -106,6 +112,11 @@ export const healthParityCases: Array<{
   {
     name: 'expired health is revoked',
     leaseStatus: buildLeaseStatus({ state: 'expired', credential_state: 'expired' }),
+    expectedHealth: 'revoked',
+  },
+  {
+    name: 'released health is revoked',
+    leaseStatus: buildLeaseStatus({ state: 'released', credential_state: 'leased' }),
     expectedHealth: 'revoked',
   },
 ]

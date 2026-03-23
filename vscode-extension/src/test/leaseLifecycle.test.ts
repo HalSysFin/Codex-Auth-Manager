@@ -28,9 +28,23 @@ test('startup with revoked lease needs reacquire', () => {
   assert.equal(needsReacquire({ state: 'revoked' }), true)
 })
 
+test('startup with released lease needs reacquire', () => {
+  assert.equal(needsReacquire({ state: 'released' }), true)
+})
+
 test('expired lease shows revoked health state', () => {
   const state = deriveLeaseHealthState({
     state: 'expired',
+    replacement_required: false,
+    rotation_recommended: false,
+    expires_at: '2026-03-22T00:00:00.000Z',
+  }, new Date('2026-03-22T00:00:00.000Z'))
+  assert.equal(state, 'revoked')
+})
+
+test('released lease shows revoked health state', () => {
+  const state = deriveLeaseHealthState({
+    state: 'released',
     replacement_required: false,
     rotation_recommended: false,
     expires_at: '2026-03-22T00:00:00.000Z',
@@ -44,6 +58,22 @@ test('replacement required handling prefers rotate', () => {
     replacement_required: true,
     rotation_recommended: false,
   }, true), true)
+})
+
+test('rotation recommendation alone does not auto-rotate', () => {
+  assert.equal(shouldRotateLease({
+    state: 'active',
+    replacement_required: false,
+    rotation_recommended: true,
+  }, true), false)
+})
+
+test('rotation recommendation can auto-rotate when policy allows it', () => {
+  assert.equal(shouldRotateLease({
+    state: 'active',
+    replacement_required: false,
+    rotation_recommended: true,
+  }, true, 'recommended_or_required'), true)
 })
 
 test('renew handling triggers near expiry', () => {

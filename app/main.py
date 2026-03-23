@@ -3,6 +3,7 @@ from __future__ import annotations
 import hmac
 import ipaddress
 import json
+import hashlib
 import logging
 import re
 import secrets
@@ -69,6 +70,7 @@ from .lease_broker_store import (
     mark_broker_credential_exhausted,
     materialize_broker_lease,
     record_broker_lease_telemetry,
+    reconcile_broker_leases,
     release_broker_lease,
     renew_broker_lease,
     rotate_broker_lease,
@@ -112,9 +114,11 @@ from .login_sessions import (
 app = FastAPI(title="Codex Auth Manager", version="0.2.0")
 logger = logging.getLogger(__name__)
 _RECONCILE_INTERVAL_SECONDS = max(int(settings.analytics_snapshot_interval_seconds or 600), 60)
+_LEASE_RECONCILE_INTERVAL_SECONDS = 15
 _LIVE_REFRESH_CONCURRENCY = 4
 _USAGE_STALE_SECONDS = 1800
 _reconcile_task: asyncio.Task[None] | None = None
+_lease_reconcile_task: asyncio.Task[None] | None = None
 LABEL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 _FRONTEND_DIST = Path(__file__).resolve().parents[1] / "frontend" / "dist"
 _LAST_REFRESH_STATUS_BY_KEY: dict[str, dict[str, Any]] = {}
@@ -245,18 +249,27 @@ async def on_startup() -> None:
         logger.warning("legacy migration skipped/failed: %s", exc)
     _migrate_usage_keys_from_labels()
     global _reconcile_task
+    global _lease_reconcile_task
     if _reconcile_task is None:
         _reconcile_task = asyncio.create_task(_periodic_reconcile_usage_windows())
+    if _lease_reconcile_task is None:
+        _lease_reconcile_task = asyncio.create_task(_periodic_reconcile_broker_leases())
 
 
 @app.on_event("shutdown")
 async def on_shutdown() -> None:
     global _reconcile_task
+    global _lease_reconcile_task
     if _reconcile_task is not None:
         _reconcile_task.cancel()
         with suppress(asyncio.CancelledError):
             await _reconcile_task
         _reconcile_task = None
+    if _lease_reconcile_task is not None:
+        _lease_reconcile_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await _lease_reconcile_task
+        _lease_reconcile_task = None
 
 
 async def _periodic_reconcile_usage_windows() -> None:
@@ -269,6 +282,17 @@ async def _periodic_reconcile_usage_windows() -> None:
             _capture_periodic_usage_snapshots(now=datetime.now(timezone.utc))
         except Exception:
             logger.exception("usage reconciliation failed")
+
+
+async def _periodic_reconcile_broker_leases() -> None:
+    while True:
+        await asyncio.sleep(_LEASE_RECONCILE_INTERVAL_SECONDS)
+        try:
+            expired = reconcile_broker_leases(now=datetime.now(timezone.utc))
+            if expired:
+                logger.info("lease reconciliation reclaimed %s stale/expired lease(s)", expired)
+        except Exception:
+            logger.exception("lease reconciliation failed")
 
 
 @app.middleware("http")
@@ -1393,6 +1417,42 @@ async def api_admin_mark_credential_exhausted(
 @app.get("/api/admin/leases/overview")
 async def api_admin_leases_overview(request: Request) -> JSONResponse:
     _require_internal_auth(request)
+    return JSONResponse(_lease_overview_payload())
+
+
+@app.get("/api/admin/leases/stream")
+async def api_admin_leases_stream(request: Request) -> StreamingResponse:
+    _require_internal_auth_or_query(request)
+    event_headers = {
+        "Cache-Control": "no-cache",
+        "Connection": "keep-alive",
+        "X-Accel-Buffering": "no",
+    }
+
+    async def _event_gen():
+        payload = _lease_overview_payload()
+        payload_hash = hashlib.sha256(
+            json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+        yield _sse_event("snapshot", payload)
+        while True:
+            if await request.is_disconnected():
+                return
+            await asyncio.sleep(10)
+            latest = _lease_overview_payload()
+            latest_hash = hashlib.sha256(
+                json.dumps(latest, sort_keys=True, separators=(",", ":")).encode("utf-8")
+            ).hexdigest()
+            if latest_hash != payload_hash:
+                payload_hash = latest_hash
+                yield _sse_event("snapshot", latest)
+            else:
+                yield ": keepalive\n\n"
+
+    return StreamingResponse(_event_gen(), media_type="text/event-stream", headers=event_headers)
+
+
+def _lease_overview_payload() -> dict[str, Any]:
     _sync_broker_credentials_from_profiles()
     credentials = list_broker_credentials()
     active_leases = list_broker_leases(active_only=True)
@@ -1417,6 +1477,9 @@ async def api_admin_leases_overview(request: Request) -> JSONResponse:
             "latest_quota_remaining": lease.get("latest_quota_remaining"),
             "issued_at": lease.get("issued_at"),
             "expires_at": lease.get("expires_at"),
+            "last_seen_at": lease.get("last_seen_at"),
+            "seconds_since_seen": lease.get("seconds_since_seen"),
+            "is_stale": lease.get("is_stale"),
             "updated_at": lease.get("updated_at"),
             "reason": lease.get("reason"),
         }
@@ -1437,23 +1500,22 @@ async def api_admin_leases_overview(request: Request) -> JSONResponse:
                 "machine_id": machine["machine_id"],
                 "agent_ids": sorted(machine["agent_ids"]),
                 "active_lease_count": len(active),
+                "is_stale": all(bool(lease.get("is_stale")) for lease in active) if active else False,
                 "active_leases": active,
             }
         )
     machine_list.sort(key=lambda row: row["active_lease_count"], reverse=True)
 
-    return JSONResponse(
-        {
-            "connected_machines": machine_list,
-            "active_leases": lease_payloads,
-            "credentials": credentials,
-            "summary": {
-                "machine_count": len(machine_list),
-                "active_lease_count": len(lease_payloads),
-                "credential_count": len(credentials),
-            },
-        }
-    )
+    return {
+        "connected_machines": machine_list,
+        "active_leases": lease_payloads,
+        "credentials": credentials,
+        "summary": {
+            "machine_count": len(machine_list),
+            "active_lease_count": len(lease_payloads),
+            "credential_count": len(credentials),
+        },
+    }
 
 
 @app.post("/api/admin/leases/{lease_id}/release")

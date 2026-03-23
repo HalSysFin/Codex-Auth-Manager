@@ -1,4 +1,5 @@
 import type { LeaseAction, LeaseHealthState, LeaseStatusResponse } from './types.js'
+export type RotationPolicy = 'replacement_required_only' | 'recommended_or_required'
 
 export function secondsUntilExpiry(expiresAt: string, now = new Date()): number {
   return Math.max(0, Math.floor((new Date(expiresAt).getTime() - now.getTime()) / 1000))
@@ -8,7 +9,7 @@ export function deriveLeaseHealthState(
   lease: Pick<LeaseStatusResponse, 'state' | 'replacement_required' | 'rotation_recommended' | 'expires_at'>,
   now = new Date(),
 ): LeaseHealthState {
-  if (lease.state === 'revoked' || lease.state === 'expired') {
+  if (lease.state === 'revoked' || lease.state === 'expired' || lease.state === 'released') {
     return 'revoked'
   }
   if (lease.replacement_required || lease.rotation_recommended) {
@@ -34,6 +35,7 @@ export function shouldRenewLease(
 export function shouldRotateLease(
   lease: Pick<LeaseStatusResponse, 'state' | 'replacement_required' | 'rotation_recommended'>,
   autoRotate: boolean,
+  rotationPolicy: RotationPolicy = 'replacement_required_only',
 ): boolean {
   if (!autoRotate) {
     return false
@@ -41,20 +43,25 @@ export function shouldRotateLease(
   if (lease.state === 'revoked' || lease.state === 'expired') {
     return true
   }
-  return lease.replacement_required || lease.rotation_recommended
+  if (rotationPolicy === 'recommended_or_required') {
+    return lease.replacement_required || lease.rotation_recommended
+  }
+  // Default policy keeps a leased auth pinned until replacement is actually required.
+  return lease.replacement_required
 }
 
 export function needsReacquire(lease: Pick<LeaseStatusResponse, 'state'> | null | undefined): boolean {
   if (!lease) {
     return true
   }
-  return lease.state === 'revoked' || lease.state === 'expired'
+  return lease.state === 'revoked' || lease.state === 'expired' || lease.state === 'released'
 }
 
 export function selectStartupAction(input: {
   leaseId: string | null
   leaseStatus?: LeaseStatusResponse | null
   autoRotate: boolean
+  rotationPolicy?: RotationPolicy
   autoRenew: boolean
   now?: Date
 }): LeaseAction {
@@ -67,7 +74,7 @@ export function selectStartupAction(input: {
   if (needsReacquire(input.leaseStatus)) {
     return 'reacquire'
   }
-  if (shouldRotateLease(input.leaseStatus, input.autoRotate)) {
+  if (shouldRotateLease(input.leaseStatus, input.autoRotate, input.rotationPolicy)) {
     return 'rotate'
   }
   if (shouldRenewLease(input.leaseStatus, input.autoRenew, input.now)) {

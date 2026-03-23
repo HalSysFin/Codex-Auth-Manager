@@ -80,6 +80,7 @@ def _ensure_lease_broker_schema_postgres(conn: Any) -> None:
             released_at TEXT NULL,
             rotation_reason TEXT NULL,
             replacement_lease_id TEXT NULL,
+            last_seen_at TEXT NULL,
             last_telemetry_at TEXT NULL,
             latest_utilization_pct DOUBLE PRECISION NULL,
             latest_quota_remaining BIGINT NULL,
@@ -152,6 +153,9 @@ def _ensure_lease_broker_schema_postgres(conn: Any) -> None:
     conn.execute(
         "ALTER TABLE broker_leases ADD COLUMN IF NOT EXISTS metadata JSONB NULL"
     )
+    conn.execute(
+        "ALTER TABLE broker_leases ADD COLUMN IF NOT EXISTS last_seen_at TEXT NULL"
+    )
 
 
 def _ensure_lease_broker_schema_sqlite(conn: Any) -> None:
@@ -193,6 +197,7 @@ def _ensure_lease_broker_schema_sqlite(conn: Any) -> None:
             released_at TEXT NULL,
             rotation_reason TEXT NULL,
             replacement_lease_id TEXT NULL,
+            last_seen_at TEXT NULL,
             last_telemetry_at TEXT NULL,
             latest_utilization_pct REAL NULL,
             latest_quota_remaining INTEGER NULL,
@@ -250,6 +255,10 @@ def _ensure_lease_broker_schema_sqlite(conn: Any) -> None:
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_broker_lease_telemetry_machine_agent_captured ON broker_lease_telemetry(machine_id, agent_id, captured_at)"
     )
+    try:
+        conn.execute("ALTER TABLE broker_leases ADD COLUMN last_seen_at TEXT NULL")
+    except Exception:
+        pass
 
 
 def sync_broker_credential(
@@ -344,6 +353,7 @@ def list_broker_credentials(db_path: Path | None = None) -> list[dict[str, Any]]
     with _connect(db_path) as conn:
         _ensure_schema(conn)
         _ensure_lease_broker_schema(conn)
+        _reconcile_expired_active_leases(conn)
         rows = conn.execute(
             "SELECT * FROM broker_credentials ORDER BY label ASC, id ASC"
         ).fetchall()
@@ -453,6 +463,7 @@ def acquire_broker_lease(
         _ensure_schema(conn)
         _ensure_lease_broker_schema(conn)
         conn.execute("BEGIN IMMEDIATE")
+        _reconcile_expired_active_leases(conn, now=now_dt)
 
         existing_machine_lease = _select_existing_machine_lease(
             conn,
@@ -460,6 +471,13 @@ def acquire_broker_lease(
             now_dt=now_dt,
         )
         if existing_machine_lease is not None:
+            conn.execute(
+                "UPDATE broker_leases SET last_seen_at = ?, updated_at = ? WHERE id = ?",
+                (now_iso, now_iso, existing_machine_lease["id"]),
+            )
+            existing_machine_lease = dict(
+                conn.execute("SELECT * FROM broker_leases WHERE id = ?", (existing_machine_lease["id"],)).fetchone()
+            )
             lease = _decode_lease_row(existing_machine_lease)
             return {"status": "ok", "reason": "existing_machine_lease_reused", "lease": lease}
 
@@ -476,10 +494,10 @@ def acquire_broker_lease(
             """
             INSERT INTO broker_leases (
                 id, credential_id, machine_id, agent_id, state, issued_at, expires_at,
-                renewed_at, revoked_at, released_at, rotation_reason, replacement_lease_id,
+                renewed_at, revoked_at, released_at, rotation_reason, replacement_lease_id, last_seen_at,
                 last_telemetry_at, latest_utilization_pct, latest_quota_remaining,
                 last_success_at, last_error_at, reason, metadata, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, 'active', ?, ?, NULL, NULL, NULL, NULL, NULL, NULL, ?, ?, NULL, NULL, ?, NULL, ?, ?)
+            ) VALUES (?, ?, ?, ?, 'active', ?, ?, NULL, NULL, NULL, NULL, NULL, ?, NULL, ?, ?, NULL, NULL, ?, NULL, ?, ?)
             """,
             (
                 lease_id,
@@ -488,6 +506,7 @@ def acquire_broker_lease(
                 agent_id,
                 now_iso,
                 expires_at,
+                now_iso,
                 credential.get("utilization_pct"),
                 credential.get("quota_remaining"),
                 reason,
@@ -572,10 +591,10 @@ def renew_broker_lease(
         conn.execute(
             """
             UPDATE broker_leases
-            SET renewed_at = ?, expires_at = ?, updated_at = ?
+            SET renewed_at = ?, expires_at = ?, last_seen_at = ?, updated_at = ?
             WHERE id = ?
             """,
-            (now_iso, renewed_expires_at, now_iso, lease_id),
+            (now_iso, renewed_expires_at, now_iso, now_iso, lease_id),
         )
         row = dict(conn.execute("SELECT * FROM broker_leases WHERE id = ?", (lease_id,)).fetchone())
         return {"status": "ok", "reason": None, "lease": _decode_lease_row(row)}
@@ -688,7 +707,8 @@ def record_broker_lease_telemetry(
         conn.execute(
             """
             UPDATE broker_leases
-            SET last_telemetry_at = ?,
+            SET last_seen_at = ?,
+                last_telemetry_at = ?,
                 latest_utilization_pct = ?,
                 latest_quota_remaining = ?,
                 last_success_at = COALESCE(?, last_success_at),
@@ -697,6 +717,7 @@ def record_broker_lease_telemetry(
             WHERE id = ?
             """,
             (
+                captured_iso,
                 captured_iso,
                 _nullable_float(utilization_pct),
                 _nullable_int(quota_remaining),
@@ -771,10 +792,10 @@ def rotate_broker_lease(
             """
             INSERT INTO broker_leases (
                 id, credential_id, machine_id, agent_id, state, issued_at, expires_at,
-                renewed_at, revoked_at, released_at, rotation_reason, replacement_lease_id,
+                renewed_at, revoked_at, released_at, rotation_reason, replacement_lease_id, last_seen_at,
                 last_telemetry_at, latest_utilization_pct, latest_quota_remaining,
                 last_success_at, last_error_at, reason, metadata, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, 'active', ?, ?, NULL, NULL, NULL, ?, NULL, NULL, ?, ?, NULL, NULL, ?, NULL, ?, ?)
+            ) VALUES (?, ?, ?, ?, 'active', ?, ?, NULL, NULL, NULL, ?, NULL, ?, NULL, ?, ?, NULL, NULL, ?, NULL, ?, ?)
             """,
             (
                 new_lease_id,
@@ -784,6 +805,7 @@ def rotate_broker_lease(
                 now_iso,
                 expires_at,
                 reason,
+                now_iso,
                 replacement.get("utilization_pct"),
                 replacement.get("quota_remaining"),
                 reason,
@@ -850,10 +872,11 @@ def materialize_broker_lease(
             """
             UPDATE broker_leases
             SET metadata = ?,
+                last_seen_at = ?,
                 updated_at = ?
             WHERE id = ?
             """,
-            (_json_dump(metadata), now_iso, lease_id),
+            (_json_dump(metadata), now_iso, now_iso, lease_id),
         )
         updated = dict(conn.execute("SELECT * FROM broker_leases WHERE id = ?", (lease_id,)).fetchone())
         return {"status": "ok", "reason": None, "lease": _decode_lease_row(updated)}
@@ -928,6 +951,13 @@ def get_broker_lease_status(
         lease = dict(row)
         _expire_lease_if_needed(conn, lease, now_dt)
         lease = dict(conn.execute("SELECT * FROM broker_leases WHERE id = ?", (lease_id,)).fetchone())
+        if lease["state"] in ACTIVE_LEASE_STATES:
+            now_iso = _to_iso(now_dt)
+            conn.execute(
+                "UPDATE broker_leases SET last_seen_at = ?, updated_at = ? WHERE id = ?",
+                (now_iso, now_iso, lease_id),
+            )
+            lease = dict(conn.execute("SELECT * FROM broker_leases WHERE id = ?", (lease_id,)).fetchone())
         credential = dict(conn.execute("SELECT * FROM broker_credentials WHERE id = ?", (lease["credential_id"],)).fetchone())
         credential = _decode_credential_row(credential)
         expires_at = _parse_iso(str(lease["expires_at"]))
@@ -944,6 +974,7 @@ def get_broker_lease_status(
             credential["state"] in {"exhausted", "revoked", "expired", "unavailable_for_assignment"}
             or lease["state"] in {"rotation_required", "revoked", "expired"}
         )
+        seconds_since_seen = _lease_seconds_since_seen(lease, now_dt)
         return {
             "lease_id": lease["id"],
             "credential_id": lease["credential_id"],
@@ -962,7 +993,30 @@ def get_broker_lease_status(
             "replacement_required": replacement_required,
             "reason": lease["reason"],
             "credential_state": credential["state"],
+            "last_seen_at": lease.get("last_seen_at"),
+            "seconds_since_seen": seconds_since_seen,
+            "is_stale": seconds_since_seen is not None and seconds_since_seen >= int(settings.lease_stale_after_seconds),
         }
+
+
+def reconcile_broker_leases(
+    *,
+    now: datetime | None = None,
+    db_path: Path | None = None,
+) -> int:
+    with _connect(db_path) as conn:
+        _ensure_schema(conn)
+        _ensure_lease_broker_schema(conn)
+        before = conn.execute(
+            f"SELECT COUNT(*) AS count FROM broker_leases WHERE state IN ({','.join('?' for _ in ACTIVE_LEASE_STATES)})",
+            tuple(sorted(ACTIVE_LEASE_STATES)),
+        ).fetchone()
+        _reconcile_expired_active_leases(conn, now=now)
+        after = conn.execute(
+            f"SELECT COUNT(*) AS count FROM broker_leases WHERE state IN ({','.join('?' for _ in ACTIVE_LEASE_STATES)})",
+            tuple(sorted(ACTIVE_LEASE_STATES)),
+        ).fetchone()
+        return max(int(before["count"]) - int(after["count"]), 0)
 
 
 def list_broker_lease_telemetry(
@@ -1108,18 +1162,27 @@ def _credential_is_usable_for_existing_lease(
 def _expire_lease_if_needed(conn: Any, lease: dict[str, Any], now_dt: datetime) -> None:
     if lease["state"] not in ACTIVE_LEASE_STATES:
         return
-    if _parse_iso(str(lease["expires_at"])) > now_dt:
+    reason = None
+    if _parse_iso(str(lease["expires_at"])) <= now_dt:
+        reason = "lease_expired"
+    else:
+        last_seen_dt = _lease_last_seen_dt(lease)
+        if last_seen_dt is not None:
+            seconds_since_seen = int((now_dt - last_seen_dt).total_seconds())
+            if seconds_since_seen >= int(settings.lease_reclaim_after_seconds):
+                reason = "lease_heartbeat_timeout"
+    if reason is None:
         return
     now_iso = _to_iso(now_dt)
     conn.execute(
         """
         UPDATE broker_leases
         SET state = 'expired',
-            reason = COALESCE(reason, 'lease_expired'),
+            reason = COALESCE(reason, ?),
             updated_at = ?
         WHERE id = ?
         """,
-        (now_iso, lease["id"]),
+        (reason, now_iso, lease["id"]),
     )
     credential = dict(conn.execute("SELECT * FROM broker_credentials WHERE id = ?", (lease["credential_id"],)).fetchone())
     _reconcile_credential_row(conn, credential, has_active_lease=False, now_dt=now_dt)
@@ -1357,7 +1420,34 @@ def _decode_credential_row(row: dict[str, Any]) -> dict[str, Any]:
 
 
 def _decode_lease_row(row: dict[str, Any]) -> dict[str, Any]:
-    return _decode_json_fields(row, {"metadata"})
+    out = _decode_json_fields(row, {"metadata"})
+    now_dt = datetime.now(timezone.utc)
+    seconds_since_seen = _lease_seconds_since_seen(out, now_dt)
+    out["seconds_since_seen"] = seconds_since_seen
+    out["is_stale"] = bool(
+        seconds_since_seen is not None
+        and seconds_since_seen >= int(settings.lease_stale_after_seconds)
+        and str(out.get("state") or "") in ACTIVE_LEASE_STATES
+    )
+    return out
+
+
+def _lease_last_seen_dt(lease: dict[str, Any]) -> datetime | None:
+    for field in ("last_seen_at", "last_telemetry_at", "renewed_at", "issued_at"):
+        raw = lease.get(field)
+        if raw:
+            try:
+                return _parse_iso(str(raw))
+            except Exception:
+                continue
+    return None
+
+
+def _lease_seconds_since_seen(lease: dict[str, Any], now_dt: datetime) -> int | None:
+    last_seen_dt = _lease_last_seen_dt(lease)
+    if last_seen_dt is None:
+        return None
+    return max(0, int((now_dt - last_seen_dt).total_seconds()))
 
 
 def _decode_json_fields(row: dict[str, Any], fields: set[str]) -> dict[str, Any]:

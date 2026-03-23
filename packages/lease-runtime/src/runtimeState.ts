@@ -13,6 +13,7 @@ export function defaultRuntimeSettings(): RuntimeSettings {
     telemetryIntervalSeconds: 300,
     autoRenew: true,
     autoRotate: true,
+    rotationPolicy: 'replacement_required_only',
     openDashboardPath: '',
     allowInsecureLocalhost: true,
   }

@@ -48,6 +48,8 @@ class Settings(BaseSettings):
     allow_client_initiated_rotation: bool = True
     lease_default_ttl_seconds: int = 3600
     lease_renewal_min_remaining_seconds: int = 300
+    lease_stale_after_seconds: int = 60
+    lease_reclaim_after_seconds: int = 180
     weekly_reset_confirmation_required: bool = True
 
     def codex_auth_file(self) -> Path:

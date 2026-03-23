@@ -1,6 +1,6 @@
 import * as vscode from 'vscode'
 import { AuthManagerClient, AuthManagerClientError, type AuthPayload, type LeaseStatusResponse } from './authManagerClient'
-import { authFileExists, writeAuthFile } from './authFile'
+import { authFileExists, deleteAuthFile, writeAuthFile } from './authFile'
 import {
   deriveLeaseHealthState,
   selectStartupAction,
@@ -93,6 +93,31 @@ class AuthManagerController {
     })
   }
 
+  private rotationPolicy(): 'replacement_required_only' | 'recommended_or_required' {
+    const configured = vscode.workspace
+      .getConfiguration()
+      .get<string>('authManager.rotationPolicy', 'replacement_required_only')
+    return configured === 'recommended_or_required' ? 'recommended_or_required' : 'replacement_required_only'
+  }
+
+  private autoReloadWindowOnLeaseChange(): boolean {
+    return vscode.workspace
+      .getConfiguration()
+      .get<boolean>('authManager.autoReloadWindowOnLeaseChange', false)
+  }
+
+  private releaseLeaseOnShutdown(): boolean {
+    return vscode.workspace
+      .getConfiguration()
+      .get<boolean>('authManager.releaseLeaseOnShutdown', true)
+  }
+
+  private deleteAuthFileOnShutdown(): boolean {
+    return vscode.workspace
+      .getConfiguration()
+      .get<boolean>('authManager.deleteAuthFileOnShutdown', true)
+  }
+
   private restartTimers(): void {
     if (this.refreshTimer) {
       clearInterval(this.refreshTimer)
@@ -160,7 +185,7 @@ class AuthManagerController {
     try {
       this.log('Starting ensureLease flow')
       if (!this.state.leaseId) {
-        await this.acquireAndMaterializeLease('startup ensure')
+        await this.acquireAndMaterializeLease('startup ensure', false)
         return
       }
       let status: LeaseStatusResponse
@@ -171,11 +196,11 @@ class AuthManagerController {
         if (shouldReacquireAfterLookupError(error instanceof AuthManagerClientError ? error.status : null)) {
           this.log(`Stored lease ${this.state.leaseId} is gone; reacquiring`)
           this.state = await this.stateStore.clear(this.state.machineId, this.state.agentId, this.authFilePath())
-          await this.acquireAndMaterializeLease('startup reacquire missing lease')
+          await this.acquireAndMaterializeLease('startup reacquire missing lease', false)
           return
         }
         this.backendReachable = false
-        await this.handleBackendError(error, 'Failed to refresh current lease on startup')
+        await this.handleBackendError(error, 'Failed to refresh current lease on startup', false)
         return
       }
       this.state = await this.stateStore.updateFromLeaseStatus(this.state, status)
@@ -183,19 +208,20 @@ class AuthManagerController {
         leaseId: this.state.leaseId,
         leaseStatus: status,
         autoRotate: vscode.workspace.getConfiguration().get<boolean>('authManager.autoRotate', true),
+        rotationPolicy: this.rotationPolicy(),
         autoRenew: vscode.workspace.getConfiguration().get<boolean>('authManager.autoRenew', true),
       })
       if (startupAction === 'reacquire') {
         this.log(`Lease ${status.lease_id} is no longer usable; acquiring replacement`)
-        await this.acquireAndMaterializeLease('startup reacquire')
+        await this.acquireAndMaterializeLease('startup reacquire', false)
         return
       }
       if (startupAction === 'rotate') {
-        await this.rotateLease()
+        await this.rotateLease(false)
         return
       }
       if (startupAction === 'renew') {
-        await this.renewLease()
+        await this.renewLease(false)
       }
       if (!(await authFileExists(this.authFilePath()))) {
         this.log('Auth file missing; materializing active lease')
@@ -222,37 +248,39 @@ class AuthManagerController {
         leaseId: this.state.leaseId,
         leaseStatus: status,
         autoRotate: vscode.workspace.getConfiguration().get<boolean>('authManager.autoRotate', true),
+        rotationPolicy: this.rotationPolicy(),
         autoRenew: vscode.workspace.getConfiguration().get<boolean>('authManager.autoRenew', true),
       })
       if (refreshAction === 'reacquire') {
         this.log(`Lease ${status.lease_id} is no longer usable during refresh; reacquiring`)
         this.state = await this.stateStore.clear(this.state.machineId, this.state.agentId, this.authFilePath())
-        await this.acquireAndMaterializeLease('refresh reacquire')
+        await this.acquireAndMaterializeLease('refresh reacquire', false)
         return
       }
       if (refreshAction === 'rotate') {
-        await this.rotateLease()
+        await this.rotateLease(false)
         return
       }
       if (refreshAction === 'renew') {
-        await this.renewLease()
+        await this.renewLease(false)
       }
       this.setMessage(`Lease refreshed at ${new Date().toLocaleTimeString()}.`)
     } catch (error) {
       if (shouldReacquireAfterLookupError(error instanceof AuthManagerClientError ? error.status : null)) {
         this.log(`Stored lease ${this.state.leaseId} was not found during refresh; reacquiring`)
         this.state = await this.stateStore.clear(this.state.machineId, this.state.agentId, this.authFilePath())
-        await this.acquireAndMaterializeLease('refresh reacquire missing lease')
+        await this.acquireAndMaterializeLease('refresh reacquire missing lease', false)
         return
       }
       this.backendReachable = false
-      await this.handleBackendError(error, 'Unable to refresh lease state')
+      await this.handleBackendError(error, 'Unable to refresh lease state', false)
+      this.setMessage('Backend unavailable; keeping current lease and retrying in background.')
     } finally {
       this.updatePresentation()
     }
   }
 
-  async renewLease(): Promise<void> {
+  async renewLease(showPopup = true): Promise<void> {
     if (!this.state.leaseId) {
       await this.ensureLease()
       return
@@ -270,18 +298,22 @@ class AuthManagerController {
       this.state = await this.stateStore.updateFromLease(this.state, response.lease)
       this.setMessage('Lease renewed.')
     } catch (error) {
-      await this.handleBackendError(error, 'Unable to renew lease')
+      await this.handleBackendError(error, 'Unable to renew lease', showPopup)
+      if (!showPopup) {
+        this.setMessage('Backend unavailable during renew; keeping current lease.')
+      }
     } finally {
       this.updatePresentation()
     }
   }
 
-  async rotateLease(): Promise<void> {
+  async rotateLease(showPopup = true): Promise<void> {
     if (!this.state.leaseId) {
       await this.acquireAndMaterializeLease('rotate with no lease')
       return
     }
     this.log(`Rotating lease ${this.state.leaseId}`)
+    const previousLeaseId = this.state.leaseId
     try {
       const response = await this.client.rotateLease({
         leaseId: this.state.leaseId,
@@ -296,8 +328,20 @@ class AuthManagerController {
       this.state = await this.stateStore.updateFromLease(this.state, response.lease)
       await this.materializeAndWriteAuth(response.lease.id)
       this.setMessage('Lease rotated and auth file updated.')
+      if (
+        this.autoReloadWindowOnLeaseChange()
+        && previousLeaseId
+        && response.lease.id
+        && response.lease.id !== previousLeaseId
+      ) {
+        this.log(`Lease changed (${previousLeaseId} -> ${response.lease.id}); reloading window`)
+        await vscode.commands.executeCommand('workbench.action.reloadWindow')
+      }
     } catch (error) {
-      await this.handleBackendError(error, 'Unable to rotate lease')
+      await this.handleBackendError(error, 'Unable to rotate lease', showPopup)
+      if (!showPopup) {
+        this.setMessage('Backend unavailable during rotate; keeping current lease.')
+      }
     } finally {
       this.updatePresentation()
     }
@@ -397,8 +441,43 @@ class AuthManagerController {
     await vscode.env.openExternal(vscode.Uri.parse(target))
   }
 
-  private async acquireAndMaterializeLease(reason: string): Promise<void> {
+  async deactivate(): Promise<void> {
+    if (this.refreshTimer) {
+      clearInterval(this.refreshTimer)
+      this.refreshTimer = undefined
+    }
+    if (this.telemetryTimer) {
+      clearInterval(this.telemetryTimer)
+      this.telemetryTimer = undefined
+    }
+
+    if (this.releaseLeaseOnShutdown() && this.state?.leaseId) {
+      try {
+        await this.client.releaseLease(this.state.leaseId, {
+          machineId: this.state.machineId,
+          agentId: this.state.agentId,
+          reason: 'Released on VS Code shutdown',
+        })
+        this.log(`Released lease ${this.state.leaseId} during shutdown`)
+      } catch (error) {
+        this.log(`Shutdown release failed (continuing): ${error instanceof Error ? error.message : String(error)}`)
+      }
+    }
+
+    if (this.deleteAuthFileOnShutdown()) {
+      try {
+        const deleted = await deleteAuthFile(this.authFilePath())
+        this.log(deleted ? `Deleted auth file at ${this.authFilePath()} on shutdown` : 'No auth file to delete on shutdown')
+      } catch (error) {
+        this.log(`Shutdown auth file delete failed (continuing): ${error instanceof Error ? error.message : String(error)}`)
+      }
+      this.state = await this.stateStore.clear(this.state.machineId, this.state.agentId, this.authFilePath())
+    }
+  }
+
+  private async acquireAndMaterializeLease(reason: string, showPopup = true): Promise<void> {
     this.log(`Acquiring lease (${reason})`)
+    const previousLeaseId = this.state.leaseId
     try {
       const response = await this.client.acquireLease({
         machineId: this.state.machineId,
@@ -413,8 +492,20 @@ class AuthManagerController {
       this.state = await this.stateStore.updateFromLease(this.state, response.lease)
       await this.materializeAndWriteAuth(response.lease.id)
       this.setMessage('Lease acquired and auth file written.')
+      if (
+        this.autoReloadWindowOnLeaseChange()
+        && previousLeaseId
+        && response.lease.id
+        && response.lease.id !== previousLeaseId
+      ) {
+        this.log(`Lease changed (${previousLeaseId} -> ${response.lease.id}); reloading window`)
+        await vscode.commands.executeCommand('workbench.action.reloadWindow')
+      }
     } catch (error) {
-      await this.handleBackendError(error, 'Unable to acquire lease')
+      await this.handleBackendError(error, 'Unable to acquire lease', showPopup)
+      if (!showPopup) {
+        this.setMessage('Backend unavailable; will retry acquiring lease in background.')
+      }
     } finally {
       this.updatePresentation()
     }
@@ -485,8 +576,16 @@ class AuthManagerController {
 }
 
 export async function activate(context: vscode.ExtensionContext): Promise<void> {
-  const controller = new AuthManagerController(context)
-  await controller.activate()
+  controllerInstance = new AuthManagerController(context)
+  await controllerInstance.activate()
 }
 
-export function deactivate(): void {}
+let controllerInstance: AuthManagerController | null = null
+
+export async function deactivate(): Promise<void> {
+  if (!controllerInstance) {
+    return
+  }
+  await controllerInstance.deactivate()
+  controllerInstance = null
+}
