@@ -177,6 +177,13 @@ npm test
 npm run build
 ```
 
+Shared broker lifecycle suite:
+```bash
+./scripts/run-broker-lifecycle-tests.sh
+```
+
+More detail is in `docs/broker-lifecycle-testing.md`.
+
 ## Docker Run
 
 ```bash

@@ -48,6 +48,50 @@ test('selectStartupAction reacquires revoked leases', () => {
   }), 'reacquire')
 })
 
+test('selectStartupAction rotates replacement-required leases', () => {
+  assert.equal(selectStartupAction({
+    leaseId: 'lease-1',
+    autoRotate: true,
+    autoRenew: true,
+    leaseStatus: {
+      lease_id: 'lease-1',
+      credential_id: 'cred-1',
+      state: 'active',
+      issued_at: '2026-03-23T00:00:00.000Z',
+      expires_at: '2026-03-23T02:00:00.000Z',
+      renewed_at: null,
+      machine_id: 'machine-a',
+      agent_id: 'headless-client',
+      latest_telemetry_at: null,
+      latest_utilization_pct: 91,
+      latest_quota_remaining: 100,
+      last_success_at: null,
+      last_error_at: null,
+      rotation_recommended: false,
+      replacement_required: true,
+      reason: null,
+      credential_state: 'leased',
+    },
+  }), 'rotate')
+})
+
+test('formatStatusLines shows backend unavailable clearly', () => {
+  const lines = formatStatusLines({
+    backendReachable: false,
+    healthState: 'backend_unavailable',
+    leaseState: null,
+    leaseId: null,
+    credentialId: null,
+    expiresAt: null,
+    latestUtilizationPct: null,
+    latestQuotaRemaining: null,
+    lastBackendRefreshAt: null,
+    lastAuthWriteAt: null,
+  })
+  assert.equal(lines[0], 'Health: backend_unavailable')
+  assert.ok(lines.includes('Backend reachable: no'))
+})
+
 test('buildLeaseTelemetryPayload stays truthful', () => {
   const payload = buildLeaseTelemetryPayload({
     machineId: 'machine-a',

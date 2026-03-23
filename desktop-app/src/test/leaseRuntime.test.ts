@@ -66,6 +66,62 @@ test('replacement required rotates', () => {
   }), 'rotate')
 })
 
+test('healthy active lease stays on the current lease', () => {
+  assert.equal(selectStartupAction({
+    leaseId: 'lease-1',
+    leaseStatus: {
+      lease_id: 'lease-1',
+      credential_id: 'cred-1',
+      state: 'active',
+      issued_at: '2026-03-22T00:00:00.000Z',
+      expires_at: '2026-03-22T03:00:00.000Z',
+      renewed_at: null,
+      machine_id: 'machine-a',
+      agent_id: 'desktop-app',
+      latest_telemetry_at: null,
+      latest_utilization_pct: 15,
+      latest_quota_remaining: 800,
+      last_success_at: null,
+      last_error_at: null,
+      rotation_recommended: false,
+      replacement_required: false,
+      reason: null,
+      credential_state: 'leased',
+    },
+    autoRotate: true,
+    autoRenew: true,
+    now: new Date('2026-03-22T00:00:00.000Z'),
+  }), 'noop')
+})
+
+test('near-expiry active lease renews instead of reacquiring', () => {
+  assert.equal(selectStartupAction({
+    leaseId: 'lease-1',
+    leaseStatus: {
+      lease_id: 'lease-1',
+      credential_id: 'cred-1',
+      state: 'active',
+      issued_at: '2026-03-22T00:00:00.000Z',
+      expires_at: '2026-03-22T00:03:00.000Z',
+      renewed_at: null,
+      machine_id: 'machine-a',
+      agent_id: 'desktop-app',
+      latest_telemetry_at: null,
+      latest_utilization_pct: 15,
+      latest_quota_remaining: 800,
+      last_success_at: null,
+      last_error_at: null,
+      rotation_recommended: false,
+      replacement_required: false,
+      reason: null,
+      credential_state: 'leased',
+    },
+    autoRotate: true,
+    autoRenew: true,
+    now: new Date('2026-03-22T00:00:00.000Z'),
+  }), 'renew')
+})
+
 test('minimal telemetry payload stays truthful', () => {
   const payload = buildLeaseTelemetryPayload({
     machineId: 'machine-a',

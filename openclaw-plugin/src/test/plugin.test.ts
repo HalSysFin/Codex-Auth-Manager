@@ -21,6 +21,20 @@ test('normalizeUsageEvent maps OpenAI-style usage fields', () => {
   assert.equal(event.metadata?.model, 'gpt-5.4')
 })
 
+test('normalizeUsageEvent maps direct counter payloads', () => {
+  const event = normalizeUsageEvent({
+    requests_count: 2,
+    tokens_in: 50,
+    tokens_out: 10,
+    source: 'openclaw',
+  })
+
+  assert.equal(event.requestsCount, 2)
+  assert.equal(event.tokensIn, 50)
+  assert.equal(event.tokensOut, 10)
+  assert.equal(event.metadata?.source, 'openclaw')
+})
+
 test('plugin aggregates usage and posts telemetry', async () => {
   let postedBody: Record<string, unknown> | null = null
   const plugin = createOpenClawAuthManagerPlugin({

@@ -71,7 +71,14 @@ export class OpenClawAuthManagerPlugin {
   }
 
   setLeaseContext(context: LeaseTelemetryContext): void {
+    const contextChanged =
+      this.context?.leaseId !== context.leaseId ||
+      this.context?.machineId !== context.machineId ||
+      this.context?.agentId !== context.agentId
     this.context = context
+    if (contextChanged) {
+      this.aggregate = emptyAggregate()
+    }
   }
 
   clearLeaseContext(): void {
