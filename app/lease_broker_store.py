@@ -920,12 +920,22 @@ def is_credential_assignable(
     return True, None
 
 
-def rank_credential_for_assignment(credential: dict[str, Any]) -> tuple[float, float, float, str]:
-    health = float(credential.get("health_score") or 0.0)
+def rank_credential_for_assignment(
+    credential: dict[str, Any],
+    *,
+    now_dt: datetime,
+) -> tuple[float, float, float, float, str]:
+    weekly_reset_at = credential.get("weekly_reset_at")
+    seconds_until_reset = float("inf")
+    if weekly_reset_at:
+        reset_dt = _parse_iso(str(weekly_reset_at))
+        if reset_dt > now_dt:
+            seconds_until_reset = (reset_dt - now_dt).total_seconds()
+    quota = float(credential.get("quota_remaining") or float("inf"))
     utilization = float(credential.get("utilization_pct") or 0.0)
-    quota = float(credential.get("quota_remaining") or 0.0)
+    health = float(credential.get("health_score") or 0.0)
     last_assigned = str(credential.get("last_assigned_at") or "")
-    return (-health, utilization, -quota, last_assigned)
+    return (seconds_until_reset, quota, -utilization, -health, last_assigned)
 
 
 def _select_best_eligible_credential(
@@ -951,7 +961,7 @@ def _select_best_eligible_credential(
             eligible.append(credential)
     if not eligible:
         return None
-    eligible.sort(key=rank_credential_for_assignment)
+    eligible.sort(key=lambda credential: rank_credential_for_assignment(credential, now_dt=now_dt))
     return eligible[0]
 
 

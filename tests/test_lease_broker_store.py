@@ -224,6 +224,58 @@ class LeaseBrokerStoreTests(unittest.TestCase):
         self.assertEqual(result["status"], "ok")
         self.assertEqual(result["lease"]["credential_id"], "cred-b")
 
+    def test_acquire_prefers_credential_with_soonest_weekly_refresh(self) -> None:
+        self._sync_credential(
+            "cred-a",
+            health_score=75.0,
+            utilization_pct=40.0,
+            quota_remaining=30000,
+            weekly_reset_at="2026-03-24T00:00:00+00:00",
+        )
+        self._sync_credential(
+            "cred-b",
+            health_score=99.0,
+            utilization_pct=10.0,
+            quota_remaining=90000,
+            weekly_reset_at="2026-03-28T00:00:00+00:00",
+        )
+
+        result = acquire_broker_lease(
+            machine_id="machine-1",
+            agent_id="agent-1",
+            now=datetime(2026, 3, 23, 12, 0, tzinfo=timezone.utc),
+            db_path=self.db_path,
+        )
+
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(result["lease"]["credential_id"], "cred-a")
+
+    def test_acquire_prefers_lower_remaining_quota_when_refresh_matches(self) -> None:
+        self._sync_credential(
+            "cred-a",
+            health_score=80.0,
+            utilization_pct=50.0,
+            quota_remaining=15000,
+            weekly_reset_at="2026-03-29T00:00:00+00:00",
+        )
+        self._sync_credential(
+            "cred-b",
+            health_score=95.0,
+            utilization_pct=20.0,
+            quota_remaining=45000,
+            weekly_reset_at="2026-03-29T00:00:00+00:00",
+        )
+
+        result = acquire_broker_lease(
+            machine_id="machine-1",
+            agent_id="agent-1",
+            now=datetime(2026, 3, 23, 12, 0, tzinfo=timezone.utc),
+            db_path=self.db_path,
+        )
+
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(result["lease"]["credential_id"], "cred-a")
+
     def test_weekly_reset_does_not_restore_assignability_until_confirmed(self) -> None:
         self._sync_credential(
             "cred-a",
