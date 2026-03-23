@@ -1,0 +1,18 @@
+[package]
+name = "codex-auth-manager-desktop"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "codex_auth_manager_desktop_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+dirs = "6"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tauri = { version = "2", features = [] }
+time = { version = "0.3", features = ["formatting"] }

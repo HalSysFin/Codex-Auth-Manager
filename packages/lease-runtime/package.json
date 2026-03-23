@@ -1,0 +1,5 @@
+{
+  "name": "@codex-auth-manager/lease-runtime",
+  "private": true,
+  "type": "module"
+}

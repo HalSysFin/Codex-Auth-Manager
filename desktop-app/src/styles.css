@@ -1,0 +1,198 @@
+body {
+  margin: 0;
+  font-family: "Segoe UI", "Helvetica Neue", sans-serif;
+  background: radial-gradient(circle at top, #1d2435 0%, #0d1117 55%);
+  color: #edf2f7;
+}
+
+#app {
+  min-height: 100vh;
+}
+
+.shell {
+  max-width: 1180px;
+  margin: 0 auto;
+  padding: 32px 24px 48px;
+}
+
+.hero,
+.panel-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.eyebrow {
+  margin: 0 0 4px;
+  color: #67e8f9;
+  text-transform: uppercase;
+  letter-spacing: 0.12em;
+  font-size: 12px;
+}
+
+h1,
+h2 {
+  margin: 0;
+}
+
+.pill {
+  border-radius: 999px;
+  padding: 10px 16px;
+  font-weight: 600;
+  border: 1px solid rgba(255, 255, 255, 0.18);
+  background: rgba(148, 163, 184, 0.18);
+}
+
+.pill.active {
+  background: rgba(16, 185, 129, 0.18);
+  color: #6ee7b7;
+}
+
+.pill.expiring,
+.pill.rotation_required {
+  background: rgba(245, 158, 11, 0.18);
+  color: #fbbf24;
+}
+
+.pill.revoked,
+.pill.backend_unavailable {
+  background: rgba(239, 68, 68, 0.18);
+  color: #fca5a5;
+}
+
+.pill.no_lease {
+  background: rgba(148, 163, 184, 0.18);
+  color: #e2e8f0;
+}
+
+.panel,
+.card,
+.message,
+.actions {
+  backdrop-filter: blur(10px);
+  background: rgba(15, 23, 42, 0.72);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 18px;
+}
+
+.panel {
+  margin-top: 20px;
+  padding: 18px;
+}
+
+.form-grid,
+.grid {
+  display: grid;
+  gap: 14px;
+  margin-top: 16px;
+}
+
+.form-grid {
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+}
+
+.grid {
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  margin-top: 20px;
+}
+
+label {
+  display: block;
+  font-size: 13px;
+  color: #cbd5e1;
+}
+
+.check {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-height: 44px;
+}
+
+input {
+  width: 100%;
+  box-sizing: border-box;
+  border-radius: 12px;
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  background: rgba(15, 23, 42, 0.9);
+  color: #f8fafc;
+  padding: 10px 12px;
+  margin-top: 8px;
+}
+
+input[type="checkbox"] {
+  width: auto;
+  margin: 0;
+}
+
+.actions {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 12px;
+  padding: 18px;
+  margin-top: 20px;
+}
+
+button {
+  border: none;
+  border-radius: 12px;
+  padding: 11px 14px;
+  background: linear-gradient(135deg, #0ea5e9, #2563eb);
+  color: white;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+button:hover {
+  filter: brightness(1.06);
+}
+
+.message {
+  margin-top: 20px;
+  padding: 16px;
+  color: #fde68a;
+}
+
+.hidden {
+  display: none;
+}
+
+.card {
+  padding: 16px;
+}
+
+.card label {
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  font-size: 11px;
+  color: #94a3b8;
+}
+
+.value {
+  margin-top: 8px;
+  font-size: 16px;
+  word-break: break-word;
+}
+
+.logs pre {
+  margin: 16px 0 0;
+  max-height: 240px;
+  overflow: auto;
+  background: rgba(2, 6, 23, 0.85);
+  border-radius: 14px;
+  padding: 14px;
+  color: #cbd5e1;
+}
+
+@media (max-width: 720px) {
+  .shell {
+    padding: 20px 16px 36px;
+  }
+
+  .hero,
+  .panel-head {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+}
