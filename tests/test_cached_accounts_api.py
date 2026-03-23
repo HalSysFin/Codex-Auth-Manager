@@ -7,10 +7,12 @@ from pathlib import Path
 from unittest.mock import patch
 
 from app.accounts import AccountProfile
+from app.login_sessions import cancel_login_session, create_login_session, get_login_session
 from app.main import (
     api_account_history,
     api_accounts,
     api_accounts_stream,
+    auth_relay_callback,
     api_lease_materialize,
     api_lease_telemetry,
     api_usage_history,
@@ -237,6 +239,37 @@ class CachedAccountsApiTests(unittest.TestCase):
         self.assertEqual(payload['status'], 'ok')
         self.assertEqual(payload['lease']['latest_utilization_pct'], 84.0)
         self.assertEqual(payload['lease']['latest_quota_remaining'], 16000)
+
+    def test_relay_callback_accepts_manual_callback_with_mismatched_state(self) -> None:
+        session = create_login_session(
+            'https://example.com/auth?state=expected-state',
+            ttl_seconds=300,
+        )
+        try:
+            with (
+                patch('app.main._store_callback', return_value=None),
+                patch('app.main.relay_callback_to_login', return_value={
+                    'attempted': True,
+                    'supported': True,
+                    'completed': True,
+                    'message': 'ok',
+                }),
+            ):
+                response = asyncio.run(auth_relay_callback({
+                    'session_id': session.session_id,
+                    'relay_token': session.relay_token,
+                    'full_url': 'http://localhost:1455/auth/callback?code=abc123&state=other-machine-state',
+                }))
+        finally:
+            cancel_login_session(session.session_id)
+
+        payload = _json_body(response)
+        self.assertEqual(payload['status'], 'callback_received')
+        self.assertTrue(payload['session']['callback_received'])
+        stored = get_login_session(session.session_id)
+        self.assertIsNotNone(stored)
+        self.assertFalse(stored.callback_payload['state_matches_session'])
+        self.assertEqual(stored.callback_payload['expected_state'], 'expected-state')
 
 
 if __name__ == '__main__':

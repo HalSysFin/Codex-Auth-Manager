@@ -664,19 +664,16 @@ async def auth_relay_callback(payload: dict[str, Any]) -> JSONResponse:
         logger.warning("relay-callback rejected: invalid relay token session_id=%s", session_id)
         raise HTTPException(status_code=403, detail="Invalid relay token")
     expected_state = _expected_state_from_auth_url(session.auth_url)
-    if expected_state and state and str(state).strip() != expected_state:
+    state_matches_session = not (
+        expected_state and state and str(state).strip() != expected_state
+    )
+    if not state_matches_session:
         logger.warning(
-            "relay-callback rejected: state mismatch session_id=%s expected=%s got=%s",
+            "relay-callback accepting mismatched state for pasted/manual callback "
+            "session_id=%s expected=%s got=%s",
             session_id,
             expected_state,
             state,
-        )
-        raise HTTPException(
-            status_code=409,
-            detail=(
-                "Callback state does not match active login session. "
-                "Start Add Account again and use that session's callback URL."
-            ),
         )
 
     callback_payload = {
@@ -685,6 +682,8 @@ async def auth_relay_callback(payload: dict[str, Any]) -> JSONResponse:
         "error": error,
         "error_description": error_description,
         "full_url": full_url,
+        "state_matches_session": state_matches_session,
+        "expected_state": expected_state,
         "relayed_at": datetime.now(timezone.utc).isoformat(),
     }
 

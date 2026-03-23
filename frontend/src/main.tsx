@@ -82,6 +82,23 @@ type AccountsCachedResponse = {
   aggregate: Aggregate
 }
 
+type LoginStatusResponse = {
+  status?: string
+  callback_received?: boolean
+  error?: string | null
+  relay?: {
+    next_action?: string | null
+  }
+  auto_persist?: {
+    status?: string | null
+    reason?: string | null
+    label?: string | null
+    error?: string | null
+    matched_existing_profile?: boolean
+    created_new_profile?: boolean
+  }
+}
+
 type StreamSnapshot = {
   accounts: Account[]
   current_label: string | null
@@ -91,6 +108,13 @@ type StreamSnapshot = {
 
 type ViewMode = 'manager' | 'stats'
 type RangeKey = '1d' | '7d' | '30d' | '90d' | 'all'
+type AccountSortKey =
+  | 'consumption_asc'
+  | 'consumption_desc'
+  | 'name_asc'
+  | 'name_desc'
+  | 'weekly_refresh_asc'
+  | 'weekly_refresh_desc'
 
 type AccountHistoryResponse = {
   label: string
@@ -314,6 +338,32 @@ async function requestJson<T>(path: string, token: string, init?: RequestInit): 
   return (await res.json()) as T
 }
 
+async function copyText(text: string): Promise<boolean> {
+  if (!text) return false
+  if (navigator.clipboard?.writeText) {
+    try {
+      await navigator.clipboard.writeText(text)
+      return true
+    } catch {
+      // fall through to execCommand path
+    }
+  }
+  try {
+    const area = document.createElement('textarea')
+    area.value = text
+    area.setAttribute('readonly', 'true')
+    area.style.position = 'fixed'
+    area.style.opacity = '0'
+    document.body.appendChild(area)
+    area.select()
+    const ok = document.execCommand('copy')
+    document.body.removeChild(area)
+    return ok
+  } catch {
+    return false
+  }
+}
+
 function fmtTs(value: string | number | null | undefined): string {
   if (!value) return '--'
   let d: Date
@@ -439,6 +489,23 @@ function refreshBadge(limitA?: Limit | null, limitB?: Limit | null, usage?: Usag
   }
 }
 
+function accountDisplayName(account: Account): string {
+  return (account.display_label || account.label || account.email || '').trim().toLowerCase()
+}
+
+function accountConsumptionValue(account: Account): number {
+  const primary = limitPercent(account.rate_limits?.requests || account.rate_limits?.primary)
+  const secondary = limitPercent(account.rate_limits?.tokens || account.rate_limits?.secondary)
+  const candidate = secondary ?? primary
+  return candidate === null ? Number.POSITIVE_INFINITY : candidate
+}
+
+function accountWeeklyRefreshValue(account: Account): number {
+  const secondary = account.rate_limits?.tokens || account.rate_limits?.secondary
+  const refreshAt = resetDate(secondary, account.usage_tracking)
+  return refreshAt ? refreshAt.getTime() : Number.POSITIVE_INFINITY
+}
+
 function App() {
   const [apiKey, setApiKey] = useState('')
   const [actionApiKey, setActionApiKey] = useState('')
@@ -451,6 +518,8 @@ function App() {
   const [addRelayToken, setAddRelayToken] = useState('')
   const [addCallbackUrl, setAddCallbackUrl] = useState('')
   const [addLabelInput, setAddLabelInput] = useState('')
+  const [addAccountFeedback, setAddAccountFeedback] = useState<string | null>(null)
+  const [addAccountFeedbackTone, setAddAccountFeedbackTone] = useState<'info' | 'success' | 'error'>('info')
   const [importAuthModalOpen, setImportAuthModalOpen] = useState(false)
   const [importAuthText, setImportAuthText] = useState('')
   const [importAuthLabel, setImportAuthLabel] = useState('')
@@ -472,6 +541,7 @@ function App() {
   const [historyError, setHistoryError] = useState<string | null>(null)
   const [historyData, setHistoryData] = useState<AccountHistoryResponse | null>(null)
   const [usageHistory, setUsageHistory] = useState<UsageHistoryResponse | null>(null)
+  const [accountSort, setAccountSort] = useState<AccountSortKey>('consumption_asc')
   const [selectedRange, setSelectedRange] = useState<RangeKey>('30d')
   const [statsChartMode, setStatsChartMode] = useState<'cumulative' | 'daily'>('cumulative')
   const [accountChartMode, setAccountChartMode] = useState<'cumulative' | 'daily'>('cumulative')
@@ -508,6 +578,27 @@ function App() {
     if (!best) return a
     return getScore(a) < getScore(best) ? a : best
   }, null)
+  const sortedAccounts = useMemo(() => {
+    const copy = [...accounts]
+    copy.sort((left, right) => {
+      switch (accountSort) {
+        case 'consumption_desc':
+          return accountConsumptionValue(right) - accountConsumptionValue(left)
+        case 'name_asc':
+          return accountDisplayName(left).localeCompare(accountDisplayName(right))
+        case 'name_desc':
+          return accountDisplayName(right).localeCompare(accountDisplayName(left))
+        case 'weekly_refresh_asc':
+          return accountWeeklyRefreshValue(left) - accountWeeklyRefreshValue(right)
+        case 'weekly_refresh_desc':
+          return accountWeeklyRefreshValue(right) - accountWeeklyRefreshValue(left)
+        case 'consumption_asc':
+        default:
+          return accountConsumptionValue(left) - accountConsumptionValue(right)
+      }
+    })
+    return copy
+  }, [accounts, accountSort])
 
   const statsDaily = usageHistory?.series.daily_usage || []
   const statsCumulative = usageHistory?.series.cumulative_usage || []
@@ -803,21 +894,33 @@ function App() {
         { method: 'POST', body: '{}' },
       )
       const authUrl = (start.auth_url || '').trim()
-      if (authUrl) {
-        window.open(authUrl, '_blank', 'noopener,noreferrer')
-      }
       setAddAuthUrl(authUrl)
       setAddSessionId((start.session_id || '').trim())
       setAddRelayToken((start.relay_token || '').trim())
       setAddCallbackUrl('')
       setAddLabelInput('')
+      setAddAccountFeedback(null)
+      setAddAccountFeedbackTone('info')
       setAddAccountModalOpen(true)
-      setStatus('Login started. Complete auth, then paste callback URL.')
+      setStatus('Add Account link ready. Copy the auth URL, complete login, then paste the callback URL.')
     } catch (e) {
       setErr(e instanceof Error ? e.message : 'Add account failed')
     } finally {
       setAddAccountLoading(false)
     }
+  }
+
+  const pollAddAccountFinalization = async (): Promise<LoginStatusResponse> => {
+    let last: LoginStatusResponse = {}
+    for (let attempt = 0; attempt < 18; attempt += 1) {
+      const next = await requestJson<LoginStatusResponse>('/auth/login/status', apiKey, { method: 'GET' })
+      last = next
+      if (next.status === 'complete' || next.status === 'failed') {
+        return next
+      }
+      await new Promise((resolve) => window.setTimeout(resolve, 1000))
+    }
+    return last
   }
 
   const submitAddAccountCallback = async () => {
@@ -833,6 +936,8 @@ function App() {
     }
     setErr(null)
     setAddAccountLoading(true)
+    setAddAccountFeedback('Submitting callback to Codex CLI...')
+    setAddAccountFeedbackTone('info')
     try {
       const parsedUrl = new URL(fullUrl)
       await requestJson('/auth/relay-callback', apiKey, {
@@ -848,11 +953,39 @@ function App() {
           label: addLabelInput.trim() || undefined,
         }),
       })
-      setAddAccountModalOpen(false)
-      setStatus('Callback relayed to Codex CLI. Refreshing...')
-      await refreshNow()
+      setAddAccountFeedback('Callback accepted. Waiting for Codex CLI to finalize auth...')
+      setAddAccountFeedbackTone('info')
+      const loginStatus = await pollAddAccountFinalization()
+      const autoPersist = loginStatus.auto_persist || {}
+      const nextAction = loginStatus.relay?.next_action || loginStatus.error || autoPersist.error || 'Add Account did not complete.'
+
+      if (loginStatus.status === 'complete' && (autoPersist.status === 'persisted' || autoPersist.status === 'skipped')) {
+        const label = autoPersist.label ? ` (${autoPersist.label})` : ''
+        const successMessage =
+          autoPersist.status === 'persisted'
+            ? autoPersist.created_new_profile
+              ? `Auth saved as a new profile${label}.`
+              : `Auth updated the matching saved profile${label}.`
+            : `Auth finalized successfully${label}.`
+        setAddAccountFeedback(successMessage)
+        setAddAccountFeedbackTone('success')
+        setStatus(successMessage)
+        await refreshNow()
+        window.setTimeout(() => {
+          setAddAccountModalOpen(false)
+          setAddAccountFeedback(null)
+        }, 1200)
+        return
+      }
+
+      setAddAccountFeedback(nextAction)
+      setAddAccountFeedbackTone('error')
+      setStatus('Add Account needs attention.')
     } catch (e) {
-      setErr(e instanceof Error ? e.message : 'Callback relay failed')
+      const message = e instanceof Error ? e.message : 'Callback relay failed'
+      setErr(message)
+      setAddAccountFeedback(message)
+      setAddAccountFeedbackTone('error')
     } finally {
       setAddAccountLoading(false)
     }
@@ -1167,7 +1300,20 @@ function App() {
           <section className="panel">
             <div className="saved-head">
               <h3>Saved Profiles</h3>
-              <span className="pill">{accountCount} account{accountCount === 1 ? '' : 's'}</span>
+              <div className="saved-head-actions">
+                <label className="sort-control">
+                  <span>Sort</span>
+                  <select value={accountSort} onChange={(e) => setAccountSort(e.target.value as AccountSortKey)}>
+                    <option value="consumption_asc">Consumption: least to most</option>
+                    <option value="consumption_desc">Consumption: most to least</option>
+                    <option value="name_asc">Name: A to Z</option>
+                    <option value="name_desc">Name: Z to A</option>
+                    <option value="weekly_refresh_asc">Weekly refresh: soonest first</option>
+                    <option value="weekly_refresh_desc">Weekly refresh: latest first</option>
+                  </select>
+                </label>
+                <span className="pill">{accountCount} account{accountCount === 1 ? '' : 's'}</span>
+              </div>
             </div>
             <div className="table-head">
               <span>Profile</span>
@@ -1176,7 +1322,7 @@ function App() {
               <span>Actions</span>
             </div>
             {accounts.length === 0 ? <div className="empty">No accounts found.</div> : null}
-            {accounts.map((a) => {
+            {sortedAccounts.map((a) => {
               const primary = a.rate_limits?.requests || a.rate_limits?.primary
               const secondary = a.rate_limits?.tokens || a.rate_limits?.secondary
               const p1Raw = limitPercent(primary)
@@ -1676,11 +1822,38 @@ function App() {
               <button className="btn btn-sm" onClick={() => setAddAccountModalOpen(false)}>Close</button>
             </div>
             <p className="muted" style={{ marginTop: 0 }}>
-              Complete login in the opened auth tab, then paste the full callback URL below. This callback is passed to Codex CLI for finalization.
+              Use this manual Add Account flow for same-device or cross-device login. Auth Manager will pass the pasted callback to Codex CLI, then save a new profile or update the matching existing profile based on the finalized auth identity.
             </p>
             {addAuthUrl ? (
-              <div className="muted" style={{ marginBottom: 8 }}>
-                Auth URL opened. If needed, <a href={addAuthUrl} target="_blank" rel="noreferrer">open again</a>.
+              <div className="manual-auth-panel">
+                <div className="panel-title" style={{ marginBottom: 8 }}>Manual Auth Steps</div>
+                <ol className="manual-auth-steps">
+                  <li>Copy the auth link below.</li>
+                  <li>Paste it into a browser on any machine and sign in with OpenAI.</li>
+                  <li>Copy the full callback URL from the browser address bar.</li>
+                  <li>Paste that callback URL into the field below and submit it.</li>
+                </ol>
+                <div className="manual-auth-link-row">
+                  <pre className="manual-auth-link">{addAuthUrl}</pre>
+                  <div className="top-actions">
+                    <button
+                      className="btn"
+                      onClick={() => {
+                        void copyText(addAuthUrl).then((ok) => {
+                          setStatus(ok ? 'Auth URL copied to clipboard.' : 'Unable to copy auth URL automatically.')
+                        })
+                      }}
+                    >
+                      Copy Auth Link
+                    </button>
+                    <a className="btn" href={addAuthUrl} target="_blank" rel="noreferrer">Open Link</a>
+                  </div>
+                </div>
+              </div>
+            ) : null}
+            {addAccountFeedback ? (
+              <div className={`inline-feedback ${addAccountFeedbackTone}`}>
+                {addAccountFeedback}
               </div>
             ) : null}
             <textarea
