@@ -433,3 +433,13 @@ These repo components are excluded from Docker image build context:
 - `headless-client/`
 - `openclaw-plugin/`
 - `packages/`
+
+## Known issues
+
+- Most client connectors are still under development not all have been tested for features use at own risk
+
+## Live (tested and working) clients and add ons
+
+- [Codex Auth Manager - OpenClaw Plugin](https://github.com/HalSysFin/Codex-Auth-Manager---OpenClaw-Plugin)
+- [Codex Auth Manager - VS Code Extension](https://github.com/HalSysFin/Codex-Auth-Manager---VS-Code-Extension)
+- [Codex Auth Manager - Auth Relay - Chrome Extension](https://github.com/HalSysFin/Codex-Auth-Manager---Chrome-Extension)
