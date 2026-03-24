@@ -21,6 +21,10 @@ test('resolvePluginConfig prefers explicit config and applies defaults', () => {
   assert.equal(config.flushEveryRequests, 5)
   assert.equal(config.authFilePath, '~/.codex/auth.json')
   assert.equal(config.requestedTtlSeconds, 1800)
+  assert.equal(config.leaseProfileId, 'openai-codex:lease')
+  assert.equal(config.enforceLeaseAsActiveAuth, true)
+  assert.equal(config.disallowNonLeaseAuth, false)
+  assert.equal(config.purgeNonLeaseProfilesOnStart, false)
   assert.equal(config.autoRenew, true)
   assert.equal(config.autoRotate, false)
   assert.equal(config.releaseLeaseOnShutdown, false)
@@ -45,6 +49,10 @@ test('validatePluginConfig reports missing required fields', () => {
     machineId: '',
     agentId: '',
     authFilePath: '~/.codex/auth.json',
+    leaseProfileId: 'openai-codex:lease',
+    enforceLeaseAsActiveAuth: true,
+    disallowNonLeaseAuth: false,
+    purgeNonLeaseProfilesOnStart: false,
     flushIntervalMs: 500,
     flushEveryRequests: 0,
     refreshIntervalMs: 60_000,

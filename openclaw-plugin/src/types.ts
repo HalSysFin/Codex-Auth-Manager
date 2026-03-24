@@ -60,6 +60,10 @@ export type AuthManagerPluginOptions = {
   fetchImpl?: typeof fetch
   logger?: Pick<Console, 'info' | 'warn' | 'error'>
   authFilePath?: string
+  leaseProfileId?: string
+  enforceLeaseAsActiveAuth?: boolean
+  disallowNonLeaseAuth?: boolean
+  purgeNonLeaseProfilesOnStart?: boolean
   allowInsecureLocalhost?: boolean
   requestedTtlSeconds?: number
   autoRenew?: boolean
@@ -76,6 +80,10 @@ export type AuthManagerLeasePluginConfig = {
   agentId: string
   leaseId?: string
   authFilePath: string
+  leaseProfileId: string
+  enforceLeaseAsActiveAuth: boolean
+  disallowNonLeaseAuth: boolean
+  purgeNonLeaseProfilesOnStart: boolean
   flushIntervalMs: number
   flushEveryRequests: number
   refreshIntervalMs: number

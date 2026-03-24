@@ -7,7 +7,7 @@ import type {
 } from './types.js'
 import { OpenClawAuthManagerPlugin } from './plugin.js'
 import { AuthManagerClientError, AuthManagerTelemetryClient } from './client.js'
-import { writeAuthFile } from './authFile.js'
+import { applyLeaseAuthToOpenClaw, writeAuthFile } from './authFile.js'
 
 function countObservedRequests(raw: UsageShape): number {
   const direct = raw.requests_count ?? raw.request_count
@@ -47,6 +47,10 @@ export class OpenClawLeaseTelemetryService {
   private readonly machineId: string
   private readonly agentId: string
   private readonly authFilePath: string
+  private readonly leaseProfileId: string
+  private readonly enforceLeaseAsActiveAuth: boolean
+  private readonly disallowNonLeaseAuth: boolean
+  private readonly purgeNonLeaseProfilesOnStart: boolean
   private flushTimer: NodeJS.Timeout | null = null
   private refreshTimer: NodeJS.Timeout | null = null
   private observedSinceFlush = 0
@@ -74,6 +78,10 @@ export class OpenClawLeaseTelemetryService {
     this.machineId = options.context?.machineId ?? 'openclaw'
     this.agentId = options.context?.agentId ?? 'openclaw'
     this.authFilePath = options.authFilePath ?? '~/.codex/auth.json'
+    this.leaseProfileId = options.leaseProfileId ?? 'openai-codex:lease'
+    this.enforceLeaseAsActiveAuth = options.enforceLeaseAsActiveAuth ?? true
+    this.disallowNonLeaseAuth = options.disallowNonLeaseAuth ?? false
+    this.purgeNonLeaseProfilesOnStart = options.purgeNonLeaseProfilesOnStart ?? false
     this.context = options.context ?? null
     this.lastKnownLeaseState = null
     this.lastKnownExpiresAt = null
@@ -81,6 +89,9 @@ export class OpenClawLeaseTelemetryService {
 
   async start(): Promise<void> {
     this.stop()
+    if (this.purgeNonLeaseProfilesOnStart && this.context?.leaseId) {
+      this.logger.info?.('[openclaw-plugin] purgeNonLeaseProfilesOnStart enabled; will enforce lease profile on first materialization')
+    }
     await this.ensureLease()
     this.flushTimer = setInterval(() => {
       void this.flushIfNeeded()
@@ -279,6 +290,13 @@ export class OpenClawLeaseTelemetryService {
       throw new Error('Lease materialization did not return auth_json')
     }
     await writeAuthFile(this.authFilePath, authPayload)
+    await applyLeaseAuthToOpenClaw({
+      payload: authPayload,
+      leaseProfileId: this.leaseProfileId,
+      expiresAtIso: lease.expires_at,
+      enforceLeaseAsActiveAuth: this.enforceLeaseAsActiveAuth,
+      disallowNonLeaseAuth: this.disallowNonLeaseAuth,
+    })
     this.context = {
       leaseId: lease.id,
       machineId: this.machineId,
@@ -287,6 +305,7 @@ export class OpenClawLeaseTelemetryService {
       quotaRemaining: lease.latest_quota_remaining,
     }
     this.plugin.setLeaseContext(this.context)
+    this.logger.info?.(`[openclaw-plugin] lease auth materialized and activated as ${this.leaseProfileId}`)
   }
 
   private consumeLeaseResponse(response: LeaseAcquireResponse, fallbackMessage: string) {

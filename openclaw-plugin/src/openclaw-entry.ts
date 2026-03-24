@@ -23,11 +23,7 @@ export function createAuthManagerOpenClawEntry(): OpenClawPluginLikeDefinition {
     name: 'Auth Manager Lease Telemetry',
     description: 'Capture truthful OpenClaw usage and post it to Auth Manager lease telemetry.',
     register(api) {
-      let service = createOpenClawLeaseTelemetryService({
-        baseUrl: 'http://127.0.0.1:8080',
-        internalApiToken: 'unset',
-        logger: api.logger,
-      })
+      let service: ReturnType<typeof createOpenClawLeaseTelemetryService> | null = null
 
       api.registerService({
         id: 'auth-manager-lease-telemetry-service',
@@ -43,6 +39,10 @@ export function createAuthManagerOpenClawEntry(): OpenClawPluginLikeDefinition {
             internalApiToken: config.internalApiToken,
             logger: api.logger,
             authFilePath: config.authFilePath,
+            leaseProfileId: config.leaseProfileId,
+            enforceLeaseAsActiveAuth: config.enforceLeaseAsActiveAuth,
+            disallowNonLeaseAuth: config.disallowNonLeaseAuth,
+            purgeNonLeaseProfilesOnStart: config.purgeNonLeaseProfilesOnStart,
             allowInsecureLocalhost: config.allowInsecureLocalhost,
             requestedTtlSeconds: config.requestedTtlSeconds,
             autoRenew: config.autoRenew,
@@ -57,7 +57,7 @@ export function createAuthManagerOpenClawEntry(): OpenClawPluginLikeDefinition {
           await service.start()
         },
         async stop() {
-          await service.shutdown()
+          if (service) await service.shutdown()
         },
       })
     },
@@ -91,6 +91,10 @@ export function buildUsageObserver(service = createOpenClawLeaseTelemetryService
         internalApiToken: params.config.internalApiToken,
         logger: params.logger,
         authFilePath: params.config.authFilePath,
+        leaseProfileId: params.config.leaseProfileId,
+        enforceLeaseAsActiveAuth: params.config.enforceLeaseAsActiveAuth,
+        disallowNonLeaseAuth: params.config.disallowNonLeaseAuth,
+        purgeNonLeaseProfilesOnStart: params.config.purgeNonLeaseProfilesOnStart,
         allowInsecureLocalhost: params.config.allowInsecureLocalhost,
         requestedTtlSeconds: params.config.requestedTtlSeconds,
         autoRenew: params.config.autoRenew,

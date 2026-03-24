@@ -7,6 +7,7 @@ const DEFAULT_REQUESTED_TTL_SECONDS = 1800
 const DEFAULT_AUTO_RENEW = true
 const DEFAULT_AUTO_ROTATE = false
 const DEFAULT_RELEASE_LEASE_ON_SHUTDOWN = false
+const DEFAULT_LEASE_PROFILE_ID = 'openai-codex:lease'
 
 function asString(value: unknown): string | undefined {
   if (typeof value !== 'string') return undefined
@@ -48,6 +49,17 @@ export function resolvePluginConfig(
   const agentId = asString(rawConfig?.agentId) ?? asString(env.AUTH_MANAGER_AGENT_ID) ?? 'openclaw'
   const leaseId = asString(rawConfig?.leaseId) ?? asString(env.AUTH_MANAGER_LEASE_ID)
   const authFilePath = asString(rawConfig?.authFilePath) ?? asString(env.AUTH_MANAGER_AUTH_FILE_PATH) ?? '~/.codex/auth.json'
+  const leaseProfileId =
+    asString(rawConfig?.leaseProfileId) ?? asString(env.AUTH_MANAGER_LEASE_PROFILE_ID) ?? DEFAULT_LEASE_PROFILE_ID
+  const enforceLeaseAsActiveAuth = asBoolean(
+    rawConfig?.enforceLeaseAsActiveAuth ?? env.AUTH_MANAGER_ENFORCE_LEASE_ACTIVE_AUTH,
+    true,
+  )
+  const disallowNonLeaseAuth = asBoolean(rawConfig?.disallowNonLeaseAuth ?? env.AUTH_MANAGER_DISALLOW_NON_LEASE_AUTH, false)
+  const purgeNonLeaseProfilesOnStart = asBoolean(
+    rawConfig?.purgeNonLeaseProfilesOnStart ?? env.AUTH_MANAGER_PURGE_NON_LEASE_PROFILES_ON_START,
+    false,
+  )
   const flushIntervalMs = Math.max(
     1_000,
     asNumber(rawConfig?.flushIntervalMs ?? env.AUTH_MANAGER_TELEMETRY_INTERVAL_MS, DEFAULT_FLUSH_INTERVAL_MS),
@@ -91,6 +103,10 @@ export function resolvePluginConfig(
     agentId,
     leaseId,
     authFilePath,
+    leaseProfileId,
+    enforceLeaseAsActiveAuth,
+    disallowNonLeaseAuth,
+    purgeNonLeaseProfilesOnStart,
     flushIntervalMs,
     flushEveryRequests,
     refreshIntervalMs,
@@ -110,6 +126,7 @@ export function validatePluginConfig(config: AuthManagerLeasePluginConfig): stri
   if (!config.internalApiToken) errors.push('internalApiToken is required')
   if (!config.machineId) errors.push('machineId is required')
   if (!config.agentId) errors.push('agentId is required')
+  if (!config.leaseProfileId) errors.push('leaseProfileId is required')
   if (config.flushIntervalMs < 1_000) errors.push('flushIntervalMs must be at least 1000')
   if (config.flushEveryRequests < 1) errors.push('flushEveryRequests must be at least 1')
   return errors
