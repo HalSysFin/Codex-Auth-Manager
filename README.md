@@ -14,6 +14,10 @@ Codex Auth Manager manages numerous Codex / ChatGPT account auths, keeps those a
 
 ![Codex Auth Manager dashboard](./assets/codex-auth-manager-dashboard.png)
 
+## Lease Management Preview
+
+![Codex Auth Manager lease management](./assets/codex-auth-manager-lease-managment.png)
+
 ## Repo Components
 
 This repo now contains several clients around the same Auth Manager backend and lease broker:
