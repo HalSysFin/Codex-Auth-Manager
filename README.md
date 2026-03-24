@@ -6,6 +6,10 @@ Auth profile manager for Codex CLI with:
 - Postgres as canonical persistence
 - Single active `auth.json` materialized on disk
 
+## Dashboard Preview
+
+![Codex Auth Manager dashboard](./assets/codex-auth-manager-dashboard.png)
+
 ## Repo Components
 
 This repo now contains several clients around the same Auth Manager backend and lease broker:
