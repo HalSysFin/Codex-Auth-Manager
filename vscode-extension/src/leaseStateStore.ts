@@ -1,5 +1,4 @@
 import { randomUUID } from 'node:crypto'
-import * as os from 'node:os'
 import type * as vscode from 'vscode'
 import {
   defaultRuntimeLeaseState,
@@ -25,12 +24,33 @@ export function defaultLeaseState(machineId: string, agentId: string, authFilePa
   return defaultRuntimeLeaseState(machineId, agentId, authFilePath)
 }
 
-export function derivePersistedMachineId(configured?: string): string {
+function sanitizeMachineFragment(value: string): string {
+  const sanitized = value.replace(/[^a-zA-Z0-9._-]/g, '-')
+  return sanitized.length > 32 ? sanitized.slice(0, 32) : sanitized
+}
+
+function isLegacyGeneratedMachineId(value: string): boolean {
+  return /^vscode-[a-zA-Z0-9._-]+-[a-f0-9]{8}$/.test(value)
+}
+
+export function derivePersistedMachineId(configured?: string, runtimeMachineId?: string, hostContext?: string): string {
   const trimmed = configured?.trim()
   if (trimmed) {
     return trimmed
   }
-  return `vscode-${os.hostname().replace(/[^a-zA-Z0-9._-]/g, '-')}-${randomUUID().slice(0, 8)}`
+  const runtimeTrimmed = runtimeMachineId?.trim()
+  const hostTrimmed = hostContext?.trim()
+  if (runtimeTrimmed) {
+    const fragments = [sanitizeMachineFragment(runtimeTrimmed)]
+    if (hostTrimmed) {
+      fragments.push(sanitizeMachineFragment(hostTrimmed))
+    }
+    return `vscode-${fragments.join('-')}`
+  }
+  if (hostTrimmed) {
+    return `vscode-${sanitizeMachineFragment(hostTrimmed)}-${randomUUID().slice(0, 8)}`
+  }
+  return `vscode-${randomUUID().slice(0, 12)}`
 }
 
 export function derivePersistedAgentId(configured?: string): string {
@@ -44,12 +64,31 @@ export function derivePersistedAgentId(configured?: string): string {
 export class LeaseStateStore {
   constructor(private readonly memento: MementoLike) {}
 
-  async getOrCreateMachineId(configured?: string): Promise<string> {
-    const existing = this.memento.get<string>(MACHINE_ID_KEY)
-    if (existing?.trim()) {
+  async getOrCreateMachineId(configured?: string, runtimeMachineId?: string, hostContext?: string): Promise<string> {
+    const configuredTrimmed = configured?.trim()
+    if (configuredTrimmed) {
+      await this.memento.update(MACHINE_ID_KEY, configuredTrimmed)
+      return configuredTrimmed
+    }
+
+    const existing = this.memento.get<string>(MACHINE_ID_KEY)?.trim()
+    const derivedRuntimeId = runtimeMachineId?.trim() || hostContext?.trim()
+      ? derivePersistedMachineId(undefined, runtimeMachineId, hostContext)
+      : undefined
+
+    if (derivedRuntimeId) {
+      if (!existing || isLegacyGeneratedMachineId(existing) || existing !== derivedRuntimeId) {
+        await this.memento.update(MACHINE_ID_KEY, derivedRuntimeId)
+        return derivedRuntimeId
+      }
       return existing
     }
-    const machineId = derivePersistedMachineId(configured)
+
+    if (existing) {
+      return existing
+    }
+
+    const machineId = derivePersistedMachineId()
     await this.memento.update(MACHINE_ID_KEY, machineId)
     return machineId
   }
@@ -66,6 +105,9 @@ export class LeaseStateStore {
 
   load(machineId: string, agentId: string, authFilePath = '~/.codex/auth.json'): LeaseState {
     const stored = this.memento.get<LeaseState>(STATE_KEY)
+    if (!stored || stored.machineId !== machineId || stored.agentId !== agentId) {
+      return defaultLeaseState(machineId, agentId, authFilePath)
+    }
     return {
       ...defaultLeaseState(machineId, agentId, authFilePath),
       ...stored,

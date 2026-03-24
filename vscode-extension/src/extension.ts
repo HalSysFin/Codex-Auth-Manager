@@ -45,9 +45,26 @@ class AuthManagerController {
     this.statusBar.show()
   }
 
+
+  private machineHostContext(): string | undefined {
+    const authority = vscode.workspace.workspaceFolders?.[0]?.uri.authority?.trim()
+    if (authority) {
+      return authority
+    }
+    const remoteName = vscode.env.remoteName?.trim()
+    if (remoteName) {
+      return remoteName
+    }
+    return undefined
+  }
+
   async activate(): Promise<void> {
     const configuration = vscode.workspace.getConfiguration()
-    const machineId = await this.stateStore.getOrCreateMachineId(configuration.get<string>('authManager.machineId'))
+    const machineId = await this.stateStore.getOrCreateMachineId(
+      configuration.get<string>('authManager.machineId'),
+      vscode.env.machineId,
+      this.machineHostContext(),
+    )
     const agentId = await this.stateStore.getOrCreateAgentId(configuration.get<string>('authManager.agentId'))
     this.state = this.stateStore.load(machineId, agentId, this.authFilePath())
     this.rebuildClient()

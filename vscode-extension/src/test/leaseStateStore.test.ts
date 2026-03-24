@@ -57,3 +57,53 @@ test('LeaseStateStore persists lease metadata', async () => {
   assert.equal(state.authFilePath, '~/.codex/auth.json')
   assert.ok(state.lastBackendRefreshAt)
 })
+
+
+test('derivePersistedMachineId prefers runtime machine fingerprint when config is blank', () => {
+  assert.equal(derivePersistedMachineId('', 'runtime-machine-id'), 'vscode-runtime-machine-id')
+})
+
+test('derivePersistedMachineId includes host context for remote targets', () => {
+  assert.equal(
+    derivePersistedMachineId('', 'runtime-machine-id', 'ssh-remote+server-a'),
+    'vscode-runtime-machine-id-ssh-remote-server-a',
+  )
+})
+
+test('getOrCreateMachineId replaces legacy generated ids with runtime fingerprint ids', async () => {
+  const memento = new MemoryMemento()
+  await memento.update('authManager.machineId', 'vscode-oldhost-1a2b3c4d')
+  const store = new LeaseStateStore(memento)
+  const machineId = await store.getOrCreateMachineId('', 'runtime-machine-id', 'ssh-remote+server-a')
+  assert.equal(machineId, 'vscode-runtime-machine-id-ssh-remote-server-a')
+})
+
+test('getOrCreateMachineId honors configured ids over persisted ids', async () => {
+  const memento = new MemoryMemento()
+  await memento.update('authManager.machineId', 'old-machine')
+  const store = new LeaseStateStore(memento)
+  const machineId = await store.getOrCreateMachineId('new-machine', 'runtime-machine-id', 'ssh-remote+server-a')
+  assert.equal(machineId, 'new-machine')
+})
+
+test('load clears stale lease state when machine id changes', async () => {
+  const store = new LeaseStateStore(new MemoryMemento())
+  await store.save({
+    ...store.load('machine-a', 'agent-a', '~/.codex/auth.json'),
+    leaseId: 'lease-1',
+    leaseState: 'active',
+  })
+  const state = store.load('machine-b', 'agent-a', '~/.codex/auth.json')
+  assert.equal(state.machineId, 'machine-b')
+  assert.equal(state.leaseId, null)
+  assert.equal(state.leaseState, null)
+})
+
+
+test('getOrCreateMachineId changes across remote hosts for the same local client', async () => {
+  const store = new LeaseStateStore(new MemoryMemento())
+  const machineA = await store.getOrCreateMachineId('', 'runtime-machine-id', 'ssh-remote+server-a')
+  const machineB = await store.getOrCreateMachineId('', 'runtime-machine-id', 'ssh-remote+server-b')
+  assert.equal(machineA, 'vscode-runtime-machine-id-ssh-remote-server-a')
+  assert.equal(machineB, 'vscode-runtime-machine-id-ssh-remote-server-b')
+})
