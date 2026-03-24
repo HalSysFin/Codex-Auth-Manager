@@ -1,4 +1,4 @@
-# OpenClaw Auth Manager Plugin
+# Codex Auth Manager Plugin
 
 This package is a plugin-ready TypeScript module for wiring OpenClaw token usage into the existing Auth Manager lease broker.
 
@@ -102,6 +102,35 @@ Authorization: Bearer <AUTH_MANAGER_INTERNAL_API_TOKEN>
 ```
 
 Use `internalApiToken` in plugin code/config and `AUTH_MANAGER_INTERNAL_API_TOKEN` in env-based setups. The older `apiKey` and `AUTH_MANAGER_API_KEY` names are kept only as compatibility fallbacks.
+
+## Required setup values
+
+Before the plugin can acquire a lease, it needs:
+
+- broker address: `baseUrl` or `brokerAddress`
+- API key: `internalApiToken`
+- optional machine name override: `machineId`
+- optional agent name: `agentId`
+
+If `machineId` is omitted, the plugin now defaults it from the host name.
+
+If `agentId` is set to `main`, the plugin sends it to the manager as `openclaw:main` so the lease UI clearly shows that the client is OpenClaw.
+
+Example config:
+
+```json
+{
+  "baseUrl": "https://openauth.plingindigo.org",
+  "internalApiToken": "<INTERNAL_API_TOKEN>",
+  "agentId": "main",
+  "machineId": "debian"
+}
+```
+
+The effective identity sent to the broker for that example is:
+
+- machine: `debian`
+- agent: `openclaw:main`
 
 ## Plugin-Ready Entry Surface
 
@@ -209,3 +238,14 @@ npm run build
 
 - The runtime wiring currently lives in the external OpenClaw clone, not in a published OpenClaw release yet.
 - The plugin intentionally does not invent usage values. If OpenClaw does not expose token counts, nothing should be sent except truthful status/utilization context.
+
+## Duplicate installs and upgrades
+
+This plugin already uses stable identity values for upgrades:
+
+- npm package name: `openclaw-auth-manager-plugin`
+- plugin id: `auth-manager-lease-telemetry`
+
+That means upgrading the same package should replace the existing install rather than create a second logical plugin.
+
+If OpenClaw still shows duplicate copies, the issue is usually stale extension directories. Remove old duplicates from `~/.openclaw/extensions` and keep only one installed copy of `auth-manager-lease-telemetry`.

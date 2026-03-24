@@ -41,7 +41,7 @@ Your plugin package **must** include both:
 ```json
 {
   "id": "auth-manager-lease-telemetry",
-  "name": "Auth Manager Lease Telemetry",
+  "name": "Codex Auth Manager Plugin",
   "description": "Acquire/renew leases, materialize auth, and post telemetry.",
   "configSchema": {
     "type": "object",
@@ -150,8 +150,9 @@ openclaw plugins list
 
 Expected:
 - plugin status `loaded`
+- display name shown as `Codex Auth Manager Plugin`
 - no `missing register/activate export`
-- no `baseUrl is required...`
+- no broker/API-key config errors
 
 Check logs:
 
@@ -208,3 +209,35 @@ And strict mode:
   - fallback URL being used too early or non-HTTPS URL.
 - Plugin loaded but no lease/auth switch
   - lease/auth adapter logic not wired into OpenClaw auth profile activation.
+
+## Required values before first lease
+
+You must provide:
+
+- broker address: `baseUrl` or `brokerAddress`
+- API key: `internalApiToken`
+- optional machine name: `machineId`
+- optional agent name: `agentId`
+
+If you do not set `machineId`, the plugin uses the host name automatically.
+If you set `agentId` to `main`, the manager will show it as `openclaw:main`.
+
+Example:
+
+```json
+{
+  "baseUrl": "https://openauth.plingindigo.org",
+  "internalApiToken": "<INTERNAL_API_TOKEN>",
+  "agentId": "main",
+  "machineId": "debian"
+}
+```
+
+## Upgrade without duplicates
+
+Use the same package name and plugin id when upgrading. This plugin ships as:
+
+- package: `openclaw-auth-manager-plugin`
+- plugin id: `auth-manager-lease-telemetry`
+
+If you see duplicate plugin entries, remove older copies from `~/.openclaw/extensions` before reinstalling.

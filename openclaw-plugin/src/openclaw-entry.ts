@@ -20,8 +20,8 @@ type OpenClawPluginLikeDefinition = {
 export function createAuthManagerOpenClawEntry(): OpenClawPluginLikeDefinition {
   return {
     id: 'auth-manager-lease-telemetry',
-    name: 'Auth Manager Lease Telemetry',
-    description: 'Capture truthful OpenClaw usage and post it to Auth Manager lease telemetry.',
+    name: 'Codex Auth Manager Plugin',
+    description: 'Acquire and manage CAM-backed auth leases, materialize auth, and post truthful OpenClaw telemetry.',
     register(api) {
       let service: ReturnType<typeof createOpenClawLeaseTelemetryService> | null = null
 
@@ -32,6 +32,8 @@ export function createAuthManagerOpenClawEntry(): OpenClawPluginLikeDefinition {
           const errors = validatePluginConfig(config)
           if (errors.length) {
             api.logger?.warn?.(`[openclaw-plugin] disabled: ${errors.join('; ')}`)
+            api.logger?.warn?.('[openclaw-plugin] set the broker address with baseUrl or brokerAddress, set the API key with internalApiToken, and optionally set machineId to override the default host-derived machine name.')
+            api.logger?.warn?.('[openclaw-plugin] example config: {"baseUrl":"https://openauth.plingindigo.org","internalApiToken":"<INTERNAL_API_TOKEN>","agentId":"main","machineId":"debian"}')
             return
           }
           service = createOpenClawLeaseTelemetryService({

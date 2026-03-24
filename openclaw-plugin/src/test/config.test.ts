@@ -31,6 +31,19 @@ test('resolvePluginConfig prefers explicit config and applies defaults', () => {
   assert.equal(config.enabled, true)
 })
 
+test('resolvePluginConfig accepts brokerAddress, derives machineId, and normalizes agentId', () => {
+  const config = resolvePluginConfig({
+    brokerAddress: 'https://openauth.plingindigo.org',
+    internalApiToken: 'secret',
+    agentId: 'main',
+  }, {})
+
+  assert.equal(config.baseUrl, 'https://openauth.plingindigo.org')
+  assert.equal(config.internalApiToken, 'secret')
+  assert.equal(config.agentId, 'openclaw:main')
+  assert.ok(config.machineId.length > 0)
+})
+
 test('resolvePluginConfig falls back to AUTH_MANAGER_INTERNAL_API_TOKEN env', () => {
   const config = resolvePluginConfig(undefined, {
     AUTH_MANAGER_BASE_URL: 'http://127.0.0.1:8080',
@@ -65,8 +78,8 @@ test('validatePluginConfig reports missing required fields', () => {
     enabled: true,
   })
 
-  assert.ok(errors.includes('baseUrl is required'))
-  assert.ok(errors.includes('internalApiToken is required'))
-  assert.ok(errors.includes('machineId is required'))
+  assert.ok(errors.includes('broker address is required (set baseUrl or brokerAddress)'))
+  assert.ok(errors.includes('API key is required (set internalApiToken)'))
+  assert.ok(errors.includes('machineId could not be derived'))
   assert.ok(errors.includes('agentId is required'))
 })

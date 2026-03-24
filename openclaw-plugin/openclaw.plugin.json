@@ -1,15 +1,16 @@
 {
   "id": "auth-manager-lease-telemetry",
-  "name": "Auth Manager Lease Telemetry",
-  "description": "Acquire/renew leases, materialize auth, enforce lease-active auth, and post telemetry.",
+  "name": "Codex Auth Manager Plugin",
+  "description": "Acquire and manage CAM-backed auth leases, materialize auth, enforce lease-active auth, and post truthful telemetry.",
   "configSchema": {
     "type": "object",
     "additionalProperties": true,
     "properties": {
-      "baseUrl": { "type": "string" },
-      "internalApiToken": { "type": "string" },
-      "machineId": { "type": "string" },
-      "agentId": { "type": "string" },
+      "baseUrl": { "type": "string", "description": "CAM broker base URL, e.g. https://openauth.plingindigo.org" },
+      "brokerAddress": { "type": "string", "description": "Alias for baseUrl" },
+      "internalApiToken": { "type": "string", "description": "CAM internal API key" },
+      "machineId": { "type": "string", "description": "Optional custom machine name. Defaults to the host name." },
+      "agentId": { "type": "string", "description": "Optional agent name. Sent as openclaw:<agent>." },
       "leaseId": { "type": ["string", "null"] },
       "authFilePath": { "type": "string" },
       "leaseProfileId": { "type": "string" },

@@ -1,3 +1,4 @@
+import os from 'node:os'
 import type { AuthManagerLeasePluginConfig } from './types.js'
 
 const DEFAULT_FLUSH_INTERVAL_MS = 60_000
@@ -34,19 +35,36 @@ function asBoolean(value: unknown, fallback: boolean): boolean {
   return fallback
 }
 
+function defaultMachineId(): string {
+  const host = asString(os.hostname())
+  return host ?? 'openclaw-host'
+}
+
+function normalizeAgentId(value: string | undefined): string {
+  const agent = value?.trim() || 'openclaw'
+  if (agent === 'openclaw') return 'openclaw'
+  if (agent.startsWith('openclaw:')) return agent
+  return `openclaw:${agent}`
+}
+
 export function resolvePluginConfig(
   rawConfig: Record<string, unknown> | undefined,
   env: NodeJS.ProcessEnv = process.env,
 ): AuthManagerLeasePluginConfig {
-  const baseUrl = asString(rawConfig?.baseUrl) ?? asString(env.AUTH_MANAGER_BASE_URL) ?? ''
+  const baseUrl =
+    asString(rawConfig?.baseUrl) ??
+    asString(rawConfig?.brokerAddress) ??
+    asString(env.AUTH_MANAGER_BASE_URL) ??
+    asString(env.AUTH_MANAGER_BROKER_ADDRESS) ??
+    ''
   const internalApiToken =
     asString(rawConfig?.internalApiToken) ??
     asString(rawConfig?.apiKey) ??
     asString(env.AUTH_MANAGER_INTERNAL_API_TOKEN) ??
     asString(env.AUTH_MANAGER_API_KEY) ??
     ''
-  const machineId = asString(rawConfig?.machineId) ?? asString(env.AUTH_MANAGER_MACHINE_ID) ?? ''
-  const agentId = asString(rawConfig?.agentId) ?? asString(env.AUTH_MANAGER_AGENT_ID) ?? 'openclaw'
+  const machineId = asString(rawConfig?.machineId) ?? asString(env.AUTH_MANAGER_MACHINE_ID) ?? defaultMachineId()
+  const agentId = normalizeAgentId(asString(rawConfig?.agentId) ?? asString(env.AUTH_MANAGER_AGENT_ID) ?? 'openclaw')
   const leaseId = asString(rawConfig?.leaseId) ?? asString(env.AUTH_MANAGER_LEASE_ID)
   const authFilePath = asString(rawConfig?.authFilePath) ?? asString(env.AUTH_MANAGER_AUTH_FILE_PATH) ?? '~/.codex/auth.json'
   const leaseProfileId =
@@ -122,9 +140,9 @@ export function resolvePluginConfig(
 
 export function validatePluginConfig(config: AuthManagerLeasePluginConfig): string[] {
   const errors: string[] = []
-  if (!config.baseUrl) errors.push('baseUrl is required')
-  if (!config.internalApiToken) errors.push('internalApiToken is required')
-  if (!config.machineId) errors.push('machineId is required')
+  if (!config.baseUrl) errors.push('broker address is required (set baseUrl or brokerAddress)')
+  if (!config.internalApiToken) errors.push('API key is required (set internalApiToken)')
+  if (!config.machineId) errors.push('machineId could not be derived')
   if (!config.agentId) errors.push('agentId is required')
   if (!config.leaseProfileId) errors.push('leaseProfileId is required')
   if (config.flushIntervalMs < 1_000) errors.push('flushIntervalMs must be at least 1000')
