@@ -6,7 +6,7 @@
     "type": "object",
     "additionalProperties": true,
     "properties": {
-      "baseUrl": { "type": "string", "description": "CAM broker base URL, e.g. https://openauth.plingindigo.org" },
+      "baseUrl": { "type": "string", "description": "CAM broker base URL, e.g. https://your-auth-manager.example.com" },
       "brokerAddress": { "type": "string", "description": "Alias for baseUrl" },
       "internalApiToken": { "type": "string", "description": "CAM internal API key" },
       "machineId": { "type": "string", "description": "Optional custom machine name. Defaults to the host name." },

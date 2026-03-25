@@ -226,7 +226,7 @@ Example:
 
 ```json
 {
-  "baseUrl": "https://openauth.plingindigo.org",
+  "baseUrl": "http://127.0.0.1:8080",
   "internalApiToken": "<INTERNAL_API_TOKEN>",
   "agentId": "main",
   "machineId": "debian"

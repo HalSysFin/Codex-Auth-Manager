@@ -33,7 +33,7 @@ export function createAuthManagerOpenClawEntry(): OpenClawPluginLikeDefinition {
           if (errors.length) {
             api.logger?.warn?.(`[openclaw-plugin] disabled: ${errors.join('; ')}`)
             api.logger?.warn?.('[openclaw-plugin] set the broker address with baseUrl or brokerAddress, set the API key with internalApiToken, and optionally set machineId to override the default host-derived machine name.')
-            api.logger?.warn?.('[openclaw-plugin] example config: {"baseUrl":"https://openauth.plingindigo.org","internalApiToken":"<INTERNAL_API_TOKEN>","agentId":"main","machineId":"debian"}')
+            api.logger?.warn?.('[openclaw-plugin] example config: {"baseUrl":"https://your-auth-manager.example.com","internalApiToken":"<INTERNAL_API_TOKEN>","agentId":"main","machineId":"debian"}')
             return
           }
           service = createOpenClawLeaseTelemetryService({

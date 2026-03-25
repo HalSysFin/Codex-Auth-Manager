@@ -120,7 +120,7 @@ Example config:
 
 ```json
 {
-  "baseUrl": "https://openauth.plingindigo.org",
+  "baseUrl": "https://your-auth-manager.example.com",
   "internalApiToken": "<INTERNAL_API_TOKEN>",
   "agentId": "main",
   "machineId": "debian"
