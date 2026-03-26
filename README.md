@@ -34,8 +34,6 @@ This repo now contains several clients around the same Auth Manager backend and 
   Tauri desktop app for Linux/Windows that performs the same broker-backed auth lifecycle without depending on VS Code.
 - `headless-client/`
   Linux-friendly non-GUI CLI/agent that can ensure a lease, materialize auth, and run a background lease-maintenance loop.
-- `openclaw-skill/`
-  Operational skill and helper scripts for managing OpenClaw Codex leases, auth materialization, and broker telemetry workflows.
 - `openclaw-plugin/`
   Lightweight TypeScript runtime helper for capturing observed OpenClaw token usage and posting it back to Auth Manager lease telemetry.
 - `packages/lease-runtime/`
@@ -384,15 +382,19 @@ See [headless-client/README.md](/root/auth_manager/headless-client/README.md) fo
 
 ## OpenClaw Integration
 
-OpenClaw support in this repo is split into two parts:
+OpenClaw support in this repo is provided by the standalone plugin:
 
-- [openclaw-skill/SKILL.md](/root/auth_manager/openclaw-skill/SKILL.md)
-  for lease repair, auth materialization, and operational workflows
 - [openclaw-plugin/README.md](/root/auth_manager/openclaw-plugin/README.md)
-  for runtime token-usage capture and lease telemetry posting
 
-The skill is useful when a human or assistant needs to repair or rotate a lease.
-The plugin is useful when OpenClaw itself can observe `prompt_tokens`, `completion_tokens`, or similar usage fields and send them back to Auth Manager.
+The plugin is responsible for:
+
+- acquiring and maintaining the OpenClaw machine lease
+- materializing the active leased auth locally
+- writing OpenClaw-compatible auth files
+- sending lease telemetry back to Auth Manager
+- importing OpenClaw usage export JSON back into the manager
+
+The older `openclaw-skill/` content is no longer the primary documented integration path and should be treated as legacy helper material until it is either removed or rewritten.
 
 ## Notes
 
