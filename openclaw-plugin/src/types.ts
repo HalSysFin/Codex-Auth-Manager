@@ -34,6 +34,7 @@ export type AggregatedTelemetry = {
   lastErrorAt: string | null
   errorRate1h: number | null
   metadata?: Record<string, unknown>
+  rawEvents: Record<string, unknown>[]
 }
 
 export type TelemetryPostBody = {
@@ -71,6 +72,8 @@ export type AuthManagerPluginOptions = {
   rotationPolicy?: 'replacement_required_only' | 'recommended_or_required'
   refreshIntervalMs?: number
   releaseLeaseOnShutdown?: boolean
+  usageExportJsonPath?: string | null
+  usageExportDays?: number
 }
 
 export type AuthManagerLeasePluginConfig = {
@@ -93,6 +96,8 @@ export type AuthManagerLeasePluginConfig = {
   rotationPolicy: 'replacement_required_only' | 'recommended_or_required'
   allowInsecureLocalhost: boolean
   releaseLeaseOnShutdown: boolean
+  usageExportJsonPath: string | null
+  usageExportDays: number
   enabled: boolean
 }
 
@@ -167,6 +172,11 @@ export type AuthPayload = {
   last_refresh?: string
 }
 
+export type OpenClawMaterial = {
+  profile_id?: string | null
+  openclaw_auth_json?: Record<string, unknown> | null
+}
+
 export type MaterializeLeaseResponse = LeaseAcquireResponse & {
   credential_material?: {
     label?: string | null
@@ -175,5 +185,6 @@ export type MaterializeLeaseResponse = LeaseAcquireResponse & {
     name?: string | null
     provider_account_id?: string | null
     auth_json?: AuthPayload | null
+    openclaw?: OpenClawMaterial | null
   } | null
 }

@@ -28,6 +28,8 @@ test('resolvePluginConfig prefers explicit config and applies defaults', () => {
   assert.equal(config.autoRenew, true)
   assert.equal(config.autoRotate, false)
   assert.equal(config.releaseLeaseOnShutdown, false)
+  assert.equal(config.usageExportJsonPath, null)
+  assert.equal(config.usageExportDays, 30)
   assert.equal(config.enabled, true)
 })
 
@@ -75,6 +77,8 @@ test('validatePluginConfig reports missing required fields', () => {
     rotationPolicy: 'replacement_required_only',
     allowInsecureLocalhost: true,
     releaseLeaseOnShutdown: true,
+    usageExportJsonPath: null,
+    usageExportDays: 30,
     enabled: true,
   })
 

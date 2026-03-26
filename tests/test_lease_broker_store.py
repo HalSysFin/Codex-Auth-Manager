@@ -17,6 +17,7 @@ from app.lease_broker_store import (
     release_broker_lease,
     renew_broker_lease,
     rotate_broker_lease,
+    set_broker_credential_assignment_disabled,
     sync_broker_credential,
 )
 
@@ -78,6 +79,24 @@ class LeaseBrokerStoreTests(unittest.TestCase):
 
         self.assertEqual(result["status"], "denied")
         self.assertEqual(result["reason"], "no_eligible_credentials_available")
+
+    def test_admin_disabled_credential_is_not_assigned_until_reenabled(self) -> None:
+        self._sync_credential("cred-a", health_score=95.0, utilization_pct=12.0)
+        self._sync_credential("cred-b", health_score=90.0, utilization_pct=10.0)
+
+        disabled = set_broker_credential_assignment_disabled("cred-a", disabled=True, db_path=self.db_path)
+        self.assertIsNotNone(disabled)
+        self.assertTrue(disabled["admin_assignment_disabled"])
+        self.assertEqual(disabled["state"], "unavailable_for_assignment")
+
+        result = acquire_broker_lease(machine_id="machine-1", agent_id="agent-1", db_path=self.db_path)
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(result["lease"]["credential_id"], "cred-b")
+
+        enabled = set_broker_credential_assignment_disabled("cred-a", disabled=False, db_path=self.db_path)
+        self.assertIsNotNone(enabled)
+        self.assertFalse(enabled["admin_assignment_disabled"])
+        self.assertEqual(enabled["state"], "available")
 
     def test_telemetry_at_100_marks_credential_exhausted(self) -> None:
         self._sync_credential("cred-a")

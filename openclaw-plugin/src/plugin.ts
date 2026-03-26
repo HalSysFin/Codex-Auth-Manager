@@ -9,6 +9,8 @@ import type {
 } from './types.js'
 import { normalizeUsageEvent } from './usage.js'
 
+const MAX_RAW_EVENTS_PER_FLUSH = 50
+
 function mergeMetadata(
   left?: Record<string, unknown>,
   right?: Record<string, unknown>,
@@ -17,7 +19,19 @@ function mergeMetadata(
   return { ...(left ?? {}), ...(right ?? {}) }
 }
 
+function appendRawEventBuffer(
+  current: Record<string, unknown>[],
+  rawEvent: Record<string, unknown>,
+): Record<string, unknown>[] {
+  const next = [...current, rawEvent]
+  return next.length > MAX_RAW_EVENTS_PER_FLUSH ? next.slice(-MAX_RAW_EVENTS_PER_FLUSH) : next
+}
+
 function toTelemetryBody(context: LeaseTelemetryContext, aggregate: AggregatedTelemetry): TelemetryPostBody {
+  const metadata =
+    aggregate.rawEvents.length > 0
+      ? mergeMetadata(aggregate.metadata, { openclaw_usage_events: aggregate.rawEvents })
+      : aggregate.metadata
   const body: TelemetryPostBody = {
     machine_id: context.machineId,
     agent_id: context.agentId,
@@ -33,7 +47,7 @@ function toTelemetryBody(context: LeaseTelemetryContext, aggregate: AggregatedTe
   if (aggregate.requestsCount > 0) body.requests_count = aggregate.requestsCount
   if (aggregate.tokensIn > 0) body.tokens_in = aggregate.tokensIn
   if (aggregate.tokensOut > 0) body.tokens_out = aggregate.tokensOut
-  if (aggregate.metadata) body.metadata = aggregate.metadata
+  if (metadata) body.metadata = metadata
   return body
 }
 
@@ -50,6 +64,7 @@ function emptyAggregate(): AggregatedTelemetry {
     lastErrorAt: null,
     errorRate1h: null,
     metadata: undefined,
+    rawEvents: [],
   }
 }
 
@@ -89,6 +104,11 @@ export class OpenClawAuthManagerPlugin {
 
   observeUsage(raw: UsageShape): NormalizedUsageEvent {
     const normalized = normalizeUsageEvent(raw)
+    const metadata = normalized.metadata ? { ...normalized.metadata } : undefined
+    const rawUsage = metadata?.openclaw_usage_raw
+    if (metadata) {
+      delete metadata.openclaw_usage_raw
+    }
     this.aggregate.requestsCount += normalized.requestsCount ?? 0
     this.aggregate.tokensIn += normalized.tokensIn ?? 0
     this.aggregate.tokensOut += normalized.tokensOut ?? 0
@@ -99,12 +119,19 @@ export class OpenClawAuthManagerPlugin {
     this.aggregate.quotaRemaining = normalized.quotaRemaining ?? this.aggregate.quotaRemaining
     this.aggregate.rateLimitRemaining = normalized.rateLimitRemaining ?? this.aggregate.rateLimitRemaining
     this.aggregate.errorRate1h = normalized.errorRate1h ?? this.aggregate.errorRate1h
-    this.aggregate.metadata = mergeMetadata(this.aggregate.metadata, normalized.metadata)
+    this.aggregate.metadata = mergeMetadata(this.aggregate.metadata, metadata)
+    if (rawUsage && typeof rawUsage === 'object' && !Array.isArray(rawUsage)) {
+      this.aggregate.rawEvents = appendRawEventBuffer(this.aggregate.rawEvents, rawUsage as Record<string, unknown>)
+    }
     return normalized
   }
 
   getPendingTotals(): AggregatedTelemetry {
-    return { ...this.aggregate, metadata: this.aggregate.metadata ? { ...this.aggregate.metadata } : undefined }
+    return {
+      ...this.aggregate,
+      metadata: this.aggregate.metadata ? { ...this.aggregate.metadata } : undefined,
+      rawEvents: this.aggregate.rawEvents.map((event) => ({ ...event })),
+    }
   }
 
   async flushTelemetry(): Promise<unknown> {

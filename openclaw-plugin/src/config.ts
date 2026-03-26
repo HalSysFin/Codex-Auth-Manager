@@ -9,6 +9,7 @@ const DEFAULT_AUTO_RENEW = true
 const DEFAULT_AUTO_ROTATE = false
 const DEFAULT_RELEASE_LEASE_ON_SHUTDOWN = false
 const DEFAULT_LEASE_PROFILE_ID = 'openai-codex:lease'
+const DEFAULT_USAGE_EXPORT_DAYS = 30
 
 function asString(value: unknown): string | undefined {
   if (typeof value !== 'string') return undefined
@@ -112,6 +113,16 @@ export function resolvePluginConfig(
     rawConfig?.releaseLeaseOnShutdown ?? env.AUTH_MANAGER_RELEASE_LEASE_ON_SHUTDOWN,
     DEFAULT_RELEASE_LEASE_ON_SHUTDOWN,
   )
+  const usageExportJsonPath =
+    asString(rawConfig?.usageExportJsonPath) ??
+    asString(rawConfig?.usageJsonPath) ??
+    asString(env.AUTH_MANAGER_USAGE_EXPORT_JSON_PATH) ??
+    asString(env.AUTH_MANAGER_USAGE_JSON_PATH) ??
+    null
+  const usageExportDays = Math.max(
+    1,
+    Math.trunc(asNumber(rawConfig?.usageExportDays ?? env.AUTH_MANAGER_USAGE_EXPORT_DAYS, DEFAULT_USAGE_EXPORT_DAYS)),
+  )
   const enabled = asBoolean(rawConfig?.enabled ?? env.AUTH_MANAGER_TELEMETRY_ENABLED, true)
 
   return {
@@ -134,6 +145,8 @@ export function resolvePluginConfig(
     rotationPolicy,
     allowInsecureLocalhost,
     releaseLeaseOnShutdown,
+    usageExportJsonPath,
+    usageExportDays,
     enabled,
   }
 }

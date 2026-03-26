@@ -82,6 +82,18 @@ type AccountsCachedResponse = {
   aggregate: Aggregate
 }
 
+type AuthExportResponse = {
+  label: string
+  email?: string | null
+  auth_json: unknown
+}
+
+type OpenClawExportData = {
+  label: string
+  profileId: string
+  authJson: string
+}
+
 type LoginStatusResponse = {
   status?: string
   callback_received?: boolean
@@ -328,6 +340,7 @@ type LeaseOverviewResponse = {
     id: string
     label?: string | null
     state?: string | null
+    admin_assignment_disabled?: boolean
     utilization_pct?: number | null
     quota_remaining?: number | null
     weekly_reset_at?: string | null
@@ -443,9 +456,9 @@ const DEFAULT_RUNTIME_SETTINGS: RuntimeSettings = {
   lease_stale_after_seconds: 60,
   lease_reclaim_after_seconds: 180,
   rotation_request_threshold_percent: 90,
-  max_assignable_utilization_percent: 95,
+  max_assignable_utilization_percent: 99,
   exhausted_utilization_percent: 100,
-  min_quota_remaining: 10000,
+  min_quota_remaining: 0,
   weekly_reset_confirmation_required: true,
   rotation_policy_default: 'replacement_required_only',
   rotation_policy_by_agent: {},
@@ -511,6 +524,181 @@ async function copyText(text: string): Promise<boolean> {
     return ok
   } catch {
     return false
+  }
+}
+
+function normalizeNonEmptyString(value: string | null | undefined): string | null {
+  if (typeof value !== 'string') return null
+  const trimmed = value.trim()
+  return trimmed || null
+}
+
+function findNestedString(payload: unknown, keys: string[]): string | null {
+  if (payload && typeof payload === 'object') {
+    if (Array.isArray(payload)) {
+      for (const item of payload) {
+        const found = findNestedString(item, keys)
+        if (found) return found
+      }
+      return null
+    }
+    const record = payload as Record<string, unknown>
+    for (const key of keys) {
+      const value = record[key]
+      if (typeof value === 'string' && value.trim()) {
+        return value.trim()
+      }
+    }
+    for (const value of Object.values(record)) {
+      const found = findNestedString(value, keys)
+      if (found) return found
+    }
+  }
+  return null
+}
+
+function decodeJwtPayload(token: string | null): Record<string, unknown> | null {
+  return decodeJwtSegment(token, 1)
+}
+
+function decodeJwtSegment(token: string | null, index: number): Record<string, unknown> | null {
+  if (!token) return null
+  const parts = token.split('.')
+  if (parts.length <= index) return null
+  try {
+    const base64 = parts[index].replace(/-/g, '+').replace(/_/g, '/')
+    const padded = `${base64}${'='.repeat((4 - (base64.length % 4)) % 4)}`
+    const decoded = atob(padded)
+    const parsed = JSON.parse(decoded)
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? (parsed as Record<string, unknown>) : null
+  } catch {
+    return null
+  }
+}
+
+function extractEmailFromClaims(claims: Record<string, unknown> | null): string | null {
+  if (!claims) return null
+  const direct = normalizeNonEmptyString(typeof claims.email === 'string' ? claims.email : null)
+  if (direct) return direct
+  const profile = claims['https://api.openai.com/profile']
+  if (profile && typeof profile === 'object' && !Array.isArray(profile)) {
+    return normalizeNonEmptyString(typeof (profile as Record<string, unknown>).email === 'string' ? String((profile as Record<string, unknown>).email) : null)
+  }
+  return null
+}
+
+function extractDisplayNameFromClaims(claims: Record<string, unknown> | null): string | null {
+  if (!claims) return null
+  for (const key of ['name', 'display_name', 'preferred_username'] as const) {
+    const value = claims[key]
+    if (typeof value === 'string') {
+      const normalized = normalizeNonEmptyString(value)
+      if (normalized) return normalized
+    }
+  }
+  const profile = claims['https://api.openai.com/profile']
+  if (profile && typeof profile === 'object' && !Array.isArray(profile)) {
+    const record = profile as Record<string, unknown>
+    for (const key of ['name', 'display_name'] as const) {
+      const value = record[key]
+      if (typeof value === 'string') {
+        const normalized = normalizeNonEmptyString(value)
+        if (normalized) return normalized
+      }
+    }
+  }
+  return null
+}
+
+function resolveOpenClawExpiryMs(authJson: unknown): number {
+  const accessToken = findNestedString(authJson, ['access_token', 'accessToken', 'token', 'api_key', 'apiKey'])
+  const idToken = findNestedString(authJson, ['id_token', 'idToken'])
+  for (const token of [accessToken, idToken]) {
+    const claims = decodeJwtPayload(token)
+    const exp = claims?.exp
+    if (typeof exp === 'number' && Number.isFinite(exp) && exp > 0) {
+      return exp > 1_000_000_000_000 ? Math.trunc(exp) : Math.trunc(exp * 1000)
+    }
+  }
+  const fallback = findNestedString(authJson, ['expires_at', 'expiresAt', 'expiry', 'expires'])
+  if (fallback) {
+    const epoch = Number(fallback)
+    if (Number.isFinite(epoch) && epoch > 0) {
+      return epoch > 1_000_000_000_000 ? Math.trunc(epoch) : Math.trunc(epoch * 1000)
+    }
+    const parsed = Date.parse(fallback)
+    if (Number.isFinite(parsed)) return parsed
+  }
+  return Date.now() + 30 * 60 * 1000
+}
+
+function slugifyProfileSuffix(value: string): string {
+  const slug = value
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+  return slug || 'profile'
+}
+
+function defaultOpenClawModelEntries(): Record<string, Record<string, never>> {
+  const models = [
+    'openai-codex/gpt-5.1',
+    'openai-codex/gpt-5.1-codex-mini',
+    'openai-codex/gpt-5.2',
+    'openai-codex/gpt-5.2-codex',
+    'openai-codex/gpt-5.3-codex',
+    'openai-codex/gpt-5.4',
+  ]
+  return Object.fromEntries(models.map((model) => [`agents.defaults.models.${model}`, {}]))
+}
+
+function buildOpenClawExport(data: AuthExportResponse): OpenClawExportData {
+  const access = findNestedString(data.auth_json, ['access_token', 'accessToken', 'token', 'api_key', 'apiKey'])
+  const refresh = findNestedString(data.auth_json, ['refresh_token', 'refreshToken'])
+  const accountId = findNestedString(data.auth_json, ['account_id', 'accountId'])
+  if (!access || !refresh || !accountId) {
+    throw new Error('Exported auth is missing access_token, refresh_token, or account_id')
+  }
+
+  const idClaims = decodeJwtPayload(findNestedString(data.auth_json, ['id_token', 'idToken']))
+  const accessClaims = decodeJwtPayload(access)
+  const accessHeader = decodeJwtSegment(access, 0)
+  const idToken = findNestedString(data.auth_json, ['id_token', 'idToken'])
+  const email = normalizeNonEmptyString(data.email) ?? extractEmailFromClaims(idClaims) ?? extractEmailFromClaims(accessClaims)
+  const displayName = extractDisplayNameFromClaims(idClaims) ?? extractDisplayNameFromClaims(accessClaims)
+  const preferredProfileSource = data.label || email?.split('@')[0] || accountId
+  const profileId = `openai-codex:${slugifyProfileSuffix(preferredProfileSource)}`
+  const authJson = {
+    ...defaultOpenClawModelEntries(),
+    'auth.order.openai-codex': [profileId],
+    [`auth.profiles.${profileId}`]: {
+      provider: 'openai-codex',
+      mode: 'oauth',
+    },
+    openai_cid_tokens: {
+      [profileId]: {
+        access_token: access,
+        refresh_token: refresh,
+        id_token: idToken,
+        expires_at_ms: resolveOpenClawExpiryMs(data.auth_json),
+        accountId,
+        provider: 'openai-codex',
+        type: 'oauth',
+        decoded_access_jwt: {
+          header: accessHeader,
+          payload: accessClaims,
+        },
+        ...(email ? { email } : {}),
+        ...(displayName ? { displayName } : {}),
+      },
+    },
+  }
+
+  return {
+    label: data.label,
+    profileId,
+    authJson: JSON.stringify(authJson, null, 2),
   }
 }
 
@@ -712,6 +900,7 @@ function App() {
   const [history, setHistory] = useState<Array<{ t: number; value: number }>>([])
   const [openMenuFor, setOpenMenuFor] = useState<string | null>(null)
   const [historyModalOpen, setHistoryModalOpen] = useState(false)
+  const [openClawExportData, setOpenClawExportData] = useState<OpenClawExportData | null>(null)
   const [historyLoading, setHistoryLoading] = useState(false)
   const [historyError, setHistoryError] = useState<string | null>(null)
   const [historyData, setHistoryData] = useState<AccountHistoryResponse | null>(null)
@@ -731,6 +920,7 @@ function App() {
   const [machineDetail, setMachineDetail] = useState<MachineLeaseDetailResponse | null>(null)
   const streamRef = useRef<EventSource | null>(null)
   const leaseStreamRef = useRef<EventSource | null>(null)
+  const usageHistoryRequestRef = useRef(0)
   const currentLabelRef = useRef<string | null>(currentLabel)
   const hasActionApiKey = actionApiKey.trim().length > 0
   const sensitiveText = (value: string | null | undefined): string => (privacyMode ? redactText(value) : (value || ''))
@@ -809,6 +999,28 @@ function App() {
     : (statsFallbackMode
         ? weeklyUtilizationSeries
         : (statsChartMode === 'daily' ? statsDaily : statsCumulative))
+  const statsPrimaryValues = statsPrimarySeries.map((d: any) =>
+    Number((d as any).value ?? (d as any).consumed ?? (d as any).cumulative ?? 0),
+  )
+  const intradayDenseMode = selectedRange === '1d' && statsChartMode === 'daily'
+  const statsGraphMin = (() => {
+    if (!statsPrimaryValues.length) return 0
+    if (!intradayDenseMode) return 0
+    const min = Math.min(...statsPrimaryValues)
+    const max = Math.max(...statsPrimaryValues)
+    const range = Math.max(1, max - min)
+    return Math.max(0, min - range * 0.15)
+  })()
+  const statsGraphMax = (() => {
+    if (!statsPrimaryValues.length) return 1
+    const max = Math.max(...statsPrimaryValues)
+    if (!intradayDenseMode) return Math.max(1, max)
+    const min = Math.min(...statsPrimaryValues)
+    const range = Math.max(1, max - min)
+    return Math.max(1, max + range * 0.15)
+  })()
+  const statsGraphRange = Math.max(1, statsGraphMax - statsGraphMin)
+  const showStatsPointMarkers = statsPrimarySeries.length <= (intradayDenseMode ? 24 : 60)
   const statsMaxValue = statsModeledFallback
     ? Math.max(1, ...statsPrimarySeries.map((d: any) => Number((d as any).consumed ?? (d as any).cumulative ?? 0)))
     : (statsFallbackMode
@@ -825,15 +1037,27 @@ function App() {
   const weeklyAtCapCount = weeklyPercents.filter((v) => v >= 100).length
   const chartRangeLabel = rangeLabel(selectedRange, statsRangeMeta)
 
-  const buildLinePath = (values: number[], width = 1000, height = 220, pad = 24) => {
+  const buildLinePath = (
+    values: number[],
+    width = 1000,
+    height = 220,
+    pad = 24,
+    minVal = 0,
+    maxVal?: number,
+  ) => {
     if (!values.length) return ''
-    const maxVal = Math.max(1, ...values)
+    const resolvedMin = Number.isFinite(minVal) ? minVal : 0
+    const resolvedMax = Math.max(
+      resolvedMin + 1,
+      Number.isFinite(maxVal as number) ? Number(maxVal) : Math.max(...values, resolvedMin + 1),
+    )
+    const valueRange = Math.max(1, resolvedMax - resolvedMin)
     const usableW = width - pad * 2
     const usableH = height - pad * 2
     return values
       .map((v, i) => {
         const x = pad + (i / Math.max(values.length - 1, 1)) * usableW
-        const y = height - pad - (v / maxVal) * usableH
+        const y = height - pad - ((v - resolvedMin) / valueRange) * usableH
         return `${i === 0 ? 'M' : 'L'} ${x.toFixed(2)} ${y.toFixed(2)}`
       })
       .join(' ')
@@ -891,7 +1115,6 @@ function App() {
     try {
       setHistoryLoading(true)
       const historyPayload = await requestJson<UsageHistoryResponse>(`/api/usage/history?range=7d`, token)
-      setUsageHistory(historyPayload)
       if (historyPayload.series?.daily_usage?.length) {
         const cutoff = Date.now() - 24 * 60 * 60 * 1000
         const last24h = historyPayload.series.daily_usage
@@ -917,7 +1140,10 @@ function App() {
   }
 
   const loadUsageHistory = async (token: string, range: RangeKey) => {
+    const requestId = usageHistoryRequestRef.current + 1
+    usageHistoryRequestRef.current = requestId
     const data = await requestJson<UsageHistoryResponse>(`/api/usage/history?range=${range}`, token)
+    if (usageHistoryRequestRef.current !== requestId) return
     setUsageHistory(data)
   }
 
@@ -1415,6 +1641,22 @@ function App() {
     if (apiKey.trim()) await loadLeaseOverview(apiKey)
   }
 
+  const adminSetCredentialAssignment = async (credentialId: string, enabled: boolean) => {
+    if (!requireActionApiKey(enabled ? 'enable lease assignment' : 'disable lease assignment')) return
+    const actionLabel = enabled ? 'allow this credential to be leased again' : 'exclude this credential from future lease allocation'
+    if (!window.confirm(`Do you want to ${actionLabel}?`)) return
+    await requestJson(
+      `/api/admin/credentials/${encodeURIComponent(credentialId)}/${enabled ? 'enable-assignment' : 'disable-assignment'}`,
+      actionApiKey,
+      {
+        method: 'POST',
+        body: JSON.stringify({ reason: enabled ? 'admin_assignment_enabled' : 'admin_assignment_disabled' }),
+      },
+    )
+    setStatus(enabled ? `Credential ${credentialId} can be leased again` : `Credential ${credentialId} excluded from new leases`)
+    if (apiKey.trim()) await loadLeaseOverview(apiKey)
+  }
+
   const openMachineDetail = async (machineId: string) => {
     if (!apiKey.trim()) return
     setMachineDetailModalOpen(true)
@@ -1646,6 +1888,18 @@ function App() {
     a.download = `${label}.auth.json`
     a.click()
     URL.revokeObjectURL(url)
+    setOpenMenuFor(null)
+  }
+
+  const openOpenClawExport = async (label: string) => {
+    if (!requireActionApiKey('export')) return
+    const res = await fetch(`/auth/export?label=${encodeURIComponent(label)}`, {
+      credentials: 'include',
+      headers: authHeaders(actionApiKey),
+    })
+    if (!res.ok) throw new Error(await res.text())
+    const data = (await res.json()) as AuthExportResponse
+    setOpenClawExportData(buildOpenClawExport(data))
     setOpenMenuFor(null)
   }
 
@@ -1980,6 +2234,7 @@ function App() {
                           <button className="menu-item" onClick={() => void switchAccount(a.label)} disabled={!hasActionApiKey}>{a.is_current ? 'Switch (Current)' : 'Switch'}</button>
                           <button className="menu-item" onClick={() => void renameAccount(a.label, a.display_label || a.label)} disabled={!hasActionApiKey}>Change profile label</button>
                           <button className="menu-item" onClick={() => void exportAccount(a.label)} disabled={!hasActionApiKey}>Export</button>
+                          <button className="menu-item" onClick={() => void openOpenClawExport(a.label)} disabled={!hasActionApiKey}>Openclaw Export</button>
                           <button className="menu-item danger" onClick={() => void deleteAccount(a.label)} disabled={!hasActionApiKey}>Delete</button>
                         </div>
                       ) : null}
@@ -2079,7 +2334,7 @@ function App() {
                 <span className="legend-dot legend-dot-teal" />
                 {statsModeledFallback
                   ? (selectedRange === '1d' && statsChartMode === 'daily'
-                      ? 'Usage line = 10-minute normalized units reconstructed from utilization snapshots'
+                      ? 'Usage line = normalized units reconstructed from 10-minute utilization buckets'
                       : 'Usage line = normalized units reconstructed from utilization snapshots (100 per account)')
                   : (statsFallbackMode
                       ? 'Usage line = weekly utilization % from stored snapshots (absolute counters unavailable)'
@@ -2096,19 +2351,36 @@ function App() {
                 <svg viewBox="0 0 1000 220" preserveAspectRatio="none">
                   <line x1="24" y1="196" x2="976" y2="196" stroke="#334155" strokeWidth="1" />
                   <path
-                    d={buildLinePath(statsPrimarySeries.map((p: any) => Number(p.value ?? p.cumulative ?? p.consumed ?? 0)))}
+                    d={buildLinePath(
+                      statsPrimaryValues,
+                      1000,
+                      220,
+                      24,
+                      statsGraphMin,
+                      statsGraphMax,
+                    )}
                     fill="none"
                     stroke="#10b981"
                     strokeWidth="3"
                     strokeLinecap="round"
                     strokeLinejoin="round"
                   />
-                  {statsPrimarySeries.map((point: any, i: number) => {
-                    const value = Number(point.value ?? point.cumulative ?? point.consumed ?? 0)
-                    const x = 24 + (i / Math.max(statsPrimarySeries.length - 1, 1)) * (1000 - 48)
-                    const y = 196 - (value / statsMaxValue) * (220 - 48)
-                    return <circle key={`${point.day ?? point.t ?? i}-${value}-${i}`} cx={x} cy={y} r="3" fill="#10b981" />
-                  })}
+                  {showStatsPointMarkers
+                    ? statsPrimarySeries.map((point: any, i: number) => {
+                        const value = Number(point.value ?? point.cumulative ?? point.consumed ?? 0)
+                        const x = 24 + (i / Math.max(statsPrimarySeries.length - 1, 1)) * (1000 - 48)
+                        const y = 196 - ((value - statsGraphMin) / statsGraphRange) * (220 - 48)
+                        return (
+                          <circle
+                            key={`${point.day ?? point.t ?? i}-${value}-${i}`}
+                            cx={x}
+                            cy={y}
+                            r="3"
+                            fill="#10b981"
+                          />
+                        )
+                      })
+                    : null}
                 </svg>
               ) : <div className="muted">No usage history yet for this range.</div>}
             </div>
@@ -2363,6 +2635,7 @@ function App() {
                 </div>
                 <div>
                   <div className="muted mono">{cred.state || '--'}</div>
+                  {cred.admin_assignment_disabled ? <div className="muted mono" style={{ color: 'var(--warn)' }}>excluded from new leases</div> : null}
                 </div>
                 <div>
                   <div className="muted mono">
@@ -2372,6 +2645,13 @@ function App() {
                   <div className="muted mono">telemetry: {fmtTs(cred.last_telemetry_at || null)}</div>
                 </div>
                 <div className="actions-col">
+                  <button
+                    className="btn btn-sm"
+                    onClick={() => void adminSetCredentialAssignment(cred.id, Boolean(cred.admin_assignment_disabled))}
+                    disabled={!hasActionApiKey}
+                  >
+                    {cred.admin_assignment_disabled ? 'Allow Leases' : 'Exclude From Leases'}
+                  </button>
                   <button
                     className="btn btn-sm danger"
                     onClick={() => void adminMarkCredentialExhausted(cred.id)}
@@ -2580,6 +2860,47 @@ function App() {
                 </div>
               </div>
             ) : null}
+          </div>
+        </div>
+      ) : null}
+
+      {openClawExportData ? (
+        <div className="modal-overlay" onClick={() => setOpenClawExportData(null)}>
+          <div className="modal-card" onClick={(e) => e.stopPropagation()}>
+            <div className="modal-head">
+              <h3>OpenClaw Export</h3>
+              <button className="btn btn-sm" onClick={() => setOpenClawExportData(null)}>Close</button>
+            </div>
+            <p className="muted" style={{ marginTop: 0 }}>
+              Merge this into the remote OpenClaw <span className="mono">auth.json</span>. Replace the existing OpenAI Codex auth entries with this profile and keep any unrelated settings you already have.
+            </p>
+            <div className="openclaw-export-meta">
+              <div><span className="muted">Account</span><strong>{sensitiveText(openClawExportData.label)}</strong></div>
+              <div><span className="muted">Profile ID</span><strong className="mono">{openClawExportData.profileId}</strong></div>
+            </div>
+            <div className="openclaw-export-grid">
+              <section className="openclaw-export-block">
+                <div className="modal-head">
+                  <h4>auth.json</h4>
+                  <button
+                    className="btn btn-sm"
+                    onClick={() => {
+                      void copyText(openClawExportData.authJson).then((ok) => {
+                        setStatus(ok ? 'Copied OpenClaw auth.json.' : 'Unable to copy OpenClaw auth.json.')
+                      })
+                    }}
+                  >
+                    Copy JSON
+                  </button>
+                </div>
+                <p className="muted" style={{ marginTop: 0 }}>
+                  Paste this into <span className="mono">~/.openclaw/auth.json</span>. Keep unrelated keys, but replace
+                  <span className="mono"> auth.order.openai-codex</span>, the matching
+                  <span className="mono"> auth.profiles.*</span> entry, and <span className="mono">openai_cid_tokens</span> with this profile.
+                </p>
+                <pre className="openclaw-export-code">{openClawExportData.authJson}</pre>
+              </section>
+            </div>
           </div>
         </div>
       ) : null}

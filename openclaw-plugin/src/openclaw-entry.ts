@@ -9,6 +9,14 @@ type OpenClawPluginLikeDefinition = {
   kind?: string
   register: (api: {
     logger?: Pick<Console, 'info' | 'warn' | 'error'>
+    registerHook?: (
+      events: string | string[],
+      handler: (event: Record<string, unknown>) => void | Promise<void>,
+      options?: {
+        name?: string
+        description?: string
+      },
+    ) => void
     registerService: (service: {
       id: string
       start: (ctx: { config?: Record<string, unknown>; env?: NodeJS.ProcessEnv }) => void | Promise<void>
@@ -52,6 +60,8 @@ export function createAuthManagerOpenClawEntry(): OpenClawPluginLikeDefinition {
             rotationPolicy: config.rotationPolicy,
             refreshIntervalMs: config.refreshIntervalMs,
             releaseLeaseOnShutdown: config.releaseLeaseOnShutdown,
+            usageExportJsonPath: config.usageExportJsonPath,
+            usageExportDays: config.usageExportDays,
             flushIntervalMs: config.flushIntervalMs,
             flushEveryRequests: config.flushEveryRequests,
             context: toLeaseContext(config),
@@ -62,6 +72,7 @@ export function createAuthManagerOpenClawEntry(): OpenClawPluginLikeDefinition {
           if (service) await service.shutdown()
         },
       })
+
     },
   }
 }
@@ -104,6 +115,8 @@ export function buildUsageObserver(service = createOpenClawLeaseTelemetryService
         rotationPolicy: params.config.rotationPolicy,
         refreshIntervalMs: params.config.refreshIntervalMs,
         releaseLeaseOnShutdown: params.config.releaseLeaseOnShutdown,
+        usageExportJsonPath: params.config.usageExportJsonPath,
+        usageExportDays: params.config.usageExportDays,
         flushIntervalMs: params.config.flushIntervalMs,
         flushEveryRequests: params.config.flushEveryRequests,
         context: toLeaseContext(params.config),

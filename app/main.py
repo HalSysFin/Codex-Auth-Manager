@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import hmac
 import ipaddress
 import json
@@ -48,6 +49,7 @@ from .account_usage_store import (
     reconcile_legacy_account_aliases,
     rename_saved_profile,
     rename_account_data,
+    import_openclaw_usage_export,
     record_account_usage,
     record_absolute_usage_snapshot,
     record_percentage_snapshot,
@@ -71,6 +73,7 @@ from .lease_broker_store import (
     list_active_broker_leases_by_credential,
     list_broker_credentials,
     mark_broker_credential_exhausted,
+    set_broker_credential_assignment_disabled,
     materialize_broker_lease,
     record_broker_lease_telemetry,
     reconcile_broker_leases,
@@ -1367,6 +1370,11 @@ async def api_lease_materialize(request: Request, lease_id: str, payload: dict[s
         "name": profile.get("name"),
         "provider_account_id": profile.get("provider_account_id"),
         "auth_json": profile.get("auth_json"),
+        "openclaw": _build_openclaw_material_for_auth(
+            profile.get("auth_json") if isinstance(profile.get("auth_json"), dict) else {},
+            email=profile.get("email") if isinstance(profile.get("email"), str) else None,
+            name=profile.get("name") if isinstance(profile.get("name"), str) else None,
+        ),
     }
     _audit_broker_event(
         "lease_materialized",
@@ -1439,6 +1447,52 @@ async def api_admin_mark_credential_exhausted(
         credential_id=credential_id,
         decision="ok",
         reason=str((payload or {}).get("reason") or "admin_marked_exhausted"),
+    )
+    return JSONResponse({"status": "ok", "credential": result})
+
+
+@app.post("/api/admin/credentials/{credential_id}/disable-assignment")
+async def api_admin_disable_credential_assignment(
+    request: Request,
+    credential_id: str,
+    payload: dict[str, Any] | None = None,
+) -> JSONResponse:
+    _require_internal_auth(request)
+    _sync_broker_credentials_from_profiles()
+    result = set_broker_credential_assignment_disabled(
+        credential_id,
+        disabled=True,
+    )
+    if result is None:
+        raise HTTPException(status_code=404, detail="Credential not found")
+    _audit_broker_event(
+        "credential_assignment_disabled",
+        credential_id=credential_id,
+        decision="ok",
+        reason=str((payload or {}).get("reason") or "admin_assignment_disabled"),
+    )
+    return JSONResponse({"status": "ok", "credential": result})
+
+
+@app.post("/api/admin/credentials/{credential_id}/enable-assignment")
+async def api_admin_enable_credential_assignment(
+    request: Request,
+    credential_id: str,
+    payload: dict[str, Any] | None = None,
+) -> JSONResponse:
+    _require_internal_auth(request)
+    _sync_broker_credentials_from_profiles()
+    result = set_broker_credential_assignment_disabled(
+        credential_id,
+        disabled=False,
+    )
+    if result is None:
+        raise HTTPException(status_code=404, detail="Credential not found")
+    _audit_broker_event(
+        "credential_assignment_enabled",
+        credential_id=credential_id,
+        decision="ok",
+        reason=str((payload or {}).get("reason") or "admin_assignment_enabled"),
     )
     return JSONResponse({"status": "ok", "credential": result})
 
@@ -1572,6 +1626,26 @@ async def api_admin_release_lease(
         reason=result.get("reason") or str((payload or {}).get("reason") or "admin_released_lease"),
     )
     return JSONResponse(result, status_code=status_code)
+
+
+@app.post("/api/openclaw/usage/import")
+async def api_openclaw_usage_import(request: Request, payload: dict[str, Any]) -> JSONResponse:
+    _require_internal_auth(request)
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="payload object is required")
+    export_data = payload.get("export_json")
+    if not isinstance(export_data, dict):
+        export_data = payload if all(key in payload for key in ("totals", "daily")) else None
+    if not isinstance(export_data, dict):
+        raise HTTPException(status_code=400, detail="export_json object is required")
+
+    result = import_openclaw_usage_export(
+        export_data=export_data,
+        machine_id=str(payload.get("machine_id") or "").strip() or None,
+        agent_id=str(payload.get("agent_id") or "").strip() or None,
+        source_name=str(payload.get("source_name") or "").strip() or None,
+    )
+    return JSONResponse(result)
 
 
 @app.post("/api/admin/leases/{lease_id}/rotate")
@@ -2674,8 +2748,10 @@ def _require_internal_auth(request: Request) -> None:
     if _has_valid_internal_api_token(request):
         return
     if request.headers.get("authorization", "").lower().startswith("bearer "):
+        _log_invalid_internal_auth(request, header_type="authorization")
         raise HTTPException(status_code=403, detail="Invalid API key")
     if request.headers.get("x-api-key", "").strip():
+        _log_invalid_internal_auth(request, header_type="x-api-key")
         raise HTTPException(status_code=403, detail="Invalid API key")
 
     raise HTTPException(
@@ -2698,6 +2774,35 @@ def _has_valid_internal_api_token(request: Request) -> bool:
         token = auth_header.split(" ", 1)[1].strip()
         return secrets.compare_digest(token, configured_token)
     return False
+
+
+def _token_fingerprint(value: str) -> str | None:
+    token = (value or "").strip()
+    if not token:
+        return None
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()[:12]
+
+
+def _log_invalid_internal_auth(request: Request, *, header_type: str) -> None:
+    presented = ""
+    if header_type == "authorization":
+        auth_header = request.headers.get("authorization", "")
+        if auth_header.lower().startswith("bearer "):
+            presented = auth_header.split(" ", 1)[1].strip()
+    elif header_type == "x-api-key":
+        presented = request.headers.get("x-api-key", "").strip()
+
+    configured = (settings.internal_api_token or "").strip()
+    logger.warning(
+        "invalid_internal_auth path=%s header_type=%s presented_len=%s presented_fp=%s configured_len=%s configured_fp=%s client=%s",
+        request.url.path,
+        header_type,
+        len(presented) if presented else 0,
+        _token_fingerprint(presented),
+        len(configured) if configured else 0,
+        _token_fingerprint(configured),
+        request.client.host if request.client else None,
+    )
 
 
 def _require_internal_auth_or_query(request: Request) -> None:
@@ -3506,6 +3611,140 @@ def _account_name(account_payload: dict[str, Any] | None, fallback_email: str | 
             if isinstance(value, str) and value.strip():
                 return value.strip()
     return fallback_email
+
+
+def _openclaw_claim_text(claims: dict[str, Any] | None, *keys: str) -> str | None:
+    if not isinstance(claims, dict):
+        return None
+    for key in keys:
+        value = claims.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
+
+
+def _openclaw_extract_email(claims: dict[str, Any] | None) -> str | None:
+    if not isinstance(claims, dict):
+        return None
+    direct = _openclaw_claim_text(claims, "email")
+    if direct:
+        return direct
+    profile = claims.get("https://api.openai.com/profile")
+    if isinstance(profile, dict):
+        return _openclaw_claim_text(profile, "email")
+    return None
+
+
+def _openclaw_extract_display_name(claims: dict[str, Any] | None) -> str | None:
+    if not isinstance(claims, dict):
+        return None
+    direct = _openclaw_claim_text(claims, "name", "display_name", "preferred_username")
+    if direct:
+        return direct
+    profile = claims.get("https://api.openai.com/profile")
+    if isinstance(profile, dict):
+        return _openclaw_claim_text(profile, "name", "display_name")
+    return None
+
+
+def _resolve_openclaw_expiry_ms(auth_json: dict[str, Any]) -> int:
+    for token in (extract_access_token(auth_json), extract_id_token(auth_json)):
+        claims = decode_jwt_claims(token)
+        exp = claims.get("exp") if isinstance(claims, dict) else None
+        if isinstance(exp, (int, float)) and exp > 0:
+            exp_num = int(exp)
+            return exp_num if exp_num > 1_000_000_000_000 else exp_num * 1000
+    return int((datetime.now(timezone.utc) + timedelta(minutes=30)).timestamp() * 1000)
+
+
+def _decode_openclaw_jwt_segment(token: str | None, index: int) -> dict[str, Any] | None:
+    if not isinstance(token, str) or not token.strip():
+        return None
+    parts = token.split(".")
+    if len(parts) <= index:
+        return None
+    payload = parts[index]
+    padding = "=" * ((4 - (len(payload) % 4)) % 4)
+    try:
+        raw = json.loads(
+            base64.urlsafe_b64decode(f"{payload}{padding}".encode("utf-8")).decode("utf-8")
+        )
+    except Exception:
+        return None
+    return raw if isinstance(raw, dict) else None
+
+
+def _default_openclaw_model_entries() -> dict[str, dict[str, Any]]:
+    models = [
+        "openai-codex/gpt-5.1",
+        "openai-codex/gpt-5.1-codex-mini",
+        "openai-codex/gpt-5.2",
+        "openai-codex/gpt-5.2-codex",
+        "openai-codex/gpt-5.3-codex",
+        "openai-codex/gpt-5.4",
+    ]
+    return {f"agents.defaults.models.{model}": {} for model in models}
+
+
+def _build_openclaw_material_for_auth(
+    auth_json: dict[str, Any],
+    *,
+    email: str | None,
+    name: str | None,
+    profile_id: str = "openai-codex:lease",
+) -> dict[str, Any] | None:
+    access_token = extract_access_token(auth_json)
+    refresh_token = None
+    tokens = auth_json.get("tokens")
+    if isinstance(tokens, dict):
+        refresh_raw = tokens.get("refresh_token")
+        if isinstance(refresh_raw, str) and refresh_raw.strip():
+            refresh_token = refresh_raw.strip()
+
+    identity = extract_account_identity(auth_json)
+    account_id = identity.account_id
+    if not account_id and isinstance(tokens, dict):
+        account_raw = tokens.get("account_id")
+        if isinstance(account_raw, str) and account_raw.strip():
+            account_id = account_raw.strip()
+    if not access_token or not refresh_token or not account_id:
+        return None
+
+    id_claims = decode_jwt_claims(extract_id_token(auth_json))
+    access_claims = decode_jwt_claims(access_token)
+    resolved_email = email or _openclaw_extract_email(id_claims) or _openclaw_extract_email(access_claims)
+    resolved_name = name or _openclaw_extract_display_name(id_claims) or _openclaw_extract_display_name(access_claims)
+    id_token = extract_id_token(auth_json)
+    expires_at_ms = _resolve_openclaw_expiry_ms(auth_json)
+    openclaw_auth = {
+        **_default_openclaw_model_entries(),
+        "auth.order.openai-codex": [profile_id],
+        f"auth.profiles.{profile_id}": {
+            "provider": "openai-codex",
+            "mode": "oauth",
+        },
+        "openai_cid_tokens": {
+            profile_id: {
+                "access_token": access_token,
+                "refresh_token": refresh_token,
+                "id_token": id_token,
+                "expires_at_ms": expires_at_ms,
+                "accountId": account_id,
+                "provider": "openai-codex",
+                "type": "oauth",
+                "decoded_access_jwt": {
+                    "header": _decode_openclaw_jwt_segment(access_token, 0),
+                    "payload": access_claims,
+                },
+                **({"email": resolved_email} if resolved_email else {}),
+                **({"displayName": resolved_name} if resolved_name else {}),
+            }
+        },
+    }
+    return {
+        "profile_id": profile_id,
+        "openclaw_auth_json": openclaw_auth,
+    }
 
 
 def _usage_tracking_payload(account_key: str) -> dict[str, Any] | None:

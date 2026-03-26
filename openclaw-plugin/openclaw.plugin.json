@@ -24,7 +24,10 @@
       "rotationPolicy": { "type": "string" },
       "flushIntervalMs": { "type": "number" },
       "flushEveryRequests": { "type": "number" },
-      "releaseLeaseOnShutdown": { "type": "boolean" }
+      "releaseLeaseOnShutdown": { "type": "boolean" },
+      "usageExportJsonPath": { "type": ["string", "null"] },
+      "usageJsonPath": { "type": ["string", "null"] },
+      "usageExportDays": { "type": "number" }
     }
   }
 }

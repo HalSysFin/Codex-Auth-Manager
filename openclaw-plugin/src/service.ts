@@ -1,3 +1,11 @@
+import * as crypto from 'node:crypto'
+import { execFile } from 'node:child_process'
+import type { Dirent } from 'node:fs'
+import * as fs from 'node:fs/promises'
+import * as os from 'node:os'
+import * as path from 'node:path'
+import { promisify } from 'node:util'
+
 import type {
   LeaseAcquireResponse,
   LeaseStatusResponse,
@@ -7,7 +15,9 @@ import type {
 } from './types.js'
 import { OpenClawAuthManagerPlugin } from './plugin.js'
 import { AuthManagerClientError, AuthManagerTelemetryClient } from './client.js'
-import { applyLeaseAuthToOpenClaw, writeAuthFile } from './authFile.js'
+import { applyLeaseAuthToOpenClaw, expandHomePath } from './authFile.js'
+
+const execFileAsync = promisify(execFile)
 
 function countObservedRequests(raw: UsageShape): number {
   const direct = raw.requests_count ?? raw.request_count
@@ -44,6 +54,8 @@ export class OpenClawLeaseTelemetryService {
   private readonly autoRotate: boolean
   private readonly rotationPolicy: 'replacement_required_only' | 'recommended_or_required'
   private readonly releaseLeaseOnShutdown: boolean
+  private readonly usageExportJsonPath: string | null
+  private readonly usageExportDays: number
   private readonly machineId: string
   private readonly agentId: string
   private readonly authFilePath: string
@@ -57,6 +69,8 @@ export class OpenClawLeaseTelemetryService {
   private context: LeaseTelemetryContext | null = null
   private lastKnownLeaseState: string | null = null
   private lastKnownExpiresAt: string | null = null
+  private lastImportedUsageHash: string | null = null
+  private usageImportRunning = false
 
   constructor(options: OpenClawLeaseTelemetryServiceOptions) {
     this.client = new AuthManagerTelemetryClient({
@@ -75,6 +89,8 @@ export class OpenClawLeaseTelemetryService {
     this.autoRotate = options.autoRotate ?? true
     this.rotationPolicy = options.rotationPolicy ?? 'replacement_required_only'
     this.releaseLeaseOnShutdown = options.releaseLeaseOnShutdown ?? true
+    this.usageExportJsonPath = options.usageExportJsonPath ? expandHomePath(options.usageExportJsonPath) : null
+    this.usageExportDays = Math.max(1, Math.trunc(options.usageExportDays ?? 30))
     this.machineId = options.context?.machineId ?? 'openclaw'
     this.agentId = options.context?.agentId ?? 'openclaw'
     this.authFilePath = options.authFilePath ?? '~/.codex/auth.json'
@@ -93,6 +109,7 @@ export class OpenClawLeaseTelemetryService {
       this.logger.info?.('[openclaw-plugin] purgeNonLeaseProfilesOnStart enabled; will enforce lease profile on first materialization')
     }
     await this.ensureLease()
+    await this.importUsageExportIfChanged()
     this.flushTimer = setInterval(() => {
       void this.flushIfNeeded()
     }, this.flushIntervalMs)
@@ -147,7 +164,10 @@ export class OpenClawLeaseTelemetryService {
       pending.lastErrorAt != null ||
       pending.utilizationPct != null ||
       pending.quotaRemaining != null
-    if (!force && !hasAnything) return
+    if (!force && !hasAnything) {
+      await this.importUsageExportIfChanged()
+      return
+    }
     try {
       await this.plugin.flushTelemetry()
       this.observedSinceFlush = 0
@@ -155,6 +175,7 @@ export class OpenClawLeaseTelemetryService {
       const message = error instanceof Error ? error.message : String(error)
       this.logger.warn?.(`[openclaw-plugin] telemetry flush failed: ${message}`)
     }
+    await this.importUsageExportIfChanged()
   }
 
   async flushNow(): Promise<void> {
@@ -228,6 +249,7 @@ export class OpenClawLeaseTelemetryService {
       if (this.shouldRenew(status)) {
         await this.renewLease()
       }
+      await this.importUsageExportIfChanged()
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error)
       this.logger.warn?.(`[openclaw-plugin] lease refresh failed: ${message}`)
@@ -285,17 +307,15 @@ export class OpenClawLeaseTelemetryService {
       agentId: this.agentId,
     })
     const lease = this.consumeLeaseResponse(response, 'lease materialize denied')
-    const authPayload = response.credential_material?.auth_json
-    if (!authPayload) {
-      throw new Error('Lease materialization did not return auth_json')
+    const openClawMaterial = response.credential_material?.openclaw ?? {}
+    if (!openClawMaterial.openclaw_auth_json && !response.credential_material?.auth_json) {
+      throw new Error('Lease materialization did not return OpenClaw auth payloads')
     }
-    await writeAuthFile(this.authFilePath, authPayload)
     await applyLeaseAuthToOpenClaw({
-      payload: authPayload,
+      material: openClawMaterial,
+      authPayload: response.credential_material?.auth_json ?? null,
       leaseProfileId: this.leaseProfileId,
-      expiresAtIso: lease.expires_at,
-      enforceLeaseAsActiveAuth: this.enforceLeaseAsActiveAuth,
-      disallowNonLeaseAuth: this.disallowNonLeaseAuth,
+      agentId: this.agentId,
     })
     this.context = {
       leaseId: lease.id,
@@ -355,6 +375,104 @@ export class OpenClawLeaseTelemetryService {
       return false
     }
     return expiresAt - Date.now() <= 5 * 60 * 1000
+  }
+
+  private async importUsageExportIfChanged(): Promise<void> {
+    if (this.usageImportRunning) {
+      return
+    }
+    try {
+      this.usageImportRunning = true
+      const source = await this.loadUsageExport()
+      if (!source) {
+        return
+      }
+      const raw = JSON.stringify(source.exportJson)
+      const contentHash = crypto.createHash('sha256').update(raw).digest('hex')
+      if (contentHash === this.lastImportedUsageHash) {
+        return
+      }
+      const result = await this.client.importOpenClawUsage({
+        machineId: this.machineId,
+        agentId: this.agentId,
+        sourceName: source.sourceName,
+        exportJson: source.exportJson,
+      })
+      this.lastImportedUsageHash = contentHash
+      this.logger.info?.(
+        `[openclaw-plugin] usage JSON import ${result.imported === false ? 'unchanged' : 'uploaded'} from ${source.sourceName}`,
+      )
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      this.logger.warn?.(`[openclaw-plugin] usage JSON import failed: ${message}`)
+    } finally {
+      this.usageImportRunning = false
+    }
+  }
+
+  private async loadUsageExport(): Promise<{ sourceName: string; exportJson: Record<string, unknown> } | null> {
+    if (this.usageExportJsonPath) {
+      return this.readUsageExportFile(this.usageExportJsonPath)
+    }
+    return this.fetchUsageExportFromOpenClaw()
+  }
+
+  private async readUsageExportFile(
+    resolvedPath: string,
+  ): Promise<{ sourceName: string; exportJson: Record<string, unknown> } | null> {
+    let raw: string
+    try {
+      raw = await fs.readFile(resolvedPath, 'utf8')
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      this.logger.warn?.(`[openclaw-plugin] usage JSON read failed: ${message}`)
+      return null
+    }
+
+    try {
+      const parsed = JSON.parse(raw) as unknown
+      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+        throw new Error('usage JSON must be an object')
+      }
+      return { sourceName: path.basename(resolvedPath), exportJson: parsed as Record<string, unknown> }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      this.logger.warn?.(`[openclaw-plugin] usage JSON parse failed: ${message}`)
+      return null
+    }
+  }
+
+  private async fetchUsageExportFromOpenClaw(): Promise<{ sourceName: string; exportJson: Record<string, unknown> } | null> {
+    try {
+      const { stdout } = await execFileAsync(
+        'openclaw',
+        ['gateway', 'usage-cost', '--json', '--days', String(this.usageExportDays)],
+        {
+          timeout: 20_000,
+          maxBuffer: 2 * 1024 * 1024,
+        },
+      )
+      const trimmed = stdout.trim()
+      if (!trimmed) {
+        return null
+      }
+      const jsonStart = trimmed.indexOf('{')
+      if (jsonStart < 0) {
+        throw new Error('usage-cost produced no JSON object')
+      }
+      const parsed = JSON.parse(trimmed.slice(jsonStart)) as unknown
+      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+        throw new Error('usage-cost JSON must be an object')
+      }
+      return {
+        sourceName: `openclaw-gateway-usage-cost-${this.usageExportDays}d.json`,
+        exportJson: parsed as Record<string, unknown>,
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      this.logger.warn?.(`[openclaw-plugin] usage-cost export failed: ${message}`)
+      return null
+    }
   }
 }
 

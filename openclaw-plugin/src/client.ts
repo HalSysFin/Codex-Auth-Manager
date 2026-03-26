@@ -142,6 +142,23 @@ export class AuthManagerTelemetryClient {
     })
   }
 
+  async importOpenClawUsage(input: {
+    machineId: string
+    agentId: string
+    sourceName?: string
+    exportJson: Record<string, unknown>
+  }): Promise<{ status: string; imported?: boolean }> {
+    return this.request<{ status: string; imported?: boolean }>('/api/openclaw/usage/import', {
+      method: 'POST',
+      body: {
+        machine_id: input.machineId,
+        agent_id: input.agentId,
+        source_name: input.sourceName,
+        export_json: input.exportJson,
+      },
+    })
+  }
+
   private async request<T>(path: string, options: { method: string; body?: unknown }): Promise<T> {
     const headers: Record<string, string> = {
       Accept: 'application/json',
@@ -173,4 +190,3 @@ export class AuthManagerTelemetryClient {
     return data as T
   }
 }
-

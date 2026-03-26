@@ -964,6 +964,46 @@ def mark_broker_credential_exhausted(
         return _decode_credential_row(updated)
 
 
+def set_broker_credential_assignment_disabled(
+    credential_id: str,
+    *,
+    disabled: bool,
+    now: datetime | None = None,
+    db_path: Path | None = None,
+) -> dict[str, Any] | None:
+    now_dt = _as_utc(now)
+    now_iso = _to_iso(now_dt)
+    with _connect(db_path) as conn:
+        _ensure_schema(conn)
+        _ensure_lease_broker_schema(conn)
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute("SELECT * FROM broker_credentials WHERE id = ?", (credential_id,)).fetchone()
+        if row is None:
+            return None
+        credential = _decode_credential_row(dict(row))
+        metadata = credential.get("metadata") if isinstance(credential.get("metadata"), dict) else {}
+        metadata = dict(metadata)
+        if disabled:
+            metadata["admin_assignment_disabled"] = True
+        else:
+            metadata.pop("admin_assignment_disabled", None)
+        conn.execute(
+            "UPDATE broker_credentials SET metadata = ?, updated_at = ? WHERE id = ?",
+            (_json_dump(metadata), now_iso, credential_id),
+        )
+        refreshed = dict(conn.execute("SELECT * FROM broker_credentials WHERE id = ?", (credential_id,)).fetchone())
+        lease_row = conn.execute(
+            f"SELECT 1 FROM broker_leases WHERE credential_id = ? AND state IN ({','.join('?' for _ in ACTIVE_LEASE_STATES)}) LIMIT 1",
+            (credential_id, *ACTIVE_LEASE_STATES),
+        ).fetchone()
+        return _reconcile_credential_row(
+            conn,
+            refreshed,
+            has_active_lease=lease_row is not None,
+            now_dt=now_dt,
+        )
+
+
 def get_broker_lease(
     lease_id: str,
     *,
@@ -1085,6 +1125,8 @@ def is_credential_assignable(
     now: datetime | None = None,
 ) -> tuple[bool, str | None]:
     now_dt = _as_utc(now)
+    if _credential_admin_assignment_disabled(credential):
+        return False, "admin_assignment_disabled"
     state = str(credential.get("state") or "")
     if state in UNASSIGNABLE_CREDENTIAL_STATES:
         return False, f"state:{state}"
@@ -1289,6 +1331,8 @@ def _apply_telemetry_to_credential(
         if utilization is not None and utilization >= _runtime_float("max_assignable_utilization_percent", settings.max_assignable_utilization_percent):
             next_state = "unavailable_for_assignment"
             due_after = due_after or weekly_reset_at
+        else:
+            next_state = "leased"
     elif due_after and weekly_reset_at:
         due_dt = _parse_iso(str(due_after))
         captured_dt = _parse_iso(captured_iso)
@@ -1375,35 +1419,51 @@ def _reconcile_credential_row(
     due_after = credential.get("reset_confirmation_due_after")
     reset_confirmed_at = credential.get("reset_confirmed_at")
     weekly_reset_at = credential.get("weekly_reset_at")
+    admin_assignment_disabled = _credential_admin_assignment_disabled(credential)
     if revoked_at:
         state = "revoked"
     elif cooldown_until and _parse_iso(str(cooldown_until)) > now_dt:
         state = "cooldown"
+    elif admin_assignment_disabled:
+        state = "leased" if has_active_lease else "unavailable_for_assignment"
     elif due_after and _runtime_bool("weekly_reset_confirmation_required", settings.weekly_reset_confirmation_required):
         due_dt = _parse_iso(str(due_after))
         last_telemetry_at = credential.get("last_telemetry_at")
-        if (
-            not reset_confirmed_at
-            and last_telemetry_at
-            and _parse_iso(str(last_telemetry_at)) >= due_dt
-            and (utilization is None or utilization < _runtime_float("max_assignable_utilization_percent", settings.max_assignable_utilization_percent))
-            and (quota is None or quota > _runtime_int("min_quota_remaining", settings.min_quota_remaining))
-        ):
-            reset_confirmed_at = last_telemetry_at
-            conn.execute(
-                "UPDATE broker_credentials SET reset_confirmed_at = ?, updated_at = ? WHERE id = ?",
-                (reset_confirmed_at, now_iso, credential["id"]),
-            )
-        confirmed_ok = bool(reset_confirmed_at and _parse_iso(str(reset_confirmed_at)) >= due_dt)
-        if confirmed_ok and (utilization is None or utilization < _runtime_float("max_assignable_utilization_percent", settings.max_assignable_utilization_percent)) and (
-            quota is None or quota > _runtime_int("min_quota_remaining", settings.min_quota_remaining)
-        ):
-            state = "available"
-            due_after = None
-        elif utilization is not None and utilization >= _runtime_float("exhausted_utilization_percent", settings.exhausted_utilization_percent):
-            state = "exhausted"
+        if due_dt > now_dt:
+            if utilization is not None and utilization >= _runtime_float("exhausted_utilization_percent", settings.exhausted_utilization_percent):
+                state = "exhausted"
+            elif (
+                utilization is not None and utilization >= _runtime_float("max_assignable_utilization_percent", settings.max_assignable_utilization_percent)
+            ) or (
+                quota is not None and quota <= _runtime_int("min_quota_remaining", settings.min_quota_remaining)
+            ):
+                state = "unavailable_for_assignment"
+            else:
+                state = "available"
+                due_after = None
         else:
-            state = "unavailable_for_assignment"
+            if (
+                not reset_confirmed_at
+                and last_telemetry_at
+                and _parse_iso(str(last_telemetry_at)) >= due_dt
+                and (utilization is None or utilization < _runtime_float("max_assignable_utilization_percent", settings.max_assignable_utilization_percent))
+                and (quota is None or quota > _runtime_int("min_quota_remaining", settings.min_quota_remaining))
+            ):
+                reset_confirmed_at = last_telemetry_at
+                conn.execute(
+                    "UPDATE broker_credentials SET reset_confirmed_at = ?, updated_at = ? WHERE id = ?",
+                    (reset_confirmed_at, now_iso, credential["id"]),
+                )
+            confirmed_ok = bool(reset_confirmed_at and _parse_iso(str(reset_confirmed_at)) >= due_dt)
+            if confirmed_ok and (utilization is None or utilization < _runtime_float("max_assignable_utilization_percent", settings.max_assignable_utilization_percent)) and (
+                quota is None or quota > _runtime_int("min_quota_remaining", settings.min_quota_remaining)
+            ):
+                state = "available"
+                due_after = None
+            elif utilization is not None and utilization >= _runtime_float("exhausted_utilization_percent", settings.exhausted_utilization_percent):
+                state = "exhausted"
+            else:
+                state = "unavailable_for_assignment"
     elif utilization is not None and utilization >= _runtime_float("exhausted_utilization_percent", settings.exhausted_utilization_percent):
         state = "exhausted"
         if weekly_reset_at:
@@ -1461,7 +1521,9 @@ def _lease_ttl_seconds(requested_ttl_seconds: int | None) -> int:
 
 
 def _decode_credential_row(row: dict[str, Any]) -> dict[str, Any]:
-    return _decode_json_fields(row, {"metadata"})
+    out = _decode_json_fields(row, {"metadata"})
+    out["admin_assignment_disabled"] = _credential_admin_assignment_disabled(out)
+    return out
 
 
 def _decode_lease_row(row: dict[str, Any]) -> dict[str, Any]:
@@ -1512,6 +1574,13 @@ def _json_dump(value: dict[str, Any] | None) -> str | None:
     if value is None:
         return None
     return json.dumps(value, separators=(",", ":"), sort_keys=True)
+
+
+def _credential_admin_assignment_disabled(credential: dict[str, Any]) -> bool:
+    metadata = credential.get("metadata")
+    if not isinstance(metadata, dict):
+        return False
+    return bool(metadata.get("admin_assignment_disabled"))
 
 
 def _nullable_float(value: Any) -> float | None:

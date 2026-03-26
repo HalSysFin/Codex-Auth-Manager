@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import calendar
+import hashlib
 import json
 import re
 import sqlite3
+from contextlib import suppress
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -1083,9 +1085,9 @@ def runtime_settings_defaults() -> dict[str, Any]:
         "lease_stale_after_seconds": max(int(settings.lease_stale_after_seconds or 60), 15),
         "lease_reclaim_after_seconds": max(int(settings.lease_reclaim_after_seconds or 180), 30),
         "rotation_request_threshold_percent": float(settings.rotation_request_threshold_percent or 90.0),
-        "max_assignable_utilization_percent": float(settings.max_assignable_utilization_percent or 95.0),
+        "max_assignable_utilization_percent": float(settings.max_assignable_utilization_percent or 99.0),
         "exhausted_utilization_percent": float(settings.exhausted_utilization_percent or 100.0),
-        "min_quota_remaining": max(int(settings.min_quota_remaining or 10000), 0),
+        "min_quota_remaining": max(int(settings.min_quota_remaining or 0), 0),
         "weekly_reset_confirmation_required": bool(settings.weekly_reset_confirmation_required),
         "rotation_policy_default": "replacement_required_only",
         "rotation_policy_by_agent": {},
@@ -1199,6 +1201,314 @@ def update_runtime_settings(values: dict[str, Any], db_path: Path | None = None)
         db_path=db_path,
     )
     return normalized
+
+
+def import_openclaw_usage_export(
+    *,
+    export_data: dict[str, Any],
+    machine_id: str | None = None,
+    agent_id: str | None = None,
+    source_name: str | None = None,
+    imported_at: datetime | None = None,
+    db_path: Path | None = None,
+) -> dict[str, Any]:
+    if not isinstance(export_data, dict):
+        raise ValueError("export_data must be an object")
+
+    sessions = export_data.get("sessions")
+    daily = export_data.get("daily")
+    totals = export_data.get("totals")
+    if sessions is None:
+        sessions = []
+    if not isinstance(sessions, list) or not isinstance(daily, list) or not isinstance(totals, dict):
+        raise ValueError("export_data must include daily[] and totals; sessions[] is optional")
+
+    resolved_machine_id = (machine_id or "").strip() or "openclaw"
+    resolved_agent_id = (agent_id or "").strip()
+    if not resolved_agent_id:
+        for row in sessions:
+            if isinstance(row, dict):
+                candidate = str(row.get("agentId") or "").strip()
+                if candidate:
+                    resolved_agent_id = candidate
+                    break
+    resolved_agent_id = resolved_agent_id or "openclaw"
+
+    created_iso = _to_iso(_as_utc(imported_at))
+    export_payload = json.dumps(export_data, sort_keys=True, separators=(",", ":"))
+    import_key = hashlib.sha256(
+        f"{resolved_machine_id}\n{resolved_agent_id}\n{source_name or ''}\n{export_payload}".encode("utf-8")
+    ).hexdigest()
+
+    def _int(value: Any) -> int:
+        if value is None or value == "":
+            return 0
+        if isinstance(value, bool):
+            return int(value)
+        if isinstance(value, (int, float)):
+            return int(value)
+        if isinstance(value, str):
+            with suppress(Exception):
+                return int(float(value.strip()))
+        return 0
+
+    def _float(value: Any) -> float | None:
+        if value is None or value == "":
+            return None
+        if isinstance(value, (int, float)):
+            return float(value)
+        if isinstance(value, str):
+            with suppress(Exception):
+                return float(value.strip())
+        return None
+
+    def _text(value: Any) -> str | None:
+        if value is None:
+            return None
+        text = str(value).strip()
+        return text or None
+
+    daily_rows = [row for row in daily if isinstance(row, dict)]
+    session_rows = [row for row in sessions if isinstance(row, dict)]
+
+    with _connect(db_path) as conn:
+        _ensure_schema(conn)
+        existing = conn.execute(
+            "SELECT import_key FROM openclaw_usage_imports WHERE import_key = ?",
+            (import_key,),
+        ).fetchone()
+        if existing:
+            return {
+                "status": "ok",
+                "imported": False,
+                "import_key": import_key,
+                "machine_id": resolved_machine_id,
+                "agent_id": resolved_agent_id,
+                "daily_rows": 0,
+                "session_rows": 0,
+            }
+
+        is_pg = getattr(conn, "_kind", "sqlite") == "postgres"
+        if is_pg:
+            conn.execute(
+                """
+                INSERT INTO openclaw_usage_imports (
+                    import_key, source_name, machine_id, agent_id, totals_json, created_at
+                ) VALUES (%s, %s, %s, %s, %s::jsonb, %s)
+                """,
+                (import_key, source_name, resolved_machine_id, resolved_agent_id, json.dumps(totals), created_iso),
+            )
+        else:
+            conn.execute(
+                """
+                INSERT INTO openclaw_usage_imports (
+                    import_key, source_name, machine_id, agent_id, totals_json, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (import_key, source_name, resolved_machine_id, resolved_agent_id, json.dumps(totals), created_iso),
+            )
+
+        daily_upserts = 0
+        for row in daily_rows:
+            usage_date = _text(row.get("date"))
+            if not usage_date:
+                continue
+            raw_json = json.dumps(row, sort_keys=True)
+            params = (
+                resolved_machine_id,
+                resolved_agent_id,
+                usage_date,
+                _int(row.get("input") or row.get("inputTokens")),
+                _int(row.get("output") or row.get("outputTokens")),
+                _int(row.get("cacheRead") or row.get("cacheReadTokens")),
+                _int(row.get("cacheWrite") or row.get("cacheWriteTokens")),
+                _int(row.get("totalTokens")),
+                _float(row.get("inputCost")),
+                _float(row.get("outputCost")),
+                _float(row.get("cacheReadCost")),
+                _float(row.get("cacheWriteCost")),
+                _float(row.get("totalCost")),
+                _int(row.get("missingCostEntries")),
+                raw_json,
+                created_iso,
+            )
+            if is_pg:
+                conn.execute(
+                    """
+                    INSERT INTO openclaw_daily_usage (
+                        machine_id, agent_id, usage_date,
+                        input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, total_tokens,
+                        input_cost, output_cost, cache_read_cost, cache_write_cost, total_cost, missing_cost_entries,
+                        raw_json, updated_at
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s)
+                    ON CONFLICT (machine_id, agent_id, usage_date) DO UPDATE
+                    SET input_tokens = EXCLUDED.input_tokens,
+                        output_tokens = EXCLUDED.output_tokens,
+                        cache_read_tokens = EXCLUDED.cache_read_tokens,
+                        cache_write_tokens = EXCLUDED.cache_write_tokens,
+                        total_tokens = EXCLUDED.total_tokens,
+                        input_cost = EXCLUDED.input_cost,
+                        output_cost = EXCLUDED.output_cost,
+                        cache_read_cost = EXCLUDED.cache_read_cost,
+                        cache_write_cost = EXCLUDED.cache_write_cost,
+                        total_cost = EXCLUDED.total_cost,
+                        missing_cost_entries = EXCLUDED.missing_cost_entries,
+                        raw_json = EXCLUDED.raw_json,
+                        updated_at = EXCLUDED.updated_at
+                    """,
+                    params,
+                )
+            else:
+                conn.execute(
+                    """
+                    INSERT INTO openclaw_daily_usage (
+                        machine_id, agent_id, usage_date,
+                        input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, total_tokens,
+                        input_cost, output_cost, cache_read_cost, cache_write_cost, total_cost, missing_cost_entries,
+                        raw_json, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(machine_id, agent_id, usage_date) DO UPDATE SET
+                        input_tokens = excluded.input_tokens,
+                        output_tokens = excluded.output_tokens,
+                        cache_read_tokens = excluded.cache_read_tokens,
+                        cache_write_tokens = excluded.cache_write_tokens,
+                        total_tokens = excluded.total_tokens,
+                        input_cost = excluded.input_cost,
+                        output_cost = excluded.output_cost,
+                        cache_read_cost = excluded.cache_read_cost,
+                        cache_write_cost = excluded.cache_write_cost,
+                        total_cost = excluded.total_cost,
+                        missing_cost_entries = excluded.missing_cost_entries,
+                        raw_json = excluded.raw_json,
+                        updated_at = excluded.updated_at
+                    """,
+                    params,
+                )
+            daily_upserts += 1
+
+        session_upserts = 0
+        for row in session_rows:
+            session_key = _text(row.get("key"))
+            updated_at_value = row.get("updatedAt")
+            if not session_key or updated_at_value in (None, ""):
+                continue
+            updated_dt = None
+            if isinstance(updated_at_value, (int, float)):
+                updated_dt = datetime.fromtimestamp(float(updated_at_value) / 1000.0, tz=timezone.utc)
+            elif isinstance(updated_at_value, str):
+                with suppress(Exception):
+                    updated_dt = datetime.fromtimestamp(float(updated_at_value.strip()) / 1000.0, tz=timezone.utc)
+            if updated_dt is None:
+                continue
+            session_agent_id = _text(row.get("agentId")) or resolved_agent_id
+            usage = row.get("usage") if isinstance(row.get("usage"), dict) else {}
+            message_counts = usage.get("messageCounts") if isinstance(usage.get("messageCounts"), dict) else {}
+            tool_usage = usage.get("toolUsage") if isinstance(usage.get("toolUsage"), dict) else {}
+            raw_json = json.dumps(row, sort_keys=True)
+            params = (
+                resolved_machine_id,
+                session_agent_id,
+                session_key,
+                _text(row.get("sessionId")),
+                _text(row.get("label")),
+                _text(row.get("channel")),
+                _text(row.get("chatType")),
+                _text(row.get("modelProvider")),
+                _text(row.get("model")),
+                _to_iso(updated_dt),
+                _int((usage or {}).get("durationMs") or row.get("durationMs")),
+                _int((message_counts or {}).get("total") or row.get("messages")),
+                _int((message_counts or {}).get("errors") or row.get("errors")),
+                _int((tool_usage or {}).get("totalCalls") or row.get("toolCalls")),
+                _int((usage or {}).get("inputTokens") or row.get("inputTokens")),
+                _int((usage or {}).get("outputTokens") or row.get("outputTokens")),
+                _int((usage or {}).get("cacheReadTokens") or row.get("cacheReadTokens")),
+                _int((usage or {}).get("cacheWriteTokens") or row.get("cacheWriteTokens")),
+                _int((usage or {}).get("totalTokens") or row.get("totalTokens")),
+                _float((usage or {}).get("totalCost") or row.get("totalCost")),
+                raw_json,
+            )
+            if is_pg:
+                conn.execute(
+                    """
+                    INSERT INTO openclaw_session_usage (
+                        machine_id, agent_id, session_key, session_id, label, channel, chat_type,
+                        model_provider, model, updated_at, duration_ms, messages, errors, tool_calls,
+                        input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, total_tokens,
+                        total_cost, raw_json
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb)
+                    ON CONFLICT (machine_id, agent_id, session_key) DO UPDATE
+                    SET session_id = EXCLUDED.session_id,
+                        label = EXCLUDED.label,
+                        channel = EXCLUDED.channel,
+                        chat_type = EXCLUDED.chat_type,
+                        model_provider = EXCLUDED.model_provider,
+                        model = EXCLUDED.model,
+                        updated_at = EXCLUDED.updated_at,
+                        duration_ms = EXCLUDED.duration_ms,
+                        messages = EXCLUDED.messages,
+                        errors = EXCLUDED.errors,
+                        tool_calls = EXCLUDED.tool_calls,
+                        input_tokens = EXCLUDED.input_tokens,
+                        output_tokens = EXCLUDED.output_tokens,
+                        cache_read_tokens = EXCLUDED.cache_read_tokens,
+                        cache_write_tokens = EXCLUDED.cache_write_tokens,
+                        total_tokens = EXCLUDED.total_tokens,
+                        total_cost = EXCLUDED.total_cost,
+                        raw_json = EXCLUDED.raw_json
+                    """,
+                    params,
+                )
+            else:
+                conn.execute(
+                    """
+                    INSERT INTO openclaw_session_usage (
+                        machine_id, agent_id, session_key, session_id, label, channel, chat_type,
+                        model_provider, model, updated_at, duration_ms, messages, errors, tool_calls,
+                        input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, total_tokens,
+                        total_cost, raw_json
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(machine_id, agent_id, session_key) DO UPDATE SET
+                        session_id = excluded.session_id,
+                        label = excluded.label,
+                        channel = excluded.channel,
+                        chat_type = excluded.chat_type,
+                        model_provider = excluded.model_provider,
+                        model = excluded.model,
+                        updated_at = excluded.updated_at,
+                        duration_ms = excluded.duration_ms,
+                        messages = excluded.messages,
+                        errors = excluded.errors,
+                        tool_calls = excluded.tool_calls,
+                        input_tokens = excluded.input_tokens,
+                        output_tokens = excluded.output_tokens,
+                        cache_read_tokens = excluded.cache_read_tokens,
+                        cache_write_tokens = excluded.cache_write_tokens,
+                        total_tokens = excluded.total_tokens,
+                        total_cost = excluded.total_cost,
+                        raw_json = excluded.raw_json
+                    """,
+                    params,
+                )
+            session_upserts += 1
+
+    return {
+        "status": "ok",
+        "imported": True,
+        "import_key": import_key,
+        "machine_id": resolved_machine_id,
+        "agent_id": resolved_agent_id,
+        "daily_rows": daily_upserts,
+        "session_rows": session_upserts,
+        "totals": {
+            "input": _int(totals.get("input")),
+            "output": _int(totals.get("output")),
+            "cacheRead": _int(totals.get("cacheRead")),
+            "cacheWrite": _int(totals.get("cacheWrite")),
+            "totalTokens": _int(totals.get("totalTokens")),
+            "totalCost": _float(totals.get("totalCost")),
+        },
+    }
 
 
 def migrate_legacy_local_state(
@@ -1446,11 +1756,18 @@ def _refresh_account_window_if_needed_locked(
     if sec_resets_at_str:
         sec_resets_at = _parse_iso(str(sec_resets_at_str))
         if now_dt >= sec_resets_at:
-            # record wastage based on secondary_used_percent (representing the weekly quota bucket)
-            sec_used = float(secondary_pct) if secondary_pct is not None else 0.0
-            sec_wasted = max(100.0 - sec_used, 0.0)
-            
-            # Record the rollover event for the weekly boundary
+            # Weekly rollover semantics are percentage-based:
+            # usage_used = weekly utilization %, usage_wasted = unused weekly %.
+            if secondary_pct is not None:
+                sec_used_pct = max(0.0, min(100.0, float(secondary_pct)))
+            elif usage_limit > 0:
+                sec_used_pct = max(0.0, min(100.0, (usage_in_window / usage_limit) * 100.0))
+            else:
+                sec_used_pct = 0.0
+            sec_wasted_pct = max(0.0, 100.0 - sec_used_pct)
+            weekly_window_start_iso = _to_iso(sec_resets_at - timedelta(days=7))
+            weekly_window_end_iso = _to_iso(sec_resets_at)
+
             conn.execute(
                 """
                 INSERT OR IGNORE INTO usage_rollovers (
@@ -1460,19 +1777,17 @@ def _refresh_account_window_if_needed_locked(
                 """,
                 (
                     account_id, 
-                    sec_resets_at_str, # Using reset time as start point for the NEXT or identifier
-                    sec_resets_at_str, # ended at the reset mark
-                    100, 
-                    sec_used, 
-                    sec_wasted,
+                    weekly_window_start_iso,
+                    weekly_window_end_iso,
+                    100,
+                    int(round(sec_used_pct)),
+                    int(round(sec_wasted_pct)),
                     primary_pct, 
-                    secondary_pct, 
+                    sec_used_pct,
                     now_iso, 
                     'weekly'
                 ),
             )
-            # Note: Weekly reset cycle management is typically handled by sync, 
-            # but we record the 'wasted' artifact here when time passes the boundary.
 
     if changed:
         conn.execute(
@@ -1637,6 +1952,75 @@ def _ensure_schema_postgres(conn: Any) -> None:
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_usage_absolute_snapshots_captured ON usage_absolute_snapshots(captured_at)"
     )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS openclaw_usage_imports (
+            import_key TEXT PRIMARY KEY,
+            source_name TEXT NULL,
+            machine_id TEXT NOT NULL,
+            agent_id TEXT NOT NULL,
+            totals_json JSONB NOT NULL,
+            created_at TEXT NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS openclaw_daily_usage (
+            machine_id TEXT NOT NULL,
+            agent_id TEXT NOT NULL,
+            usage_date TEXT NOT NULL,
+            input_tokens BIGINT NOT NULL DEFAULT 0,
+            output_tokens BIGINT NOT NULL DEFAULT 0,
+            cache_read_tokens BIGINT NOT NULL DEFAULT 0,
+            cache_write_tokens BIGINT NOT NULL DEFAULT 0,
+            total_tokens BIGINT NOT NULL DEFAULT 0,
+            input_cost DOUBLE PRECISION NULL,
+            output_cost DOUBLE PRECISION NULL,
+            cache_read_cost DOUBLE PRECISION NULL,
+            cache_write_cost DOUBLE PRECISION NULL,
+            total_cost DOUBLE PRECISION NULL,
+            missing_cost_entries BIGINT NULL,
+            raw_json JSONB NOT NULL,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY (machine_id, agent_id, usage_date)
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS openclaw_session_usage (
+            machine_id TEXT NOT NULL,
+            agent_id TEXT NOT NULL,
+            session_key TEXT NOT NULL,
+            session_id TEXT NULL,
+            label TEXT NULL,
+            channel TEXT NULL,
+            chat_type TEXT NULL,
+            model_provider TEXT NULL,
+            model TEXT NULL,
+            updated_at TEXT NOT NULL,
+            duration_ms BIGINT NULL,
+            messages BIGINT NULL,
+            errors BIGINT NULL,
+            tool_calls BIGINT NULL,
+            input_tokens BIGINT NOT NULL DEFAULT 0,
+            output_tokens BIGINT NOT NULL DEFAULT 0,
+            cache_read_tokens BIGINT NOT NULL DEFAULT 0,
+            cache_write_tokens BIGINT NOT NULL DEFAULT 0,
+            total_tokens BIGINT NOT NULL DEFAULT 0,
+            total_cost DOUBLE PRECISION NULL,
+            raw_json JSONB NOT NULL,
+            PRIMARY KEY (machine_id, agent_id, session_key)
+        )
+        """
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_openclaw_daily_usage_date ON openclaw_daily_usage(usage_date)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_openclaw_session_usage_updated_at ON openclaw_session_usage(updated_at)"
+    )
 
     conn.execute("ALTER TABLE accounts ADD COLUMN IF NOT EXISTS provider_account_id TEXT NULL")
     conn.execute("ALTER TABLE accounts ADD COLUMN IF NOT EXISTS name TEXT NULL")
@@ -1794,6 +2178,71 @@ def _ensure_schema_sqlite(conn: Any) -> None:
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_usage_absolute_snapshots_captured ON usage_absolute_snapshots(captured_at)"
     )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS openclaw_usage_imports (
+            import_key TEXT PRIMARY KEY,
+            source_name TEXT NULL,
+            machine_id TEXT NOT NULL,
+            agent_id TEXT NOT NULL,
+            totals_json TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS openclaw_daily_usage (
+            machine_id TEXT NOT NULL,
+            agent_id TEXT NOT NULL,
+            usage_date TEXT NOT NULL,
+            input_tokens INTEGER NOT NULL DEFAULT 0,
+            output_tokens INTEGER NOT NULL DEFAULT 0,
+            cache_read_tokens INTEGER NOT NULL DEFAULT 0,
+            cache_write_tokens INTEGER NOT NULL DEFAULT 0,
+            total_tokens INTEGER NOT NULL DEFAULT 0,
+            input_cost REAL NULL,
+            output_cost REAL NULL,
+            cache_read_cost REAL NULL,
+            cache_write_cost REAL NULL,
+            total_cost REAL NULL,
+            missing_cost_entries INTEGER NULL,
+            raw_json TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY (machine_id, agent_id, usage_date)
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS openclaw_session_usage (
+            machine_id TEXT NOT NULL,
+            agent_id TEXT NOT NULL,
+            session_key TEXT NOT NULL,
+            session_id TEXT NULL,
+            label TEXT NULL,
+            channel TEXT NULL,
+            chat_type TEXT NULL,
+            model_provider TEXT NULL,
+            model TEXT NULL,
+            updated_at TEXT NOT NULL,
+            duration_ms INTEGER NULL,
+            messages INTEGER NULL,
+            errors INTEGER NULL,
+            tool_calls INTEGER NULL,
+            input_tokens INTEGER NOT NULL DEFAULT 0,
+            output_tokens INTEGER NOT NULL DEFAULT 0,
+            cache_read_tokens INTEGER NOT NULL DEFAULT 0,
+            cache_write_tokens INTEGER NOT NULL DEFAULT 0,
+            total_tokens INTEGER NOT NULL DEFAULT 0,
+            total_cost REAL NULL,
+            raw_json TEXT NOT NULL,
+            PRIMARY KEY (machine_id, agent_id, session_key)
+        )
+        """
+    )
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_openclaw_daily_usage_date ON openclaw_daily_usage(usage_date)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_openclaw_session_usage_updated_at ON openclaw_session_usage(updated_at)")
 
     conn.execute(
         """

@@ -197,6 +197,15 @@ class CachedAccountsApiTests(unittest.TestCase):
         self.assertEqual(payload['status'], 'ok')
         self.assertEqual(payload['credential_material']['label'], 'max')
         self.assertEqual(payload['credential_material']['auth_json']['tokens']['account_id'], 'acct-max')
+        self.assertEqual(payload['credential_material']['openclaw']['profile_id'], 'openai-codex:lease')
+        self.assertEqual(
+            payload['credential_material']['openclaw']['openclaw_auth_json']['openai_cid_tokens']['openai-codex:lease']['accountId'],
+            'acct-max',
+        )
+        self.assertEqual(
+            payload['credential_material']['openclaw']['openclaw_auth_json']['auth.profiles.openai-codex:lease']['mode'],
+            'oauth',
+        )
 
     def test_lease_telemetry_returns_updated_latest_summary(self) -> None:
         with (

@@ -34,24 +34,32 @@ function safeObject(value: unknown): Record<string, unknown> {
   return value && typeof value === 'object' && !Array.isArray(value) ? (value as Record<string, unknown>) : {}
 }
 
+function cloneJsonSafe(value: unknown): unknown {
+  try {
+    return JSON.parse(JSON.stringify(value))
+  } catch {
+    return undefined
+  }
+}
+
 export function normalizeUsageEvent(raw: UsageShape): NormalizedUsageEvent {
   const usage = safeObject(raw.usage)
   const metrics = safeObject(raw.metrics)
 
   let tokensIn =
-    toInt(firstPresent(raw, ['tokens_in', 'prompt_tokens', 'input_tokens'])) ??
-    toInt(firstPresent(usage, ['prompt_tokens', 'input_tokens'])) ??
-    toInt(firstPresent(metrics, ['prompt_tokens', 'input_tokens']))
+    toInt(firstPresent(raw, ['tokens_in', 'prompt_tokens', 'input_tokens', 'input'])) ??
+    toInt(firstPresent(usage, ['prompt_tokens', 'input_tokens', 'input'])) ??
+    toInt(firstPresent(metrics, ['prompt_tokens', 'input_tokens', 'input']))
 
   let tokensOut =
-    toInt(firstPresent(raw, ['tokens_out', 'completion_tokens', 'output_tokens'])) ??
-    toInt(firstPresent(usage, ['completion_tokens', 'output_tokens'])) ??
-    toInt(firstPresent(metrics, ['completion_tokens', 'output_tokens']))
+    toInt(firstPresent(raw, ['tokens_out', 'completion_tokens', 'output_tokens', 'output'])) ??
+    toInt(firstPresent(usage, ['completion_tokens', 'output_tokens', 'output'])) ??
+    toInt(firstPresent(metrics, ['completion_tokens', 'output_tokens', 'output']))
 
   const totalTokens =
-    toInt(firstPresent(raw, ['total_tokens'])) ??
-    toInt(firstPresent(usage, ['total_tokens'])) ??
-    toInt(firstPresent(metrics, ['total_tokens']))
+    toInt(firstPresent(raw, ['total_tokens', 'total'])) ??
+    toInt(firstPresent(usage, ['total_tokens', 'total'])) ??
+    toInt(firstPresent(metrics, ['total_tokens', 'total']))
 
   if (tokensIn == null && totalTokens != null && tokensOut != null) {
     tokensIn = Math.max(totalTokens - tokensOut, 0)
@@ -74,6 +82,8 @@ export function normalizeUsageEvent(raw: UsageShape): NormalizedUsageEvent {
   if (typeof source === 'string' && source.trim()) metadata.source = source.trim()
   if (totalTokens != null) metadata.total_tokens = totalTokens
   if (Object.keys(usage).length) metadata.usage_keys = Object.keys(usage).sort()
+  const clonedRaw = cloneJsonSafe(raw)
+  if (clonedRaw && typeof clonedRaw === 'object') metadata.openclaw_usage_raw = clonedRaw as Record<string, unknown>
 
   return {
     requestsCount,
