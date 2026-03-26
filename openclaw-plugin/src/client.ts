@@ -145,6 +145,8 @@ export class AuthManagerTelemetryClient {
   async importOpenClawUsage(input: {
     machineId: string
     agentId: string
+    leaseId?: string | null
+    credentialId?: string | null
     sourceName?: string
     exportJson: Record<string, unknown>
   }): Promise<{ status: string; imported?: boolean }> {
@@ -153,6 +155,8 @@ export class AuthManagerTelemetryClient {
       body: {
         machine_id: input.machineId,
         agent_id: input.agentId,
+        lease_id: input.leaseId,
+        credential_id: input.credentialId,
         source_name: input.sourceName,
         export_json: input.exportJson,
       },

@@ -575,6 +575,8 @@ test('service uploads usage JSON only when the file content changes', async () =
     assert.equal(importBodies.length, 1)
     assert.equal(importBodies[0].machine_id, 'machine-a')
     assert.equal(importBodies[0].agent_id, 'openclaw:main')
+    assert.equal(importBodies[0].lease_id, 'lease_1')
+    assert.equal(importBodies[0].credential_id, 'cred_1')
     assert.equal(importBodies[0].source_name, 'usage.json')
 
     await new Promise((resolve) => setTimeout(resolve, 50))

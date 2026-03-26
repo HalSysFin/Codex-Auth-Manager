@@ -69,6 +69,7 @@ export class OpenClawLeaseTelemetryService {
   private context: LeaseTelemetryContext | null = null
   private lastKnownLeaseState: string | null = null
   private lastKnownExpiresAt: string | null = null
+  private currentCredentialId: string | null = null
   private lastImportedUsageHash: string | null = null
   private usageImportRunning = false
 
@@ -138,6 +139,7 @@ export class OpenClawLeaseTelemetryService {
 
   clearLeaseContext(): void {
     this.context = null
+    this.currentCredentialId = null
     this.plugin.clearLeaseContext()
     this.observedSinceFlush = 0
   }
@@ -334,12 +336,14 @@ export class OpenClawLeaseTelemetryService {
     }
     this.lastKnownLeaseState = response.lease.state
     this.lastKnownExpiresAt = response.lease.expires_at
+    this.currentCredentialId = response.lease.credential_id || null
     return response.lease
   }
 
   private captureLeaseStatus(status: LeaseStatusResponse): void {
     this.lastKnownLeaseState = status.state
     this.lastKnownExpiresAt = status.expires_at
+    this.currentCredentialId = status.credential_id || null
     if (this.context) {
       this.context = {
         ...this.context,
@@ -395,6 +399,8 @@ export class OpenClawLeaseTelemetryService {
       const result = await this.client.importOpenClawUsage({
         machineId: this.machineId,
         agentId: this.agentId,
+        leaseId: this.context?.leaseId ?? null,
+        credentialId: this.currentCredentialId,
         sourceName: source.sourceName,
         exportJson: source.exportJson,
       })

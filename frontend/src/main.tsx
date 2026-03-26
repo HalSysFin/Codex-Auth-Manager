@@ -288,6 +288,42 @@ type UsageHistoryResponse = {
   }
 }
 
+type OpenClawCredentialUsageResponse = {
+  range: RangeKey
+  range_metadata?: {
+    label?: string
+    window_label?: string
+    timezone?: string
+    boundary_mode?: string
+  }
+  totals: {
+    input_tokens: number
+    output_tokens: number
+    cache_read_tokens: number
+    cache_write_tokens: number
+    total_tokens: number
+    total_cost: number
+    credential_count: number
+  }
+  rows: Array<{
+    credential_id: string
+    lease_id?: string | null
+    label: string
+    display_label?: string | null
+    email?: string | null
+    input_tokens: number
+    output_tokens: number
+    cache_read_tokens: number
+    cache_write_tokens: number
+    total_tokens: number
+    total_cost?: number | null
+    day_count: number
+    machine_count: number
+    agent_count: number
+    last_updated_at?: string | null
+  }>
+}
+
 type SessionStatus = {
   web_login_enabled: boolean
   session_valid: boolean
@@ -905,6 +941,7 @@ function App() {
   const [historyError, setHistoryError] = useState<string | null>(null)
   const [historyData, setHistoryData] = useState<AccountHistoryResponse | null>(null)
   const [usageHistory, setUsageHistory] = useState<UsageHistoryResponse | null>(null)
+  const [openClawCredentialUsage, setOpenClawCredentialUsage] = useState<OpenClawCredentialUsageResponse | null>(null)
   const [accountSort, setAccountSort] = useState<AccountSortKey>('consumption_asc')
   const [selectedRange, setSelectedRange] = useState<RangeKey>('30d')
   const [statsChartMode, setStatsChartMode] = useState<'cumulative' | 'daily'>('cumulative')
@@ -921,6 +958,7 @@ function App() {
   const streamRef = useRef<EventSource | null>(null)
   const leaseStreamRef = useRef<EventSource | null>(null)
   const usageHistoryRequestRef = useRef(0)
+  const openClawUsageRequestRef = useRef(0)
   const currentLabelRef = useRef<string | null>(currentLabel)
   const hasActionApiKey = actionApiKey.trim().length > 0
   const sensitiveText = (value: string | null | undefined): string => (privacyMode ? redactText(value) : (value || ''))
@@ -1027,6 +1065,8 @@ function App() {
         ? 100
         : Math.max(1, ...statsPrimarySeries.map((d: any) => Number((d as any).consumed ?? (d as any).cumulative ?? 0))))
   const wastedSeries = usageHistory?.series.daily_rollover_wasted || []
+  const openClawUsageRows = openClawCredentialUsage?.rows || []
+  const openClawUsageTotals = openClawCredentialUsage?.totals
   const wastedMaxValue = Math.max(1, ...wastedSeries.map((d) => Number(d.value || 0)))
   const weeklyPercents = accounts
     .map((a) => limitPercent(a.rate_limits?.tokens || a.rate_limits?.secondary))
@@ -1145,6 +1185,14 @@ function App() {
     const data = await requestJson<UsageHistoryResponse>(`/api/usage/history?range=${range}`, token)
     if (usageHistoryRequestRef.current !== requestId) return
     setUsageHistory(data)
+  }
+
+  const loadOpenClawCredentialUsage = async (token: string, range: RangeKey) => {
+    const requestId = openClawUsageRequestRef.current + 1
+    openClawUsageRequestRef.current = requestId
+    const data = await requestJson<OpenClawCredentialUsageResponse>(`/api/openclaw/usage/by-credential?range=${range}`, token)
+    if (openClawUsageRequestRef.current !== requestId) return
+    setOpenClawCredentialUsage(data)
   }
 
   const loadLeaseOverview = async (token: string) => {
@@ -1267,6 +1315,7 @@ function App() {
       setAggregate(data)
       setHistory((prev) => [...prev, { t: Date.now(), value: data.aggregate_utilization_percent || displayUtilization }].slice(-50))
       void loadUsageHistory(token, selectedRange).catch(() => {})
+      void loadOpenClawCredentialUsage(token, selectedRange).catch(() => {})
     })
 
     es.addEventListener('error', (ev) => {
@@ -1982,6 +2031,7 @@ function App() {
     void loadCached(apiKey)
       .then(async () => {
         await loadUsageHistory(apiKey, selectedRange)
+        await loadOpenClawCredentialUsage(apiKey, selectedRange)
         startStream(apiKey)
       })
       .catch((e: unknown) => {
@@ -1997,6 +2047,7 @@ function App() {
   useEffect(() => {
     if (!apiKey.trim()) return
     void loadUsageHistory(apiKey, selectedRange).catch(() => {})
+    void loadOpenClawCredentialUsage(apiKey, selectedRange).catch(() => {})
   }, [selectedRange])
 
   useEffect(() => {
@@ -2441,6 +2492,68 @@ function App() {
                 </div>
               ))}
             </div>
+          </div>
+
+          <div className="cards" style={{ marginTop: 16 }}>
+            <div>
+              <label>OpenClaw Tokens In Range</label>
+              <strong>{fmtNullableNumber(openClawUsageTotals?.total_tokens ?? null)}</strong>
+              <div className="muted small">Lease-attributed OpenClaw usage imported into the manager</div>
+            </div>
+            <div>
+              <label>OpenClaw Credentials Seen</label>
+              <strong>{fmtNullableNumber(openClawUsageTotals?.credential_count ?? null)}</strong>
+            </div>
+            <div>
+              <label>OpenClaw Input Tokens</label>
+              <strong>{fmtNullableNumber(openClawUsageTotals?.input_tokens ?? null)}</strong>
+            </div>
+            <div>
+              <label>OpenClaw Output Tokens</label>
+              <strong>{fmtNullableNumber(openClawUsageTotals?.output_tokens ?? null)}</strong>
+            </div>
+          </div>
+
+          <div className="panel" style={{ marginTop: 16 }}>
+            <div className="saved-head">
+              <h3>OpenClaw Usage By Lease</h3>
+              <span className="pill">
+                {openClawUsageRows.length} credential{openClawUsageRows.length === 1 ? '' : 's'}
+              </span>
+            </div>
+            {openClawUsageRows.length ? (
+              <div className="table-wrap">
+                <table className="table">
+                  <thead>
+                    <tr>
+                      <th>Credential</th>
+                      <th>Total Tokens</th>
+                      <th>Input</th>
+                      <th>Output</th>
+                      <th>Cache Read</th>
+                      <th>Lease</th>
+                      <th>Updated</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {openClawUsageRows.map((row) => (
+                      <tr key={`${row.credential_id}-${row.lease_id || 'none'}`}>
+                        <td>
+                          <div>{sensitiveText(row.display_label || row.label || row.credential_id)}</div>
+                          <div className="muted small mono">{sensitiveText(row.credential_id)}</div>
+                        </td>
+                        <td>{fmtNullableNumber(row.total_tokens)}</td>
+                        <td>{fmtNullableNumber(row.input_tokens)}</td>
+                        <td>{fmtNullableNumber(row.output_tokens)}</td>
+                        <td>{fmtNullableNumber(row.cache_read_tokens)}</td>
+                        <td className="mono">{row.lease_id || '--'}</td>
+                        <td>{fmtTs(row.last_updated_at)}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            ) : <div className="muted">No OpenClaw lease-attributed usage imported yet for this range.</div>}
           </div>
         </section>
       ) : (

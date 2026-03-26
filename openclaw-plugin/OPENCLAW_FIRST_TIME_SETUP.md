@@ -40,7 +40,7 @@ Your plugin package **must** include both:
 
 ```json
 {
-  "id": "auth-manager-lease-telemetry",
+  "id": "openclaw-auth-manager-plugin",
   "name": "Codex Auth Manager Plugin",
   "description": "Acquire/renew leases, materialize auth, and post telemetry.",
   "configSchema": {
@@ -99,7 +99,7 @@ openclaw plugins install .
 Then enable it:
 
 ```bash
-openclaw plugins enable auth-manager-lease-telemetry
+openclaw plugins enable openclaw-auth-manager-plugin
 ```
 
 ---
@@ -111,9 +111,9 @@ Set in `~/.openclaw/openclaw.json`:
 ```json
 {
   "plugins": {
-    "allow": ["discord", "auth-manager-lease-telemetry"],
+    "allow": ["discord", "openclaw-auth-manager-plugin"],
     "entries": {
-      "auth-manager-lease-telemetry": {
+      "openclaw-auth-manager-plugin": {
         "enabled": true,
         "config": {
           "baseUrl": "https://your-auth-manager.example.com",
@@ -238,6 +238,6 @@ Example:
 Use the same package name and plugin id when upgrading. This plugin ships as:
 
 - package: `openclaw-auth-manager-plugin`
-- plugin id: `auth-manager-lease-telemetry`
+- plugin id: `openclaw-auth-manager-plugin`
 
 If you see duplicate plugin entries, remove older copies from `~/.openclaw/extensions` before reinstalling.

@@ -133,11 +133,11 @@ That means short restarts do not voluntarily give the auth back, and the plugin 
 The plugin keeps stable install identity values:
 
 - npm package name: `openclaw-auth-manager-plugin`
-- plugin id: `auth-manager-lease-telemetry`
+- plugin id: `openclaw-auth-manager-plugin`
 
 That means upgrades should replace the existing plugin rather than create a second logical install.
 
-If you still see duplicates, remove stale copies from `~/.openclaw/extensions` and keep only one installed copy of `auth-manager-lease-telemetry`.
+If you still see duplicates, remove stale copies from `~/.openclaw/extensions` and keep only one installed copy of `openclaw-auth-manager-plugin`.
 
 ## Local Development
 

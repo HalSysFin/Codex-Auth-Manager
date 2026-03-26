@@ -35,7 +35,7 @@ This repo now contains several clients around the same Auth Manager backend and 
 - `headless-client/`
   Linux-friendly non-GUI CLI/agent that can ensure a lease, materialize auth, and run a background lease-maintenance loop.
 - `openclaw-plugin/`
-  Lightweight TypeScript runtime helper for capturing observed OpenClaw token usage and posting it back to Auth Manager lease telemetry.
+  Standalone OpenClaw plugin for lease-backed auth materialization, usage import, and per-lease token attribution back into Auth Manager.
 - `packages/lease-runtime/`
   Shared TypeScript broker/runtime helpers used for backend client access, lease lifecycle decisions, auth payload validation, state helpers, and telemetry payload generation.
 - `scripts/`
@@ -393,6 +393,9 @@ The plugin is responsible for:
 - writing OpenClaw-compatible auth files
 - sending lease telemetry back to Auth Manager
 - importing OpenClaw usage export JSON back into the manager
+- attributing imported OpenClaw usage to the active lease and leased credential
+
+The manager can now display OpenClaw token usage by leased credential in the stats view, using the lease context sent back by the plugin with each usage import.
 
 The older `openclaw-skill/` content is no longer the primary documented integration path and should be treated as legacy helper material until it is either removed or rewritten.
 

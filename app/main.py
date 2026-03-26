@@ -40,6 +40,7 @@ from .account_usage_store import (
     get_active_profile_label,
     get_runtime_settings,
     initialize_usage_store,
+    list_openclaw_usage_by_credential,
     list_absolute_usage_snapshots,
     list_usage_rollovers,
     list_usage_snapshots,
@@ -1643,6 +1644,8 @@ async def api_openclaw_usage_import(request: Request, payload: dict[str, Any]) -
         export_data=export_data,
         machine_id=str(payload.get("machine_id") or "").strip() or None,
         agent_id=str(payload.get("agent_id") or "").strip() or None,
+        lease_id=str(payload.get("lease_id") or "").strip() or None,
+        credential_id=str(payload.get("credential_id") or "").strip() or None,
         source_name=str(payload.get("source_name") or "").strip() or None,
     )
     return JSONResponse(result)
@@ -2226,6 +2229,70 @@ async def api_usage_history(request: Request, range: str = "30d") -> JSONRespons
                 "daily_points": len(fallback_series) if fallback_mode else len(daily_series),
                 "is_sparse": (len(fallback_series) if fallback_mode else len(daily_series)) < 3,
             },
+        }
+    )
+
+
+@app.get("/api/openclaw/usage/by-credential")
+async def api_openclaw_usage_by_credential(request: Request, range: str = "30d") -> JSONResponse:
+    _require_internal_auth(request)
+    selected_range, since_dt = _parse_history_range(range)
+    since_date = since_dt.date().isoformat() if since_dt is not None else None
+
+    rows = list_openclaw_usage_by_credential(since_date=since_date)
+    broker_credentials = {
+        str(row.get("id") or ""): row for row in list_broker_credentials()
+    }
+    profiles = _dedupe_profiles(list_profiles())
+    profile_by_account_key = {p.account_key: p for p in profiles}
+
+    payload_rows: list[dict[str, Any]] = []
+    for row in rows:
+        credential_id = str(row.get("credential_id") or "").strip()
+        broker_row = broker_credentials.get(credential_id) or {}
+        profile = profile_by_account_key.get(credential_id)
+        label = (
+            str(broker_row.get("label") or "").strip()
+            or (profile.label if profile else "")
+            or credential_id
+        )
+        display_label = _display_label(label, profile.email if profile else None) if label else credential_id
+        payload_rows.append(
+            {
+                "credential_id": credential_id,
+                "lease_id": row.get("lease_id"),
+                "label": label,
+                "display_label": display_label,
+                "email": profile.email if profile else None,
+                "input_tokens": int(row.get("input_tokens") or 0),
+                "output_tokens": int(row.get("output_tokens") or 0),
+                "cache_read_tokens": int(row.get("cache_read_tokens") or 0),
+                "cache_write_tokens": int(row.get("cache_write_tokens") or 0),
+                "total_tokens": int(row.get("total_tokens") or 0),
+                "total_cost": row.get("total_cost"),
+                "day_count": int(row.get("day_count") or 0),
+                "machine_count": int(row.get("machine_count") or 0),
+                "agent_count": int(row.get("agent_count") or 0),
+                "last_updated_at": row.get("last_updated_at"),
+            }
+        )
+
+    totals = {
+        "input_tokens": sum(int(row["input_tokens"]) for row in payload_rows),
+        "output_tokens": sum(int(row["output_tokens"]) for row in payload_rows),
+        "cache_read_tokens": sum(int(row["cache_read_tokens"]) for row in payload_rows),
+        "cache_write_tokens": sum(int(row["cache_write_tokens"]) for row in payload_rows),
+        "total_tokens": sum(int(row["total_tokens"]) for row in payload_rows),
+        "total_cost": sum(float(row["total_cost"] or 0) for row in payload_rows) if payload_rows else 0,
+        "credential_count": len(payload_rows),
+    }
+
+    return JSONResponse(
+        {
+            "range": selected_range,
+            "range_metadata": _history_range_metadata(selected_range),
+            "totals": totals,
+            "rows": payload_rows,
         }
     )
 

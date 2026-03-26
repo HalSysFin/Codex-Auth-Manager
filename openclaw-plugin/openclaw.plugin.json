@@ -1,5 +1,5 @@
 {
-  "id": "auth-manager-lease-telemetry",
+  "id": "openclaw-auth-manager-plugin",
   "name": "Codex Auth Manager Plugin",
   "description": "Acquire and manage CAM-backed auth leases, materialize auth, enforce lease-active auth, and post truthful telemetry.",
   "configSchema": {

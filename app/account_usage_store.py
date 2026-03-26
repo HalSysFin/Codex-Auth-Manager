@@ -1208,6 +1208,8 @@ def import_openclaw_usage_export(
     export_data: dict[str, Any],
     machine_id: str | None = None,
     agent_id: str | None = None,
+    lease_id: str | None = None,
+    credential_id: str | None = None,
     source_name: str | None = None,
     imported_at: datetime | None = None,
     db_path: Path | None = None,
@@ -1233,11 +1235,16 @@ def import_openclaw_usage_export(
                     resolved_agent_id = candidate
                     break
     resolved_agent_id = resolved_agent_id or "openclaw"
+    resolved_lease_id = (lease_id or "").strip() or None
+    resolved_credential_id = (credential_id or "").strip() or None
 
     created_iso = _to_iso(_as_utc(imported_at))
     export_payload = json.dumps(export_data, sort_keys=True, separators=(",", ":"))
     import_key = hashlib.sha256(
-        f"{resolved_machine_id}\n{resolved_agent_id}\n{source_name or ''}\n{export_payload}".encode("utf-8")
+        (
+            f"{resolved_machine_id}\n{resolved_agent_id}\n{resolved_lease_id or ''}\n"
+            f"{resolved_credential_id or ''}\n{source_name or ''}\n{export_payload}"
+        ).encode("utf-8")
     ).hexdigest()
 
     def _int(value: Any) -> int:
@@ -1273,6 +1280,14 @@ def import_openclaw_usage_export(
 
     with _connect(db_path) as conn:
         _ensure_schema(conn)
+        if resolved_lease_id and not resolved_credential_id:
+            with suppress(Exception):
+                lease_row = conn.execute(
+                    "SELECT credential_id FROM broker_leases WHERE id = ?",
+                    (resolved_lease_id,),
+                ).fetchone()
+                if lease_row:
+                    resolved_credential_id = str(lease_row.get("credential_id") or "").strip() or None
         existing = conn.execute(
             "SELECT import_key FROM openclaw_usage_imports WHERE import_key = ?",
             (import_key,),
@@ -1284,6 +1299,8 @@ def import_openclaw_usage_export(
                 "import_key": import_key,
                 "machine_id": resolved_machine_id,
                 "agent_id": resolved_agent_id,
+                "lease_id": resolved_lease_id,
+                "credential_id": resolved_credential_id,
                 "daily_rows": 0,
                 "session_rows": 0,
             }
@@ -1293,19 +1310,37 @@ def import_openclaw_usage_export(
             conn.execute(
                 """
                 INSERT INTO openclaw_usage_imports (
-                    import_key, source_name, machine_id, agent_id, totals_json, created_at
-                ) VALUES (%s, %s, %s, %s, %s::jsonb, %s)
+                    import_key, source_name, machine_id, agent_id, lease_id, credential_id, totals_json, created_at
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s::jsonb, %s)
                 """,
-                (import_key, source_name, resolved_machine_id, resolved_agent_id, json.dumps(totals), created_iso),
+                (
+                    import_key,
+                    source_name,
+                    resolved_machine_id,
+                    resolved_agent_id,
+                    resolved_lease_id,
+                    resolved_credential_id,
+                    json.dumps(totals),
+                    created_iso,
+                ),
             )
         else:
             conn.execute(
                 """
                 INSERT INTO openclaw_usage_imports (
-                    import_key, source_name, machine_id, agent_id, totals_json, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?)
+                    import_key, source_name, machine_id, agent_id, lease_id, credential_id, totals_json, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (import_key, source_name, resolved_machine_id, resolved_agent_id, json.dumps(totals), created_iso),
+                (
+                    import_key,
+                    source_name,
+                    resolved_machine_id,
+                    resolved_agent_id,
+                    resolved_lease_id,
+                    resolved_credential_id,
+                    json.dumps(totals),
+                    created_iso,
+                ),
             )
 
         daily_upserts = 0
@@ -1317,6 +1352,8 @@ def import_openclaw_usage_export(
             params = (
                 resolved_machine_id,
                 resolved_agent_id,
+                resolved_lease_id,
+                resolved_credential_id,
                 usage_date,
                 _int(row.get("input") or row.get("inputTokens")),
                 _int(row.get("output") or row.get("outputTokens")),
@@ -1336,13 +1373,15 @@ def import_openclaw_usage_export(
                 conn.execute(
                     """
                     INSERT INTO openclaw_daily_usage (
-                        machine_id, agent_id, usage_date,
+                        machine_id, agent_id, lease_id, credential_id, usage_date,
                         input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, total_tokens,
                         input_cost, output_cost, cache_read_cost, cache_write_cost, total_cost, missing_cost_entries,
                         raw_json, updated_at
-                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s)
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s)
                     ON CONFLICT (machine_id, agent_id, usage_date) DO UPDATE
-                    SET input_tokens = EXCLUDED.input_tokens,
+                    SET lease_id = EXCLUDED.lease_id,
+                        credential_id = EXCLUDED.credential_id,
+                        input_tokens = EXCLUDED.input_tokens,
                         output_tokens = EXCLUDED.output_tokens,
                         cache_read_tokens = EXCLUDED.cache_read_tokens,
                         cache_write_tokens = EXCLUDED.cache_write_tokens,
@@ -1362,12 +1401,14 @@ def import_openclaw_usage_export(
                 conn.execute(
                     """
                     INSERT INTO openclaw_daily_usage (
-                        machine_id, agent_id, usage_date,
+                        machine_id, agent_id, lease_id, credential_id, usage_date,
                         input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, total_tokens,
                         input_cost, output_cost, cache_read_cost, cache_write_cost, total_cost, missing_cost_entries,
                         raw_json, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(machine_id, agent_id, usage_date) DO UPDATE SET
+                        lease_id = excluded.lease_id,
+                        credential_id = excluded.credential_id,
                         input_tokens = excluded.input_tokens,
                         output_tokens = excluded.output_tokens,
                         cache_read_tokens = excluded.cache_read_tokens,
@@ -1408,6 +1449,8 @@ def import_openclaw_usage_export(
             params = (
                 resolved_machine_id,
                 session_agent_id,
+                resolved_lease_id,
+                resolved_credential_id,
                 session_key,
                 _text(row.get("sessionId")),
                 _text(row.get("label")),
@@ -1432,13 +1475,15 @@ def import_openclaw_usage_export(
                 conn.execute(
                     """
                     INSERT INTO openclaw_session_usage (
-                        machine_id, agent_id, session_key, session_id, label, channel, chat_type,
+                        machine_id, agent_id, lease_id, credential_id, session_key, session_id, label, channel, chat_type,
                         model_provider, model, updated_at, duration_ms, messages, errors, tool_calls,
                         input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, total_tokens,
                         total_cost, raw_json
-                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb)
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb)
                     ON CONFLICT (machine_id, agent_id, session_key) DO UPDATE
-                    SET session_id = EXCLUDED.session_id,
+                    SET lease_id = EXCLUDED.lease_id,
+                        credential_id = EXCLUDED.credential_id,
+                        session_id = EXCLUDED.session_id,
                         label = EXCLUDED.label,
                         channel = EXCLUDED.channel,
                         chat_type = EXCLUDED.chat_type,
@@ -1463,12 +1508,14 @@ def import_openclaw_usage_export(
                 conn.execute(
                     """
                     INSERT INTO openclaw_session_usage (
-                        machine_id, agent_id, session_key, session_id, label, channel, chat_type,
+                        machine_id, agent_id, lease_id, credential_id, session_key, session_id, label, channel, chat_type,
                         model_provider, model, updated_at, duration_ms, messages, errors, tool_calls,
                         input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, total_tokens,
                         total_cost, raw_json
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(machine_id, agent_id, session_key) DO UPDATE SET
+                        lease_id = excluded.lease_id,
+                        credential_id = excluded.credential_id,
                         session_id = excluded.session_id,
                         label = excluded.label,
                         channel = excluded.channel,
@@ -1498,6 +1545,8 @@ def import_openclaw_usage_export(
         "import_key": import_key,
         "machine_id": resolved_machine_id,
         "agent_id": resolved_agent_id,
+        "lease_id": resolved_lease_id,
+        "credential_id": resolved_credential_id,
         "daily_rows": daily_upserts,
         "session_rows": session_upserts,
         "totals": {
@@ -1509,6 +1558,43 @@ def import_openclaw_usage_export(
             "totalCost": _float(totals.get("totalCost")),
         },
     }
+
+
+def list_openclaw_usage_by_credential(
+    *,
+    since_date: str | None = None,
+    db_path: Path | None = None,
+) -> list[dict[str, Any]]:
+    with _connect(db_path) as conn:
+        _ensure_schema(conn)
+        is_pg = getattr(conn, "_kind", "sqlite") == "postgres"
+        conditions = ["credential_id IS NOT NULL", "TRIM(COALESCE(credential_id, '')) <> ''"]
+        params: list[Any] = []
+        if since_date:
+            conditions.append("usage_date >= " + ("%s" if is_pg else "?"))
+            params.append(since_date)
+        where_clause = " AND ".join(conditions)
+        query = f"""
+            SELECT
+                credential_id,
+                MAX(lease_id) AS lease_id,
+                SUM(input_tokens) AS input_tokens,
+                SUM(output_tokens) AS output_tokens,
+                SUM(cache_read_tokens) AS cache_read_tokens,
+                SUM(cache_write_tokens) AS cache_write_tokens,
+                SUM(total_tokens) AS total_tokens,
+                SUM(COALESCE(total_cost, 0)) AS total_cost,
+                COUNT(*) AS day_count,
+                COUNT(DISTINCT machine_id) AS machine_count,
+                COUNT(DISTINCT agent_id) AS agent_count,
+                MAX(updated_at) AS last_updated_at
+            FROM openclaw_daily_usage
+            WHERE {where_clause}
+            GROUP BY credential_id
+            ORDER BY SUM(total_tokens) DESC, credential_id ASC
+        """
+        rows = conn.execute(query, params).fetchall()
+    return [dict(row) for row in rows]
 
 
 def migrate_legacy_local_state(
@@ -1831,6 +1917,16 @@ def _ensure_schema(conn: Any) -> None:
     _ensure_schema_sqlite(conn)
 
 
+def _ensure_sqlite_column(conn: Any, table_name: str, column_name: str, definition: str) -> None:
+    existing = {
+        str(row["name"] if isinstance(row, sqlite3.Row) else row[1])
+        for row in conn.execute(f"PRAGMA table_info({table_name})").fetchall()
+    }
+    if column_name in existing:
+        return
+    conn.execute(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {definition}")
+
+
 def _ensure_schema_postgres(conn: Any) -> None:
     conn.execute(
         """
@@ -1959,6 +2055,8 @@ def _ensure_schema_postgres(conn: Any) -> None:
             source_name TEXT NULL,
             machine_id TEXT NOT NULL,
             agent_id TEXT NOT NULL,
+            lease_id TEXT NULL,
+            credential_id TEXT NULL,
             totals_json JSONB NOT NULL,
             created_at TEXT NOT NULL
         )
@@ -1969,6 +2067,8 @@ def _ensure_schema_postgres(conn: Any) -> None:
         CREATE TABLE IF NOT EXISTS openclaw_daily_usage (
             machine_id TEXT NOT NULL,
             agent_id TEXT NOT NULL,
+            lease_id TEXT NULL,
+            credential_id TEXT NULL,
             usage_date TEXT NOT NULL,
             input_tokens BIGINT NOT NULL DEFAULT 0,
             output_tokens BIGINT NOT NULL DEFAULT 0,
@@ -1992,6 +2092,8 @@ def _ensure_schema_postgres(conn: Any) -> None:
         CREATE TABLE IF NOT EXISTS openclaw_session_usage (
             machine_id TEXT NOT NULL,
             agent_id TEXT NOT NULL,
+            lease_id TEXT NULL,
+            credential_id TEXT NULL,
             session_key TEXT NOT NULL,
             session_id TEXT NULL,
             label TEXT NULL,
@@ -2015,13 +2117,6 @@ def _ensure_schema_postgres(conn: Any) -> None:
         )
         """
     )
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_openclaw_daily_usage_date ON openclaw_daily_usage(usage_date)"
-    )
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_openclaw_session_usage_updated_at ON openclaw_session_usage(updated_at)"
-    )
-
     conn.execute("ALTER TABLE accounts ADD COLUMN IF NOT EXISTS provider_account_id TEXT NULL")
     conn.execute("ALTER TABLE accounts ADD COLUMN IF NOT EXISTS name TEXT NULL")
     conn.execute("ALTER TABLE accounts ADD COLUMN IF NOT EXISTS primary_used_percent DOUBLE PRECISION NULL")
@@ -2036,6 +2131,24 @@ def _ensure_schema_postgres(conn: Any) -> None:
     conn.execute("ALTER TABLE usage_rollovers ADD COLUMN IF NOT EXISTS primary_percent_at_reset DOUBLE PRECISION NULL")
     conn.execute("ALTER TABLE usage_rollovers ADD COLUMN IF NOT EXISTS secondary_percent_at_reset DOUBLE PRECISION NULL")
     conn.execute("ALTER TABLE usage_rollovers ADD COLUMN IF NOT EXISTS window_type TEXT NOT NULL DEFAULT 'short'")
+    conn.execute("ALTER TABLE openclaw_usage_imports ADD COLUMN IF NOT EXISTS lease_id TEXT NULL")
+    conn.execute("ALTER TABLE openclaw_usage_imports ADD COLUMN IF NOT EXISTS credential_id TEXT NULL")
+    conn.execute("ALTER TABLE openclaw_daily_usage ADD COLUMN IF NOT EXISTS lease_id TEXT NULL")
+    conn.execute("ALTER TABLE openclaw_daily_usage ADD COLUMN IF NOT EXISTS credential_id TEXT NULL")
+    conn.execute("ALTER TABLE openclaw_session_usage ADD COLUMN IF NOT EXISTS lease_id TEXT NULL")
+    conn.execute("ALTER TABLE openclaw_session_usage ADD COLUMN IF NOT EXISTS credential_id TEXT NULL")
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_openclaw_daily_usage_date ON openclaw_daily_usage(usage_date)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_openclaw_session_usage_updated_at ON openclaw_session_usage(updated_at)"
+    )
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_openclaw_usage_imports_lease_id ON openclaw_usage_imports(lease_id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_openclaw_usage_imports_credential_id ON openclaw_usage_imports(credential_id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_openclaw_daily_usage_lease_id ON openclaw_daily_usage(lease_id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_openclaw_daily_usage_credential_id ON openclaw_daily_usage(credential_id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_openclaw_session_usage_lease_id ON openclaw_session_usage(lease_id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_openclaw_session_usage_credential_id ON openclaw_session_usage(credential_id)")
 
     now_iso = _to_iso(datetime.now(timezone.utc))
     conn.execute(
@@ -2185,6 +2298,8 @@ def _ensure_schema_sqlite(conn: Any) -> None:
             source_name TEXT NULL,
             machine_id TEXT NOT NULL,
             agent_id TEXT NOT NULL,
+            lease_id TEXT NULL,
+            credential_id TEXT NULL,
             totals_json TEXT NOT NULL,
             created_at TEXT NOT NULL
         )
@@ -2195,6 +2310,8 @@ def _ensure_schema_sqlite(conn: Any) -> None:
         CREATE TABLE IF NOT EXISTS openclaw_daily_usage (
             machine_id TEXT NOT NULL,
             agent_id TEXT NOT NULL,
+            lease_id TEXT NULL,
+            credential_id TEXT NULL,
             usage_date TEXT NOT NULL,
             input_tokens INTEGER NOT NULL DEFAULT 0,
             output_tokens INTEGER NOT NULL DEFAULT 0,
@@ -2218,6 +2335,8 @@ def _ensure_schema_sqlite(conn: Any) -> None:
         CREATE TABLE IF NOT EXISTS openclaw_session_usage (
             machine_id TEXT NOT NULL,
             agent_id TEXT NOT NULL,
+            lease_id TEXT NULL,
+            credential_id TEXT NULL,
             session_key TEXT NOT NULL,
             session_id TEXT NULL,
             label TEXT NULL,
@@ -2241,8 +2360,20 @@ def _ensure_schema_sqlite(conn: Any) -> None:
         )
         """
     )
+    _ensure_sqlite_column(conn, "openclaw_usage_imports", "lease_id", "TEXT NULL")
+    _ensure_sqlite_column(conn, "openclaw_usage_imports", "credential_id", "TEXT NULL")
+    _ensure_sqlite_column(conn, "openclaw_daily_usage", "lease_id", "TEXT NULL")
+    _ensure_sqlite_column(conn, "openclaw_daily_usage", "credential_id", "TEXT NULL")
+    _ensure_sqlite_column(conn, "openclaw_session_usage", "lease_id", "TEXT NULL")
+    _ensure_sqlite_column(conn, "openclaw_session_usage", "credential_id", "TEXT NULL")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_openclaw_daily_usage_date ON openclaw_daily_usage(usage_date)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_openclaw_session_usage_updated_at ON openclaw_session_usage(updated_at)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_openclaw_usage_imports_lease_id ON openclaw_usage_imports(lease_id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_openclaw_usage_imports_credential_id ON openclaw_usage_imports(credential_id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_openclaw_daily_usage_lease_id ON openclaw_daily_usage(lease_id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_openclaw_daily_usage_credential_id ON openclaw_daily_usage(credential_id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_openclaw_session_usage_lease_id ON openclaw_session_usage(lease_id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_openclaw_session_usage_credential_id ON openclaw_session_usage(credential_id)")
 
     conn.execute(
         """

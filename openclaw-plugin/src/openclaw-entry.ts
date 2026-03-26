@@ -27,14 +27,14 @@ type OpenClawPluginLikeDefinition = {
 
 export function createAuthManagerOpenClawEntry(): OpenClawPluginLikeDefinition {
   return {
-    id: 'auth-manager-lease-telemetry',
+    id: 'openclaw-auth-manager-plugin',
     name: 'Codex Auth Manager Plugin',
     description: 'Acquire and manage CAM-backed auth leases, materialize auth, and post truthful OpenClaw telemetry.',
     register(api) {
       let service: ReturnType<typeof createOpenClawLeaseTelemetryService> | null = null
 
       api.registerService({
-        id: 'auth-manager-lease-telemetry-service',
+        id: 'openclaw-auth-manager-plugin-service',
         async start(ctx) {
           const config = resolvePluginConfig((ctx.config ?? {}) as Record<string, unknown>, ctx.env ?? process.env)
           const errors = validatePluginConfig(config)
