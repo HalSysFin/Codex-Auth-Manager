@@ -1,4 +1,5 @@
-import type { AuthManagerLeasePluginConfig, LeaseTelemetryContext, UsageShape } from './types.js'
+import type { AuthManagerLeasePluginConfig, LeaseControlAPI, LeaseTelemetryContext, UsageShape } from './types.js'
+import { createLeaseManagerController } from './leaseControl.js'
 import { createOpenClawLeaseTelemetryService } from './service.js'
 import { resolvePluginConfig, validatePluginConfig } from './config.js'
 
@@ -21,6 +22,7 @@ type OpenClawPluginLikeDefinition = {
       id: string
       start: (ctx: { config?: Record<string, unknown>; env?: NodeJS.ProcessEnv }) => void | Promise<void>
       stop?: () => void | Promise<void>
+      lease?: LeaseControlAPI
     }) => void
   }) => void
 }
@@ -32,9 +34,48 @@ export function createAuthManagerOpenClawEntry(): OpenClawPluginLikeDefinition {
     description: 'Acquire and manage CAM-backed auth leases, materialize auth, and post truthful OpenClaw telemetry.',
     register(api) {
       let service: ReturnType<typeof createOpenClawLeaseTelemetryService> | null = null
+      let leaseApi: LeaseControlAPI | undefined
 
       api.registerService({
         id: 'openclaw-auth-manager-plugin-service',
+        lease: {
+          status: async (input) => {
+            if (!leaseApi) throw new Error('Lease service is not started')
+            return leaseApi.status(input)
+          },
+          ensure: async (input) => {
+            if (!leaseApi) throw new Error('Lease service is not started')
+            return leaseApi.ensure(input)
+          },
+          renew: async (input) => {
+            if (!leaseApi) throw new Error('Lease service is not started')
+            return leaseApi.renew(input)
+          },
+          rotate: async (input) => {
+            if (!leaseApi) throw new Error('Lease service is not started')
+            return leaseApi.rotate(input)
+          },
+          release: async (input) => {
+            if (!leaseApi) throw new Error('Lease service is not started')
+            return leaseApi.release(input)
+          },
+          reacquire: async (input) => {
+            if (!leaseApi) throw new Error('Lease service is not started')
+            return leaseApi.reacquire(input)
+          },
+          materialize: async () => {
+            if (!leaseApi) throw new Error('Lease service is not started')
+            return leaseApi.materialize()
+          },
+          flushTelemetry: async () => {
+            if (!leaseApi) throw new Error('Lease service is not started')
+            return leaseApi.flushTelemetry()
+          },
+          setAutoMode: async (input) => {
+            if (!leaseApi) throw new Error('Lease service is not started')
+            return leaseApi.setAutoMode(input)
+          },
+        },
         async start(ctx) {
           const config = resolvePluginConfig((ctx.config ?? {}) as Record<string, unknown>, ctx.env ?? process.env)
           const errors = validatePluginConfig(config)
@@ -66,10 +107,12 @@ export function createAuthManagerOpenClawEntry(): OpenClawPluginLikeDefinition {
             flushEveryRequests: config.flushEveryRequests,
             context: toLeaseContext(config),
           })
+          leaseApi = createLeaseManagerController(service)
           await service.start()
         },
         async stop() {
           if (service) await service.shutdown()
+          leaseApi = undefined
         },
       })
 
@@ -95,6 +138,7 @@ export function buildUsageObserver(service = createOpenClawLeaseTelemetryService
     setLeaseContext: (context: LeaseTelemetryContext) => void
     flushNow: () => Promise<void>
     stop: () => Promise<void>
+    lease: LeaseControlAPI
   }
 } {
   return {
@@ -122,11 +166,13 @@ export function buildUsageObserver(service = createOpenClawLeaseTelemetryService
         context: toLeaseContext(params.config),
       })
       void instance.start()
+      const lease = createLeaseManagerController(instance)
       return {
         observeUsage: (raw) => instance.observeUsage(raw),
         setLeaseContext: (context) => instance.setLeaseContext(context),
         flushNow: () => instance.flushNow(),
         stop: async () => instance.shutdown(),
+        lease,
       }
     },
   }

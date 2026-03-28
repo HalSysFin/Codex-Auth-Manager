@@ -77,6 +77,9 @@ export class HeadlessAgent {
         await this.rotate()
       } else if (action === 'renew') {
         await this.renew()
+      } else if (this.shouldRematerializeAuth(status)) {
+        await this.log(`Credential auth changed for lease ${status.lease_id}; rematerializing`)
+        await this.materializeAndWriteAuth(status.lease_id)
       } else if (!(await authFileExists(this.config.settings.authFilePath))) {
         const leaseId = this.document.lease.leaseId
         if (leaseId) {
@@ -114,6 +117,9 @@ export class HeadlessAgent {
         await this.rotate()
       } else if (shouldRenewLease(status, this.config.settings.autoRenew)) {
         await this.renew()
+      } else if (this.shouldRematerializeAuth(status)) {
+        await this.log(`Credential auth changed for lease ${status.lease_id}; rematerializing`)
+        await this.materializeAndWriteAuth(status.lease_id)
       } else {
         this.setMessage(`Lease refreshed at ${new Date().toISOString()}`)
       }
@@ -246,6 +252,12 @@ export class HeadlessAgent {
     try {
       await this.client.postTelemetry(this.document.lease.leaseId, buildLeaseTelemetryPayload(this.document.lease))
       this.backendReachable = true
+      const status = await this.client.getLease(this.document.lease.leaseId)
+      this.document.lease = updateRuntimeStateFromLeaseStatus(this.document.lease, status)
+      if (this.shouldRematerializeAuth(status)) {
+        await this.log(`Credential auth changed during telemetry for lease ${status.lease_id}; rematerializing`)
+        await this.materializeAndWriteAuth(status.lease_id)
+      }
       await this.log(`Posted telemetry for lease ${this.document.lease.leaseId}`)
     } catch (error) {
       await this.handleError(error, 'Unable to post telemetry', false)
@@ -333,5 +345,18 @@ export class HeadlessAgent {
       this.output.warn(`${prefix}: ${message}`)
       await appendLog(this.config.paths, `[${new Date().toISOString()}] ${prefix}: ${message}`)
     }
+  }
+
+  private shouldRematerializeAuth(status: LeaseStatusResponse): boolean {
+    if (!this.document.lease.leaseId || !status.auth_refresh_required) {
+      return false
+    }
+    if (!status.credential_auth_updated_at) {
+      return true
+    }
+    if (!this.document.lease.lastAuthWriteAt) {
+      return true
+    }
+    return status.credential_auth_updated_at > this.document.lease.lastAuthWriteAt
   }
 }

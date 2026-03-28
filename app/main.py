@@ -30,6 +30,7 @@ from .account_identity import (
     extract_account_identity,
     extract_email,
     extract_id_token,
+    extract_refresh_token,
 )
 from .account_usage_store import (
     delete_account_data,
@@ -118,7 +119,7 @@ from .login_sessions import (
     validate_relay_token,
 )
 
-APP_VERSION = "1.2.1"
+APP_VERSION = "1.2.3"
 GITHUB_REPO = "HalSysFin/Codex-Auth-Manager"
 _VERSION_CHECK_CACHE: dict[str, Any] = {
     "checked_at": None,
@@ -129,10 +130,13 @@ _VERSION_CHECK_CACHE_TTL_SECONDS = 3600
 app = FastAPI(title="Codex Auth Manager", version=APP_VERSION)
 logger = logging.getLogger(__name__)
 _LEASE_RECONCILE_INTERVAL_SECONDS = 15
+_AUTH_KEEPALIVE_INTERVAL_SECONDS = 300
+_AUTH_REFRESH_LEEWAY_SECONDS = 10 * 60
 _LIVE_REFRESH_CONCURRENCY = 4
 _USAGE_STALE_SECONDS = 1800
 _reconcile_task: asyncio.Task[None] | None = None
 _lease_reconcile_task: asyncio.Task[None] | None = None
+_auth_keepalive_task: asyncio.Task[None] | None = None
 LABEL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 _FRONTEND_DIST = Path(__file__).resolve().parents[1] / "frontend" / "dist"
 _LAST_REFRESH_STATUS_BY_KEY: dict[str, dict[str, Any]] = {}
@@ -186,11 +190,65 @@ def _broker_health_score_for_profile(
         score -= 15.0
     if refresh_status and refresh_status.get("state") == "failed":
         score -= 30.0
+    if refresh_status and refresh_status.get("reauth_required"):
+        score = min(score, 5.0)
     return round(max(0.0, min(score, 100.0)), 2)
+
+
+def _refresh_error_requires_reauth(error: str | None) -> bool:
+    text = str(error or "").strip().lower()
+    if not text:
+        return False
+    markers = (
+        "token_expired",
+        "refresh_token_reused",
+        "sign in again",
+        "signing in again",
+        "please try signing in again",
+        "please log out and sign in again",
+        "provided authentication token is expired",
+        "refresh token was already used",
+        "access token could not be refreshed",
+    )
+    return any(marker in text for marker in markers)
+
+
+def _access_token_expired(auth_json: dict[str, Any] | None) -> bool:
+    if not isinstance(auth_json, dict):
+        return False
+    access_token = extract_access_token(auth_json)
+    if not access_token:
+        return False
+    claims = decode_jwt_claims(access_token)
+    if not claims:
+        return False
+    exp = claims.get("exp")
+    if not isinstance(exp, (int, float)):
+        return False
+    return datetime.fromtimestamp(float(exp), tz=timezone.utc) <= datetime.now(timezone.utc)
+
+
+def _profile_reauth_requirement(
+    profile: AccountProfile,
+    refresh_status: dict[str, Any] | None,
+) -> tuple[bool, str | None]:
+    status = refresh_status or {}
+    if status.get("reauth_required"):
+        return True, str(status.get("last_error") or "Reauthentication required")
+    auth_json = profile.auth if isinstance(profile.auth, dict) else {}
+    if not _access_token_expired(auth_json):
+        return False, None
+    has_refresh = bool(extract_refresh_token(auth_json))
+    if not has_refresh:
+        return True, "Access token expired and no refresh token is available."
+    if not settings.openai_token_url or not settings.openai_client_id:
+        return True, "Access token expired and automatic refresh is not configured on the manager."
+    return False, None
 
 
 def _sync_broker_credentials_from_profiles() -> list[dict[str, Any]]:
     profiles = _dedupe_profiles(list_profiles())
+    profile_by_account_key = {profile.account_key: profile for profile in profiles if profile.account_key}
     _touch_profiles_usage(profiles)
     cached = _build_cached_accounts_snapshot(profiles=profiles)
     synced: list[dict[str, Any]] = []
@@ -214,6 +272,12 @@ def _sync_broker_credentials_from_profiles() -> list[dict[str, Any]]:
             "email": account.get("email"),
             "account_type": account.get("account_type"),
         }
+        if refresh_status.get("reauth_required"):
+            metadata["reauth_required"] = True
+            metadata["reauth_reason"] = refresh_status.get("last_error")
+        profile = profile_by_account_key.get(account_key)
+        if profile and profile.auth_updated_at:
+            metadata["auth_updated_at"] = profile.auth_updated_at
         synced.append(
             sync_broker_credential(
                 credential_id=account_key,
@@ -252,6 +316,7 @@ def _leased_profile_payload_for_credential(
                 "email": profile.email,
                 "name": getattr(profile, "name", None),
                 "provider_account_id": None,
+                "auth_updated_at": getattr(profile, "auth_updated_at", None),
                 "auth_json": profile.auth,
             }
     return None
@@ -277,18 +342,29 @@ async def on_startup() -> None:
             logger.info("reconciled legacy account aliases into canonical account keys: %s", reconciled)
     except Exception as exc:
         logger.warning("legacy account alias reconciliation failed: %s", exc)
+    try:
+        refreshed = await _refresh_saved_auths_if_needed()
+        if refreshed:
+            logger.info("auth keepalive refreshed %s saved auth(s) on startup", refreshed)
+            _sync_broker_credentials_from_profiles()
+    except Exception as exc:
+        logger.warning("startup auth keepalive refresh failed: %s", exc)
     global _reconcile_task
     global _lease_reconcile_task
+    global _auth_keepalive_task
     if _reconcile_task is None:
         _reconcile_task = asyncio.create_task(_periodic_reconcile_usage_windows())
     if _lease_reconcile_task is None:
         _lease_reconcile_task = asyncio.create_task(_periodic_reconcile_broker_leases())
+    if _auth_keepalive_task is None:
+        _auth_keepalive_task = asyncio.create_task(_periodic_refresh_saved_auths())
 
 
 @app.on_event("shutdown")
 async def on_shutdown() -> None:
     global _reconcile_task
     global _lease_reconcile_task
+    global _auth_keepalive_task
     if _reconcile_task is not None:
         _reconcile_task.cancel()
         with suppress(asyncio.CancelledError):
@@ -299,6 +375,11 @@ async def on_shutdown() -> None:
         with suppress(asyncio.CancelledError):
             await _lease_reconcile_task
         _lease_reconcile_task = None
+    if _auth_keepalive_task is not None:
+        _auth_keepalive_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await _auth_keepalive_task
+        _auth_keepalive_task = None
 
 
 async def _periodic_reconcile_usage_windows() -> None:
@@ -322,6 +403,18 @@ async def _periodic_reconcile_broker_leases() -> None:
                 logger.info("lease reconciliation reclaimed %s stale/expired lease(s)", expired)
         except Exception:
             logger.exception("lease reconciliation failed")
+
+
+async def _periodic_refresh_saved_auths() -> None:
+    while True:
+        await asyncio.sleep(_AUTH_KEEPALIVE_INTERVAL_SECONDS)
+        try:
+            refreshed = await _refresh_saved_auths_if_needed()
+            if refreshed:
+                logger.info("auth keepalive refreshed %s saved auth(s)", refreshed)
+                _sync_broker_credentials_from_profiles()
+        except Exception:
+            logger.exception("auth keepalive failed")
 
 
 @app.middleware("http")
@@ -1281,6 +1374,7 @@ async def api_lease_release(request: Request, lease_id: str, payload: dict[str, 
 @app.post("/api/leases/{lease_id}/telemetry")
 async def api_lease_telemetry(request: Request, lease_id: str, payload: dict[str, Any]) -> JSONResponse:
     _require_internal_auth(request)
+    _sync_broker_credentials_from_profiles()
     machine_id = str(payload.get("machine_id") or "").strip()
     agent_id = str(payload.get("agent_id") or "").strip()
     captured_at = str(payload.get("captured_at") or "").strip()
@@ -1331,6 +1425,7 @@ async def api_lease_telemetry(request: Request, lease_id: str, payload: dict[str
 @app.post("/api/leases/{lease_id}/materialize")
 async def api_lease_materialize(request: Request, lease_id: str, payload: dict[str, Any]) -> JSONResponse:
     _require_internal_auth(request)
+    _sync_broker_credentials_from_profiles()
     machine_id = str(payload.get("machine_id") or "").strip()
     agent_id = str(payload.get("agent_id") or "").strip()
     if not machine_id or not agent_id:
@@ -2096,6 +2191,11 @@ async def api_usage_history(request: Request, range: str = "30d") -> JSONRespons
     current_total_limit = int(aggregate_summary["total_current_window_limit"] or 0)
     current_total_remaining = int(aggregate_summary["total_remaining"] or 0)
     active_account_count = len(cached["accounts"])
+    active_account_keys = {
+        str(account.get("account_key") or "").strip()
+        for account in cached["accounts"]
+        if str(account.get("account_key") or "").strip()
+    }
     normalized_pool_limit = active_account_count * 100 if active_account_count > 0 else 0
     normalized_pool_used = (
         round(sum(live_weekly_percents), 2)
@@ -2107,15 +2207,24 @@ async def api_usage_history(request: Request, range: str = "30d") -> JSONRespons
         if normalized_pool_limit > 0
         else 0.0
     )
-    absolute_snapshot_available = any(
-        any(int(row.get(field) or 0) > 0 for field in ("usage_in_window", "usage_limit", "lifetime_used"))
+    absolute_account_keys = {
+        str(row.get("account_id") or "").strip()
         for row in snapshots
+        if str(row.get("account_id") or "").strip()
+        and any(int(row.get(field) or 0) > 0 for field in ("usage_in_window", "usage_limit", "lifetime_used"))
+    }
+    absolute_snapshot_available = bool(active_account_keys & absolute_account_keys)
+    absolute_pool_usage_available = bool(active_account_keys) and absolute_account_keys.issuperset(
+        active_account_keys
     )
     absolute_usage_available = bool(
-        current_total_limit > 0
-        or current_total_used > 0
-        or current_total_remaining > 0
-        or absolute_snapshot_available
+        absolute_pool_usage_available
+        and (
+            current_total_limit > 0
+            or current_total_used > 0
+            or current_total_remaining > 0
+            or absolute_snapshot_available
+        )
     )
     fallback_mode = (not absolute_usage_available) and bool(fallback_series)
     if fallback_mode:
@@ -2879,6 +2988,104 @@ async def _exchange_code_for_token(
         raise HTTPException(status_code=500, detail="Invalid token response") from exc
 
 
+def _auth_access_token_expiring_soon(
+    auth_json: dict[str, Any],
+    *,
+    leeway_seconds: int = _AUTH_REFRESH_LEEWAY_SECONDS,
+) -> bool:
+    claims = decode_jwt_claims(extract_access_token(auth_json))
+    if not claims:
+        return False
+    exp = claims.get("exp")
+    if not isinstance(exp, int):
+        return False
+    now_ts = int(datetime.now(timezone.utc).timestamp())
+    return exp <= now_ts + max(int(leeway_seconds), 0)
+
+
+async def _refresh_saved_auth_via_refresh_token(profile: AccountProfile) -> bool:
+    auth_json = profile.auth if isinstance(profile.auth, dict) else {}
+    refresh_token = extract_refresh_token(auth_json)
+    if not refresh_token or not settings.openai_token_url or not settings.openai_client_id:
+        return False
+
+    data: dict[str, str] = {
+        "grant_type": "refresh_token",
+        "client_id": settings.openai_client_id,
+        "refresh_token": refresh_token,
+    }
+    if settings.openai_client_secret:
+        data["client_secret"] = settings.openai_client_secret
+
+    async with httpx.AsyncClient(timeout=20) as client:
+        response = await client.post(
+            settings.openai_token_url,
+            data=data,
+            headers={"Accept": "application/json"},
+        )
+
+    if response.status_code >= 400:
+        raise RuntimeError(response.text.strip() or "Refresh token exchange failed")
+
+    try:
+        token_response = response.json()
+    except ValueError as exc:
+        raise RuntimeError("Invalid refresh token response") from exc
+
+    if not isinstance(token_response, dict):
+        raise RuntimeError("Unexpected refresh token response format")
+
+    next_auth = json.loads(json.dumps(auth_json))
+    tokens = next_auth.get("tokens")
+    if not isinstance(tokens, dict):
+        tokens = {}
+        next_auth["tokens"] = tokens
+
+    access_token = token_response.get("access_token")
+    if isinstance(access_token, str) and access_token.strip():
+        tokens["access_token"] = access_token.strip()
+    refresh_out = token_response.get("refresh_token")
+    if isinstance(refresh_out, str) and refresh_out.strip():
+        tokens["refresh_token"] = refresh_out.strip()
+    id_token = token_response.get("id_token")
+    if isinstance(id_token, str) and id_token.strip():
+        tokens["id_token"] = id_token.strip()
+    if not isinstance(tokens.get("account_id"), str) or not str(tokens.get("account_id") or "").strip():
+        identity_hint = extract_account_identity(next_auth)
+        if identity_hint.account_id:
+            tokens["account_id"] = identity_hint.account_id
+
+    next_auth["last_refresh"] = datetime.now(timezone.utc).isoformat()
+    identity = extract_account_identity(next_auth)
+    upsert_saved_profile(
+        label=profile.label,
+        account_key=identity.account_key or profile.account_key,
+        auth_json=next_auth,
+        email=identity.email or profile.email,
+        name=identity.name or profile.name,
+        subject=identity.subject or profile.subject,
+        user_id=identity.user_id or profile.user_id,
+        provider_account_id=identity.account_id or profile.provider_account_id,
+    )
+    return True
+
+
+async def _refresh_saved_auths_if_needed() -> int:
+    refreshed = 0
+    for profile in _dedupe_profiles(list_profiles()):
+        auth_json = profile.auth if isinstance(profile.auth, dict) else {}
+        if not auth_json or not extract_refresh_token(auth_json):
+            continue
+        if not _auth_access_token_expiring_soon(auth_json):
+            continue
+        try:
+            if await _refresh_saved_auth_via_refresh_token(profile):
+                refreshed += 1
+        except Exception as exc:
+            logger.warning("auth keepalive refresh failed for %s: %s", profile.label, exc)
+    return refreshed
+
+
 def _require_internal_auth(request: Request) -> None:
     if _web_login_enabled() and _has_valid_web_session(request):
         return
@@ -3014,6 +3221,12 @@ def _account_payload(
     active_lease: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     refresh_status = _refresh_status_payload(profile.account_key, usage_tracking)
+    reauth_required, reauth_reason = _profile_reauth_requirement(profile, refresh_status)
+    refresh_status["reauth_required"] = reauth_required
+    if reauth_required and not refresh_status.get("last_error"):
+        refresh_status["last_error"] = reauth_reason
+        if refresh_status.get("state") == "idle":
+            refresh_status["state"] = "failed"
     usage_limit = int((usage_tracking or {}).get("usage_limit") or 0)
     usage_used = int((usage_tracking or {}).get("usage_in_window") or 0)
     cached_primary_percent = (usage_tracking or {}).get("primary_used_percent")
@@ -3245,6 +3458,7 @@ def _refresh_status_payload(
     status.setdefault("last_attempt_at", None)
     status.setdefault("last_success_at", None)
     status.setdefault("last_error", None)
+    status.setdefault("reauth_required", False)
 
     updated_at = (
         (usage_tracking or {}).get("last_usage_sync_at")
@@ -3273,8 +3487,10 @@ def _mark_refresh_status(account_key: str, *, ok: bool, error: str | None) -> No
     if ok:
         entry["last_success_at"] = now_iso
         entry["last_error"] = None
+        entry["reauth_required"] = False
     else:
         entry["last_error"] = error
+        entry["reauth_required"] = _refresh_error_requires_reauth(error)
 
 
 def _mark_refresh_completed() -> None:

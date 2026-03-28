@@ -906,9 +906,15 @@ def materialize_broker_lease(
         metadata = lease.get("metadata")
         if not isinstance(metadata, dict):
             metadata = {}
+        credential_metadata = (
+            credential.get("metadata")
+            if isinstance(credential.get("metadata"), dict)
+            else {}
+        )
         delivery_count = int(metadata.get("delivery_count") or 0) + 1
         metadata["delivery_count"] = delivery_count
         metadata["last_materialized_at"] = now_iso
+        metadata["credential_auth_updated_at"] = credential_metadata.get("auth_updated_at")
         if not metadata.get("first_materialized_at"):
             metadata["first_materialized_at"] = now_iso
         conn.execute(
@@ -1043,6 +1049,16 @@ def get_broker_lease_status(
             lease = dict(conn.execute("SELECT * FROM broker_leases WHERE id = ?", (lease_id,)).fetchone())
         credential = dict(conn.execute("SELECT * FROM broker_credentials WHERE id = ?", (lease["credential_id"],)).fetchone())
         credential = _decode_credential_row(credential)
+        credential_metadata = (
+            credential.get("metadata")
+            if isinstance(credential.get("metadata"), dict)
+            else {}
+        )
+        lease_metadata = (
+            lease.get("metadata")
+            if isinstance(lease.get("metadata"), dict)
+            else {}
+        )
         expires_at = _parse_iso(str(lease["expires_at"]))
         seconds_remaining = max(0, int((expires_at - now_dt).total_seconds()))
         rotation_recommended = bool(
@@ -1077,6 +1093,11 @@ def get_broker_lease_status(
             "replacement_required": replacement_required,
             "reason": lease["reason"],
             "credential_state": credential["state"],
+            "credential_auth_updated_at": credential_metadata.get("auth_updated_at"),
+            "auth_refresh_required": (
+                credential_metadata.get("auth_updated_at") is not None
+                and credential_metadata.get("auth_updated_at") != lease_metadata.get("credential_auth_updated_at")
+            ),
             "effective_rotation_policy": effective_rotation_policy,
             "last_seen_at": lease.get("last_seen_at"),
             "seconds_since_seen": seconds_since_seen,
@@ -1420,10 +1441,14 @@ def _reconcile_credential_row(
     reset_confirmed_at = credential.get("reset_confirmed_at")
     weekly_reset_at = credential.get("weekly_reset_at")
     admin_assignment_disabled = _credential_admin_assignment_disabled(credential)
+    metadata = credential.get("metadata") if isinstance(credential.get("metadata"), dict) else {}
+    reauth_required = bool(metadata.get("reauth_required"))
     if revoked_at:
         state = "revoked"
     elif cooldown_until and _parse_iso(str(cooldown_until)) > now_dt:
         state = "cooldown"
+    elif reauth_required:
+        state = "leased" if has_active_lease else "unavailable_for_assignment"
     elif admin_assignment_disabled:
         state = "leased" if has_active_lease else "unavailable_for_assignment"
     elif due_after and _runtime_bool("weekly_reset_confirmation_required", settings.weekly_reset_confirmation_required):

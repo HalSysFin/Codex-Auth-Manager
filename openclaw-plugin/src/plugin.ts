@@ -2,6 +2,7 @@ import { AuthManagerTelemetryClient } from './client.js'
 import type {
   AggregatedTelemetry,
   AuthManagerPluginOptions,
+  LeaseAcquireResponse,
   LeaseTelemetryContext,
   NormalizedUsageEvent,
   TelemetryPostBody,
@@ -134,7 +135,7 @@ export class OpenClawAuthManagerPlugin {
     }
   }
 
-  async flushTelemetry(): Promise<unknown> {
+  async flushTelemetry(): Promise<LeaseAcquireResponse> {
     if (!this.context) {
       throw new Error('No active lease context is configured')
     }

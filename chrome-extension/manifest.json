@@ -2,8 +2,12 @@
   "manifest_version": 3,
   "name": "Codex Auth Relay",
   "description": "Relays fixed localhost OAuth callbacks to Codex auth-manager.",
-  "version": "0.2.0",
-  "permissions": ["storage", "tabs", "webNavigation"],
+  "version": "0.2.1",
+  "permissions": [
+    "storage",
+    "tabs",
+    "webNavigation"
+  ],
   "host_permissions": [
     "http://127.0.0.1:1445/*",
     "http://localhost:1445/*",

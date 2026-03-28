@@ -3,7 +3,7 @@ import assert from 'node:assert/strict'
 import { formatStatusLines } from '../output.js'
 import { buildLeaseTelemetryPayload } from '../../../packages/lease-runtime/src/telemetry.js'
 import { deriveLeaseHealthState, selectStartupAction } from '../../../packages/lease-runtime/src/leaseLifecycle.js'
-import { healthParityCases, startupParityCases } from '../../../packages/lease-runtime/src/test/parityMatrix.ts'
+import { healthParityCases, startupParityCases } from '../../../packages/lease-runtime/src/test/parityMatrix.js'
 
 test('formatStatusLines renders readable status output', () => {
   const lines = formatStatusLines({
@@ -99,12 +99,15 @@ test('buildLeaseTelemetryPayload stays truthful', () => {
     agentId: 'headless-client',
     leaseId: 'lease-1',
     credentialId: 'cred-1',
+    accountLabel: null,
+    accountName: null,
     issuedAt: null,
     expiresAt: null,
     leaseState: 'active',
     latestTelemetryAt: null,
     latestUtilizationPct: 50,
     latestQuotaRemaining: 500,
+    credentialAuthUpdatedAt: null,
     lastAuthWriteAt: null,
     lastBackendRefreshAt: '2026-03-23T00:00:00.000Z',
     replacementRequired: false,

@@ -107,6 +107,64 @@ export type OpenClawLeaseTelemetryServiceOptions = AuthManagerPluginOptions & {
   refreshIntervalMs?: number
 }
 
+export type LeaseControlErrorCode =
+  | 'no_active_lease'
+  | 'broker_unreachable'
+  | 'renew_denied'
+  | 'rotation_denied'
+  | 'release_failed'
+  | 'materialization_failed'
+  | 'concurrent_operation'
+  | 'invalid_state'
+
+export type LeaseControlStatus = {
+  leaseId: string | null
+  state: string | null
+  credentialId: string | null
+  expiresAt: string | null
+  utilizationPct: number | null
+  quotaRemaining: number | null
+  rotationRecommended: boolean
+  replacementRequired: boolean
+  authMaterialized: boolean
+  leaseProfileId: string | null
+  machineId: string | null
+  agentId: string | null
+  autoRenew: boolean
+  autoRotate: boolean
+  lastError: string | null
+  lastRefreshAt: string | null
+}
+
+export type LeaseControlError = {
+  code: LeaseControlErrorCode
+  message: string
+}
+
+export type LeaseControlResult = {
+  ok: boolean
+  operation: string
+  status: LeaseControlStatus
+  error: LeaseControlError | null
+}
+
+export type AutomaticLeaseManagementUpdate = {
+  autoRenew?: boolean
+  autoRotate?: boolean
+}
+
+export type LeaseControlAPI = {
+  status: (input?: { refresh?: boolean }) => Promise<LeaseControlResult>
+  ensure: (input?: { reason?: string }) => Promise<LeaseControlResult>
+  renew: (input?: { reason?: string }) => Promise<LeaseControlResult>
+  rotate: (input?: { reason?: string }) => Promise<LeaseControlResult>
+  release: (input?: { reason?: string }) => Promise<LeaseControlResult>
+  reacquire: (input?: { reason?: string }) => Promise<LeaseControlResult>
+  materialize: () => Promise<LeaseControlResult>
+  flushTelemetry: () => Promise<LeaseControlResult>
+  setAutoMode: (input: AutomaticLeaseManagementUpdate) => Promise<LeaseControlResult>
+}
+
 export type Lease = {
   id: string
   credential_id: string
@@ -158,6 +216,8 @@ export type LeaseStatusResponse = {
   replacement_required: boolean
   reason: string | null
   credential_state: string
+  credential_auth_updated_at?: string | null
+  auth_refresh_required?: boolean
 }
 
 export type AuthPayload = {

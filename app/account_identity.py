@@ -23,6 +23,7 @@ ACCESS_TOKEN_KEYS = [
 ]
 
 ID_TOKEN_KEYS = ["id_token", "idToken"]
+REFRESH_TOKEN_KEYS = ["refresh_token", "refreshToken"]
 
 
 @dataclass
@@ -123,6 +124,10 @@ def extract_access_token(payload: Any) -> str | None:
 
 def extract_id_token(payload: Any) -> str | None:
     return _find_first_key(payload, ID_TOKEN_KEYS)
+
+
+def extract_refresh_token(payload: Any) -> str | None:
+    return _find_first_key(payload, REFRESH_TOKEN_KEYS)
 
 
 def decode_jwt_claims(token: str | None) -> dict[str, Any] | None:

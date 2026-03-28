@@ -16,6 +16,29 @@ import { LeaseWebviewProvider, type LeaseViewModel } from './views/leaseWebview'
 
 type ManualAction = 'refresh' | 'renew' | 'rotate' | 'release' | 'reload' | 'requestNew'
 
+const RELEASE_REPO = 'HalSysFin/Codex-Auth-Manager---VS-Code-Extension'
+const RELEASE_CHECK_INTERVAL_MS = 12 * 60 * 60 * 1000
+const RELEASE_CHECK_CACHE_KEY = 'authManager.releaseCheck'
+const RELEASE_CHECK_USER_AGENT = 'codex-auth-manager-extension'
+
+function compareVersions(left: string, right: string): number {
+  const normalize = (value: string): number[] => value
+    .trim()
+    .replace(/^v/i, '')
+    .split('.')
+    .map((part) => Number.parseInt(part.replace(/[^0-9].*$/, ''), 10) || 0)
+  const a = normalize(left)
+  const b = normalize(right)
+  const length = Math.max(a.length, b.length)
+  for (let index = 0; index < length; index += 1) {
+    const diff = (a[index] || 0) - (b[index] || 0)
+    if (diff !== 0) {
+      return diff > 0 ? 1 : -1
+    }
+  }
+  return 0
+}
+
 class AuthManagerController {
   private readonly output = vscode.window.createOutputChannel('Codex Auth Manager')
   private readonly statusBar = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 100)
@@ -92,8 +115,49 @@ class AuthManagerController {
       }),
     )
     this.updatePresentation()
+    void this.checkForExtensionUpdate()
     await this.ensureLease()
     this.restartTimers()
+  }
+
+  private async checkForExtensionUpdate(): Promise<void> {
+    const cacheKey = `${RELEASE_CHECK_CACHE_KEY}:${RELEASE_REPO}`
+    const now = Date.now()
+    const lastCheckedAt = this.context.globalState.get<number>(cacheKey, 0)
+    if (now - lastCheckedAt < RELEASE_CHECK_INTERVAL_MS) {
+      return
+    }
+    await this.context.globalState.update(cacheKey, now)
+    try {
+      const response = await fetch(`https://api.github.com/repos/${RELEASE_REPO}/releases/latest`, {
+        headers: {
+          Accept: 'application/vnd.github+json',
+          'User-Agent': RELEASE_CHECK_USER_AGENT,
+        },
+      })
+      if (!response.ok) {
+        throw new Error(`GitHub release check failed with ${response.status}`)
+      }
+      const release = (await response.json()) as { tag_name?: string; html_url?: string }
+      const latestVersion = release.tag_name?.trim()
+      const currentVersion = String(this.context.extension.packageJSON.version || '').trim()
+      if (!latestVersion || !currentVersion || compareVersions(latestVersion, currentVersion) <= 0) {
+        return
+      }
+      this.log(`Extension update available: current=${currentVersion} latest=${latestVersion}`)
+      const selection = await vscode.window.showInformationMessage(
+        `A newer release of ${this.context.extension.packageJSON.displayName || this.context.extension.packageJSON.name} is available (${latestVersion}).`,
+        'View Release',
+        'Dismiss',
+      )
+      if (selection === 'View Release') {
+        const releaseUrl = release.html_url || `https://github.com/${RELEASE_REPO}/releases/latest`
+        await vscode.env.openExternal(vscode.Uri.parse(releaseUrl))
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      this.log(`Extension version check skipped: ${message}`)
+    }
   }
 
   private registerCommands(): void {
@@ -185,6 +249,19 @@ class AuthManagerController {
     })
   }
 
+  private shouldRematerializeAuth(status: LeaseStatusResponse): boolean {
+    if (!this.state.leaseId || !status.auth_refresh_required) {
+      return false
+    }
+    if (!status.credential_auth_updated_at) {
+      return true
+    }
+    if (!this.state.lastAuthWriteAt) {
+      return true
+    }
+    return status.credential_auth_updated_at > this.state.lastAuthWriteAt
+  }
+
   private currentViewModel(): LeaseViewModel {
     const config = vscode.workspace.getConfiguration()
     return {
@@ -243,6 +320,10 @@ class AuthManagerController {
       if (startupAction === 'renew') {
         await this.renewLease(false)
       }
+      if (this.shouldRematerializeAuth(status)) {
+        this.log('Credential auth changed on the manager; rematerializing active lease')
+        await this.materializeAndWriteAuth(status.lease_id)
+      }
       if (!(await authFileExists(this.authFilePath()))) {
         this.log('Auth file missing; materializing active lease')
         await this.materializeAndWriteAuth(status.lease_id)
@@ -283,6 +364,10 @@ class AuthManagerController {
       }
       if (refreshAction === 'renew') {
         await this.renewLease(false)
+      }
+      if (this.shouldRematerializeAuth(status)) {
+        this.log(`Credential auth changed for lease ${status.lease_id}; rematerializing`)
+        await this.materializeAndWriteAuth(status.lease_id)
       }
       this.setMessage(`Lease refreshed at ${new Date().toLocaleTimeString()}.`)
     } catch (error) {
@@ -566,6 +651,12 @@ class AuthManagerController {
     try {
       await this.client.postTelemetry(this.state.leaseId, buildLeaseTelemetryPayload(this.state))
       this.backendReachable = true
+      const status = await this.client.getLease(this.state.leaseId)
+      this.state = await this.stateStore.updateFromLeaseStatus(this.state, status)
+      if (this.shouldRematerializeAuth(status)) {
+        this.log(`Credential auth changed during telemetry for lease ${this.state.leaseId}; rematerializing`)
+        await this.materializeAndWriteAuth(status.lease_id)
+      }
       this.log(`Posted telemetry for lease ${this.state.leaseId}`)
     } catch (error) {
       await this.handleBackendError(error, 'Unable to post telemetry', false)

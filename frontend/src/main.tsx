@@ -8,6 +8,7 @@ type RefreshStatus = {
   last_success_at?: string | null
   last_error?: string | null
   is_stale?: boolean
+  reauth_required?: boolean
 }
 
 type Limit = {
@@ -1022,6 +1023,33 @@ function App() {
     })
     return copy
   }, [accounts, accountSort])
+
+  const accountHealthSummary = useMemo(() => {
+    let reauthRequired = 0
+    let safeToAssign = 0
+    let leased = 0
+    let stale = 0
+    for (const account of accounts) {
+      const refreshStatus = account.refresh_status || {}
+      const requiresReauth = Boolean(refreshStatus.reauth_required)
+      const hasActiveLease = Boolean(account.active_lease)
+      if (refreshStatus.is_stale) stale += 1
+      if (hasActiveLease) leased += 1
+      if (requiresReauth) {
+        reauthRequired += 1
+        continue
+      }
+      if (!hasActiveLease) {
+        safeToAssign += 1
+      }
+    }
+    return {
+      reauthRequired,
+      safeToAssign,
+      leased,
+      stale,
+    }
+  }, [accounts])
 
   const statsDaily = usageHistory?.series.daily_usage || []
   const statsCumulative = usageHistory?.series.cumulative_usage || []
@@ -2248,6 +2276,28 @@ function App() {
                 <span className="pill">{accountCount} account{accountCount === 1 ? '' : 's'}</span>
               </div>
             </div>
+            <div className="cards" style={{ marginBottom: 16 }}>
+              <div className={accountHealthSummary.reauthRequired > 0 ? 'warn-card' : ''}>
+                <label>Reauth Required</label>
+                <strong>{accountHealthSummary.reauthRequired}</strong>
+                <div className="muted small">Expired or non-refreshable auths that need a fresh sign-in</div>
+              </div>
+              <div>
+                <label>Safe To Assign</label>
+                <strong>{accountHealthSummary.safeToAssign}</strong>
+                <div className="muted small">Available accounts without an active lease or reauth block</div>
+              </div>
+              <div>
+                <label>Currently Leased</label>
+                <strong>{accountHealthSummary.leased}</strong>
+                <div className="muted small">Accounts actively serving a client lease</div>
+              </div>
+              <div className={accountHealthSummary.stale > 0 ? 'warn-card' : ''}>
+                <label>Stale Status</label>
+                <strong>{accountHealthSummary.stale}</strong>
+                <div className="muted small">Accounts with old usage/refresh snapshots</div>
+              </div>
+            </div>
             <div className="table-head">
               <span>Profile</span>
               <span>Rate Limits</span>
@@ -2266,6 +2316,8 @@ function App() {
               const scopeError = rateError.includes('Missing scopes') ? 'Live rate-limit scopes are missing for this account.' : rateError
               const badge = refreshBadge(secondary, null, undefined)
               const refreshState = a.refresh_status?.state || 'idle'
+              const requiresReauth = Boolean(a.refresh_status?.reauth_required)
+              const safeToAssign = !requiresReauth && !a.active_lease
               const refreshLabel =
                 refreshState === 'refreshing'
                   ? 'Refreshing'
@@ -2281,6 +2333,15 @@ function App() {
                       <button className="profile-link-btn" onClick={() => void openAccountHistory(a.label)}>
                         {sensitiveText(a.display_label || a.label)}
                       </button>
+                      {requiresReauth ? (
+                        <span className="pill" style={{ background: 'rgba(239,68,68,.12)', color: '#fca5a5', borderColor: 'rgba(239,68,68,.35)' }}>
+                          Reauth Required
+                        </span>
+                      ) : safeToAssign ? (
+                        <span className="pill" style={{ background: 'rgba(16,185,129,.12)', color: '#6ee7b7', borderColor: 'rgba(16,185,129,.35)' }}>
+                          Safe To Assign
+                        </span>
+                      ) : null}
                       <span className={`refresh-indicator ${refreshState}`}>
                         <span className="refresh-dot" />
                         {refreshLabel}
@@ -2294,6 +2355,11 @@ function App() {
                       <CodexBadge />
                     </div>
                     <div className="muted mono">Profile label: {sensitiveText(a.label)}</div>
+                    {requiresReauth ? (
+                      <div className="muted mono" style={{ color: '#fca5a5' }}>
+                        {a.refresh_status?.last_error || 'This auth needs to be signed in again before it can be assigned.'}
+                      </div>
+                    ) : null}
                     {a.active_lease ? (
                       <div className="muted mono">
                         Leased to {a.active_lease.machine_id} / {a.active_lease.agent_id}
@@ -2377,7 +2443,7 @@ function App() {
               <label>Current Used</label>
               <div className="unit-value"><strong>{fmtNullableNumber(statsSummary?.current_total_used)}</strong></div>
               <div className={`muted small ${pctClass(statsSummary?.weekly_utilization_now || 0)}`}>
-                {statsSummary?.weekly_utilization_now == null ? 'No live utilization snapshot' : `${statsSummary.weekly_utilization_now}% weekly utilization now`}
+                {statsSummary?.weekly_utilization_now == null ? 'No live 5h utilization snapshot' : `${statsSummary.weekly_utilization_now}% 5h utilization now`}
               </div>
             </div>
             <div>
@@ -2385,8 +2451,8 @@ function App() {
               <div className="unit-value"><strong>{fmtNullableNumber(statsSummary?.current_total_remaining)}</strong></div>
               <div className="muted small">
                 {statsModeledFallback
-                  ? 'Normalized remaining capacity across accounts'
-                  : (statsFallbackMode ? 'Unavailable in fallback mode' : 'Current remaining across accounts')}
+                  ? 'Normalized 5h remaining capacity across accounts'
+                  : (statsFallbackMode ? 'Unavailable in fallback mode' : 'Current remaining across the 5h pool window')}
               </div>
             </div>
             <div className={(aggregate.fleet_efficiency_pct < 80 && !statsFallbackMode) ? 'warn-card' : ''}>
@@ -2394,8 +2460,8 @@ function App() {
               <div className="unit-value"><strong>{fmtNullableNumber(statsSummary?.current_total_limit)}</strong></div>
               <div className="muted small">
                 {statsModeledFallback
-                  ? 'Normalized capacity at 100 units per account'
-                  : (statsFallbackMode ? 'Unavailable in fallback mode' : 'Current total limit across accounts')}
+                  ? 'Normalized 5h capacity at 100 units per account'
+                  : (statsFallbackMode ? 'Unavailable in fallback mode' : 'Current total 5h limit across accounts')}
               </div>
             </div>
             <div className={aggregate.total_wasted_units > 0 ? 'warn-card' : ''}>
@@ -2425,14 +2491,14 @@ function App() {
                 {statsModeledFallback
                   ? (selectedRange === '1d' && statsChartMode === 'daily'
                       ? 'Usage line = normalized units reconstructed from 10-minute utilization buckets'
-                      : 'Usage line = normalized units reconstructed from utilization snapshots (100 per account)')
+                      : 'Usage line = normalized 5h units reconstructed from utilization snapshots (100 per account)')
                   : (statsFallbackMode
-                      ? 'Usage line = weekly utilization % from stored snapshots (absolute counters unavailable)'
+                      ? 'Usage line = 5h utilization % from stored snapshots (absolute counters unavailable)'
                       : 'Usage line = consumed units (from lifetime deltas), not utilization %')}
               </span>
               <span className="legend-item">
                 <span className="legend-dot legend-dot-amber" />
-                Weekly utilization now: {weeklyUtilizationNow == null ? '--' : `${weeklyUtilizationNow}%`}
+                5h utilization now: {weeklyUtilizationNow == null ? '--' : `${weeklyUtilizationNow}%`}
                 {weeklyPercents.length ? ` (${weeklyAtCapCount}/${weeklyPercents.length} at 100%)` : ''}
               </span>
             </div>
@@ -2793,7 +2859,7 @@ function App() {
                   <div className="muted mono">
                     util: {cred.utilization_pct == null ? '--' : `${Math.round(Number(cred.utilization_pct))}%`} · remaining: {cred.quota_remaining == null ? '--' : cred.quota_remaining}
                   </div>
-                  <div className="muted mono">weekly reset: {fmtTs(cred.weekly_reset_at || null)}</div>
+                  <div className="muted mono">5h reset: {fmtTs(cred.weekly_reset_at || null)}</div>
                   <div className="muted mono">telemetry: {fmtTs(cred.last_telemetry_at || null)}</div>
                 </div>
                 <div className="actions-col">

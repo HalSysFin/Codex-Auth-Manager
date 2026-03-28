@@ -8,6 +8,17 @@ test('entry registers only the service and does not depend on llm_output hooks',
     | {
         start: (ctx: { config?: Record<string, unknown>; env?: NodeJS.ProcessEnv }) => void | Promise<void>
         stop?: () => void | Promise<void>
+        lease?: {
+          status: (input?: { refresh?: boolean }) => Promise<unknown>
+          ensure: (input?: { reason?: string }) => Promise<unknown>
+          renew: (input?: { reason?: string }) => Promise<unknown>
+          rotate: (input?: { reason?: string }) => Promise<unknown>
+          release: (input?: { reason?: string }) => Promise<unknown>
+          reacquire: (input?: { reason?: string }) => Promise<unknown>
+          materialize: () => Promise<unknown>
+          flushTelemetry: () => Promise<unknown>
+          setAutoMode: (input: { autoRenew?: boolean; autoRotate?: boolean }) => Promise<unknown>
+        }
       }
     | undefined
   const originalFetch = globalThis.fetch
@@ -60,6 +71,7 @@ test('entry registers only the service and does not depend on llm_output hooks',
     })
 
     assert.ok(registeredService)
+    assert.ok(registeredService.lease)
 
     await registeredService.start({
       config: {
@@ -90,6 +102,9 @@ test('entry registers only the service and does not depend on llm_output hooks',
         AUTH_MANAGER_INTERNAL_API_TOKEN: 'secret',
       },
     })
+
+    const status = await registeredService.lease?.status({ refresh: false })
+    assert.ok(status)
 
     await registeredService.stop?.()
   } finally {

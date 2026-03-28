@@ -21,6 +21,7 @@ import {
 import { buildLeaseTelemetryPayload } from '../../packages/lease-runtime/src/telemetry.ts'
 import type {
   LeaseAcquireResponse,
+  LeaseStatusResponse,
   LeaseHealthState,
   PersistedDesktopState,
   RuntimeLeaseState,
@@ -129,6 +130,10 @@ export class DesktopLeaseController {
         if (action === 'renew') {
           await this.renewLease()
         }
+        if (this.shouldRematerializeAuth(status)) {
+          await this.log(`Credential auth changed for lease ${status.lease_id}; rematerializing`)
+          await this.materializeAndWriteAuth(status.lease_id)
+        }
         if (!(await authFileExists(this.state.settings.authFilePath))) {
           const leaseId = this.state.lease.leaseId
           if (leaseId) {
@@ -175,6 +180,11 @@ export class DesktopLeaseController {
       }
       if (shouldRenewLease(status, this.state.settings.autoRenew)) {
         await this.renewLease()
+        return
+      }
+      if (this.shouldRematerializeAuth(status)) {
+        await this.log(`Credential auth changed for lease ${status.lease_id}; rematerializing`)
+        await this.materializeAndWriteAuth(status.lease_id)
         return
       }
       this.setMessage(`Lease refreshed at ${new Date().toLocaleTimeString()}.`)
@@ -301,6 +311,12 @@ export class DesktopLeaseController {
     try {
       await this.client.postTelemetry(this.state.lease.leaseId, buildLeaseTelemetryPayload(this.state.lease))
       this.backendReachable = true
+      const status = await this.client.getLease(this.state.lease.leaseId)
+      this.state.lease = updateRuntimeStateFromLeaseStatus(this.state.lease, status)
+      if (this.shouldRematerializeAuth(status)) {
+        await this.log(`Credential auth changed during telemetry for lease ${status.lease_id}; rematerializing`)
+        await this.materializeAndWriteAuth(status.lease_id)
+      }
       await this.log(`Posted telemetry for lease ${this.state.lease.leaseId}`)
     } catch (error) {
       await this.handleError(error, 'Unable to post telemetry', false)
@@ -377,6 +393,19 @@ export class DesktopLeaseController {
 
   private setMessage(message: string | null): void {
     this.message = message
+  }
+
+  private shouldRematerializeAuth(status: LeaseStatusResponse): boolean {
+    if (!this.state.lease.leaseId || !status.auth_refresh_required) {
+      return false
+    }
+    if (!status.credential_auth_updated_at) {
+      return true
+    }
+    if (!this.state.lease.lastAuthWriteAt) {
+      return true
+    }
+    return status.credential_auth_updated_at > this.state.lease.lastAuthWriteAt
   }
 
   private currentHealthState(): LeaseHealthState {

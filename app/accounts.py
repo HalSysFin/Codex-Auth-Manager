@@ -23,6 +23,7 @@ class AccountProfile:
     plan_type: str | None = None
     access_token: str | None = None
     email: str | None = None
+    auth_updated_at: str | None = None
     rate_limit_window_type: str | None = None
     usage_limit: int | None = None
     usage_in_window: int | None = None
@@ -70,6 +71,7 @@ def list_profiles() -> list[AccountProfile]:
                 plan_type=identity.plan_type,
                 access_token=access_token,
                 email=str(row.get("email")) if row.get("email") is not None else identity.email,
+                auth_updated_at=str(row.get("auth_updated_at")) if row.get("auth_updated_at") is not None else None,
             )
         )
 

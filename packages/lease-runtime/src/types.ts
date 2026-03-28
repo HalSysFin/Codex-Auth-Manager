@@ -48,6 +48,8 @@ export interface LeaseStatusResponse {
   replacement_required: boolean
   reason: string | null
   credential_state: string
+  credential_auth_updated_at?: string | null
+  auth_refresh_required?: boolean
   effective_rotation_policy?: 'replacement_required_only' | 'recommended_or_required'
 }
 
@@ -105,6 +107,7 @@ export interface RuntimeLeaseState {
   latestTelemetryAt: string | null
   latestUtilizationPct: number | null
   latestQuotaRemaining: number | null
+  credentialAuthUpdatedAt: string | null
   lastAuthWriteAt: string | null
   lastBackendRefreshAt: string | null
   replacementRequired: boolean
@@ -119,6 +122,7 @@ export interface RuntimeSettings {
   machineId: string
   agentId: string
   authFilePath: string
+  openDashboardPath: string
   refreshIntervalSeconds: number
   telemetryIntervalSeconds: number
   autoRenew: boolean

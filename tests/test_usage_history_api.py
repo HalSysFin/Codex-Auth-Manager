@@ -287,6 +287,84 @@ class UsageHistoryApiTests(unittest.TestCase):
         self.assertEqual(payload["series"]["daily_usage"], [])
         self.assertTrue(len(payload["series"]["hourly_weekly_utilization"]) >= 1)
 
+    def test_usage_history_falls_back_when_absolute_coverage_is_partial(self) -> None:
+        profiles = [
+            AccountProfile(
+                label="max",
+                path=Path("/tmp/max.json"),
+                auth={},
+                account_key="acct:max",
+                email="max@example.com",
+            ),
+            AccountProfile(
+                label="james",
+                path=Path("/tmp/james.json"),
+                auth={},
+                account_key="acct:james",
+                email="james@example.com",
+            ),
+        ]
+        with (
+            patch("app.main._require_internal_auth", return_value=None),
+            patch("app.main._dedupe_profiles", return_value=profiles),
+            patch("app.main.list_profiles", return_value=profiles),
+            patch("app.main._touch_profiles_usage", return_value=None),
+            patch("app.main._build_cached_accounts_snapshot", return_value={
+                "accounts": [
+                    {
+                        "account_key": "acct:max",
+                        "label": "max",
+                        "display_label": "max",
+                        "email": "max@example.com",
+                        "refresh_status": {},
+                        "usage_tracking": {"secondary_used_percent": 40.0},
+                    },
+                    {
+                        "account_key": "acct:james",
+                        "label": "james",
+                        "display_label": "james",
+                        "email": "james@example.com",
+                        "refresh_status": {},
+                        "usage_tracking": {"secondary_used_percent": 20.0},
+                    },
+                ],
+                "current_label": "max",
+                "aggregate": {
+                    "total_current_window_used": 0,
+                    "total_current_window_limit": 0,
+                    "total_remaining": 0,
+                    "stale_accounts": 0,
+                    "failed_accounts": 0,
+                    "last_refresh_time": "2026-03-22T20:50:25.528974+00:00",
+                },
+            }),
+            patch("app.main.list_absolute_usage_snapshots", return_value=[
+                {
+                    "account_id": "acct:max",
+                    "captured_at": "2026-03-22T10:00:00+00:00",
+                    "usage_in_window": 0,
+                    "usage_limit": 100,
+                    "lifetime_used": 60,
+                }
+            ]),
+            patch("app.main.list_usage_rollovers", return_value=[]),
+            patch("app.main.list_usage_snapshots", return_value=[
+                {"account_id": "acct:max", "captured_at": "2026-03-22T19:00:00+00:00", "secondary_used_percent": 30.0},
+                {"account_id": "acct:max", "captured_at": "2026-03-22T20:00:00+00:00", "secondary_used_percent": 40.0},
+                {"account_id": "acct:james", "captured_at": "2026-03-22T19:00:00+00:00", "secondary_used_percent": 10.0},
+                {"account_id": "acct:james", "captured_at": "2026-03-22T20:00:00+00:00", "secondary_used_percent": 20.0},
+            ]),
+        ):
+            response = asyncio.run(api_usage_history(request=None, range="1d"))
+
+        payload = _json_body(response)
+        self.assertTrue(payload["summary"]["fallback_mode"])
+        self.assertFalse(payload["summary"]["absolute_usage_available"])
+        self.assertEqual(payload["summary"]["total_consumed_in_range"], 20.0)
+        self.assertEqual(payload["summary"]["current_total_used"], 60.0)
+        self.assertEqual(payload["summary"]["current_total_limit"], 200.0)
+        self.assertEqual(payload["summary"]["current_total_remaining"], 140.0)
+
     def test_modeled_consumption_ignores_resets_and_keeps_positive_deltas(self) -> None:
         snapshots = [
             {"account_id": "acct:max", "captured_at": "2026-03-22T00:10:00+00:00", "secondary_used_percent": 40.0},

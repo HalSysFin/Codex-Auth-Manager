@@ -128,6 +128,96 @@ By default the plugin is configured for a sticky OpenClaw lease:
 
 That means short restarts do not voluntarily give the auth back, and the plugin only switches auth when the current leased credential is no longer serviceable.
 
+## Lease Control API
+
+The plugin now exposes a thin manual lease-control surface on top of the existing automatic lifecycle.
+
+Available methods:
+
+- `lease.status({ refresh? })`
+- `lease.ensure({ reason? })`
+- `lease.renew({ reason? })`
+- `lease.rotate({ reason? })`
+- `lease.release({ reason? })`
+- `lease.reacquire({ reason? })`
+- `lease.materialize()`
+- `lease.flushTelemetry()`
+- `lease.setAutoMode({ autoRenew?, autoRotate? })`
+
+Each method returns a structured result:
+
+```ts
+{
+  ok: boolean
+  operation: string
+  status: {
+    leaseId: string | null
+    state: string | null
+    credentialId: string | null
+    expiresAt: string | null
+    utilizationPct: number | null
+    quotaRemaining: number | null
+    rotationRecommended: boolean
+    replacementRequired: boolean
+    authMaterialized: boolean
+    leaseProfileId: string | null
+    machineId: string | null
+    agentId: string | null
+    autoRenew: boolean
+    autoRotate: boolean
+    lastError: string | null
+    lastRefreshAt: string | null
+  }
+  error: {
+    code: string
+    message: string
+  } | null
+}
+```
+
+Example:
+
+```ts
+const result = await service.lease.rotate({ reason: 'studio_manual_rotate' })
+if (!result.ok) {
+  console.error(result.error?.code, result.error?.message)
+}
+```
+
+### Rotate vs Reacquire
+
+- `rotate` asks the broker to replace the current active lease with another lease
+- `reacquire` is the stronger path:
+  - flush pending telemetry
+  - release the current lease if one exists
+  - acquire a fresh lease
+  - materialize auth again
+
+Use `rotate` when you want a broker-managed replacement decision.
+Use `reacquire` when you explicitly want to drop the current lease and start fresh.
+
+### Release Behavior
+
+`release` releases the current lease at the broker and clears the plugin's active lease context.
+
+Important:
+
+- it does **not** currently delete the local auth files immediately
+- the local auth remains on disk until a later materialization or shutdown cleanup path changes it
+- pending telemetry is flushed first on a best-effort basis before release
+
+### Auto-Renew / Auto-Rotate
+
+The automatic background loop still works as before.
+
+The new control API can also change automation at runtime:
+
+```ts
+await service.lease.setAutoMode({ autoRenew: true, autoRotate: false })
+```
+
+This updates the in-memory behavior for the running plugin instance without requiring a restart.
+
 ## Duplicate Installs And Upgrades
 
 The plugin keeps stable install identity values:
