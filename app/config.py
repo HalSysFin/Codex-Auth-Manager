@@ -17,6 +17,10 @@ class Settings(BaseSettings):
 
     codex_cli_bin: str = "codex"
     codex_auth_path: str = "/root/.codex/auth.json"
+    codex_refresh_enabled: bool = True
+    codex_refresh_model: str = "gpt-4o-mini"
+    codex_refresh_prompt: str = "Reply with exactly OK."
+    codex_refresh_timeout_seconds: int = 30
     callback_store_dir: str = "/var/lib/auth-manager/callbacks"
     codex_profiles_dir: str = "/var/lib/auth-manager/legacy/profiles"
     usage_db_path: str = "/var/lib/auth-manager/legacy/auth-manager.sqlite3"

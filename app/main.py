@@ -4,6 +4,9 @@ import base64
 import hmac
 import ipaddress
 import json
+import os
+import tempfile
+import subprocess
 import hashlib
 import logging
 import re
@@ -119,7 +122,7 @@ from .login_sessions import (
     validate_relay_token,
 )
 
-APP_VERSION = "1.2.3"
+APP_VERSION = "1.2.4"
 GITHUB_REPO = "HalSysFin/Codex-Auth-Manager"
 _VERSION_CHECK_CACHE: dict[str, Any] = {
     "checked_at": None,
@@ -241,7 +244,7 @@ def _profile_reauth_requirement(
     has_refresh = bool(extract_refresh_token(auth_json))
     if not has_refresh:
         return True, "Access token expired and no refresh token is available."
-    if not settings.openai_token_url or not settings.openai_client_id:
+    if not _refresh_keepalive_supported():
         return True, "Access token expired and automatic refresh is not configured on the manager."
     return False, None
 
@@ -343,10 +346,12 @@ async def on_startup() -> None:
     except Exception as exc:
         logger.warning("legacy account alias reconciliation failed: %s", exc)
     try:
-        refreshed = await _refresh_saved_auths_if_needed()
-        if refreshed:
-            logger.info("auth keepalive refreshed %s saved auth(s) on startup", refreshed)
-            _sync_broker_credentials_from_profiles()
+        # Avoid blocking startup on Codex CLI refreshes; let the periodic task handle it.
+        if settings.openai_token_url and settings.openai_client_id:
+            refreshed = await _refresh_saved_auths_if_needed()
+            if refreshed:
+                logger.info("auth keepalive refreshed %s saved auth(s) on startup", refreshed)
+                _sync_broker_credentials_from_profiles()
     except Exception as exc:
         logger.warning("startup auth keepalive refresh failed: %s", exc)
     global _reconcile_task
@@ -3070,6 +3075,116 @@ async def _refresh_saved_auth_via_refresh_token(profile: AccountProfile) -> bool
     return True
 
 
+def _refresh_keepalive_supported() -> bool:
+    if settings.openai_token_url and settings.openai_client_id:
+        return True
+    return bool(settings.codex_refresh_enabled and settings.codex_cli_bin)
+
+
+def _write_auth_json(path: Path, auth_json: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(auth_json, ensure_ascii=False, indent=2))
+
+
+def _read_auth_json(path: Path) -> dict[str, Any] | None:
+    if not path.exists():
+        return None
+    try:
+        return json.loads(path.read_text())
+    except Exception:
+        return None
+
+
+def _codex_cli_refresh_error_text(stdout: str, stderr: str) -> str:
+    combined = "\n".join(part for part in [stdout.strip(), stderr.strip()] if part).strip()
+    return combined or "Codex CLI refresh failed"
+
+
+def _codex_cli_refresh_attempt(
+    *,
+    auth_json: dict[str, Any],
+    model: str | None,
+    prompt: str,
+    timeout_seconds: int,
+) -> dict[str, Any] | None:
+    with tempfile.TemporaryDirectory(prefix="codex-refresh-") as tmp_dir:
+        home = Path(tmp_dir)
+        auth_path = home / ".codex" / "auth.json"
+        _write_auth_json(auth_path, auth_json)
+        env = os.environ.copy()
+        env["HOME"] = str(home)
+        env["USERPROFILE"] = str(home)
+        env["XDG_CONFIG_HOME"] = str(home / ".config")
+        env["XDG_DATA_HOME"] = str(home / ".local" / "share")
+        cmd = [settings.codex_cli_bin, "exec", "--skip-git-repo-check"]
+        if model:
+            cmd += ["-m", model]
+        cmd.append(prompt)
+        result = subprocess.run(
+            cmd,
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=timeout_seconds,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(_codex_cli_refresh_error_text(result.stdout, result.stderr))
+        return _read_auth_json(auth_path)
+
+
+async def _refresh_saved_auth_via_codex_cli(profile: AccountProfile) -> bool:
+    auth_json = profile.auth if isinstance(profile.auth, dict) else {}
+    refresh_token = extract_refresh_token(auth_json)
+    if not refresh_token or not settings.codex_refresh_enabled:
+        return False
+
+    def _do_refresh() -> dict[str, Any] | None:
+        model = (settings.codex_refresh_model or "").strip() or None
+        prompt = (settings.codex_refresh_prompt or "").strip() or "Reply with exactly OK."
+        timeout_seconds = max(5, int(settings.codex_refresh_timeout_seconds or 30))
+        try:
+            return _codex_cli_refresh_attempt(
+                auth_json=auth_json,
+                model=model,
+                prompt=prompt,
+                timeout_seconds=timeout_seconds,
+            )
+        except RuntimeError as exc:
+            if model:
+                # Retry without model in case the CLI rejects the provided model.
+                return _codex_cli_refresh_attempt(
+                    auth_json=auth_json,
+                    model=None,
+                    prompt=prompt,
+                    timeout_seconds=timeout_seconds,
+                )
+            raise exc
+
+    next_auth = await asyncio.to_thread(_do_refresh)
+    if not isinstance(next_auth, dict):
+        return False
+    old_access = extract_access_token(auth_json) or ""
+    new_access = extract_access_token(next_auth) or ""
+    if not new_access:
+        return False
+    if new_access == old_access and next_auth.get("last_refresh") == auth_json.get("last_refresh"):
+        return False
+
+    next_auth["last_refresh"] = datetime.now(timezone.utc).isoformat()
+    identity = extract_account_identity(next_auth)
+    upsert_saved_profile(
+        label=profile.label,
+        account_key=identity.account_key or profile.account_key,
+        auth_json=next_auth,
+        email=identity.email or profile.email,
+        name=identity.name or profile.name,
+        subject=identity.subject or profile.subject,
+        user_id=identity.user_id or profile.user_id,
+        provider_account_id=identity.account_id or profile.provider_account_id,
+    )
+    return True
+
+
 async def _refresh_saved_auths_if_needed() -> int:
     refreshed = 0
     for profile in _dedupe_profiles(list_profiles()):
@@ -3079,7 +3194,11 @@ async def _refresh_saved_auths_if_needed() -> int:
         if not _auth_access_token_expiring_soon(auth_json):
             continue
         try:
-            if await _refresh_saved_auth_via_refresh_token(profile):
+            if settings.openai_token_url and settings.openai_client_id:
+                ok = await _refresh_saved_auth_via_refresh_token(profile)
+            else:
+                ok = await _refresh_saved_auth_via_codex_cli(profile)
+            if ok:
                 refreshed += 1
         except Exception as exc:
             logger.warning("auth keepalive refresh failed for %s: %s", profile.label, exc)
