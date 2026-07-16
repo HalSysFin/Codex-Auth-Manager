@@ -7,7 +7,7 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/HalSysFin/codex-auth-manager.git"
+    "url": "https://github.com/HalSysFin/Codex-Auth-Manager---Cursor-Extension.git"
   },
   "engines": {
     "vscode": "^1.90.0"

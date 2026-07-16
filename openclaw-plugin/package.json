@@ -3,6 +3,11 @@
   "version": "1.0.5",
   "type": "module",
   "description": "Plugin-ready Auth Manager lease telemetry module for OpenClaw.",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/HalSysFin/Codex-Auth-Manager---OpenClaw-Plugin.git"
+  },
+  "homepage": "https://github.com/HalSysFin/Codex-Auth-Manager---OpenClaw-Plugin",
   "openclaw": {
     "extensions": [
       "./index.js"

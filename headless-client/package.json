@@ -2,6 +2,10 @@
   "name": "auth-manager-headless-client",
   "version": "0.1.4",
   "private": true,
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/HalSysFin/Codex-Auth-Manager---Headless-Client.git"
+  },
   "type": "module",
   "bin": {
     "auth-manager-agent": "dist/headless-client/src/cli.js"

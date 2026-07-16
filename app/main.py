@@ -134,7 +134,7 @@ from .login_sessions import (
 )
 from .oauth_flow import build_auth_payload
 
-APP_VERSION = "1.2.5"
+APP_VERSION = "1.2.6"
 GITHUB_REPO = "HalSysFin/Codex-Auth-Manager"
 _VERSION_CHECK_CACHE: dict[str, Any] = {
     "checked_at": None,

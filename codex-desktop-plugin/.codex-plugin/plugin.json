@@ -5,10 +5,10 @@
   "author": {
     "name": "James",
     "email": "you@example.com",
-    "url": "https://github.com/HalSysFin/Codex-Auth-Manager---VS-Code-Extension"
+    "url": "https://github.com/HalSysFin/Codex-Auth-Manager---Codex-Desktop-Plugin"
   },
-  "homepage": "https://github.com/HalSysFin/Codex-Auth-Manager---VS-Code-Extension",
-  "repository": "https://github.com/HalSysFin/Codex-Auth-Manager---VS-Code-Extension",
+  "homepage": "https://github.com/HalSysFin/Codex-Auth-Manager---Codex-Desktop-Plugin",
+  "repository": "https://github.com/HalSysFin/Codex-Auth-Manager---Codex-Desktop-Plugin",
   "license": "MIT",
   "keywords": [
     "auth",
@@ -29,7 +29,7 @@
       "Read",
       "Write"
     ],
-    "websiteURL": "https://github.com/HalSysFin/Codex-Auth-Manager---VS-Code-Extension",
+    "websiteURL": "https://github.com/HalSysFin/Codex-Auth-Manager---Codex-Desktop-Plugin",
     "defaultPrompt": [
       "Check the current Codex Desktop lease health and tell me if anything needs rotating.",
       "Ensure Codex Desktop has an active lease and materialized auth.",

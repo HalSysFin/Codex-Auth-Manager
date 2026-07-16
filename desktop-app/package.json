@@ -2,6 +2,10 @@
   "name": "codex-auth-manager-desktop",
   "version": "0.1.4",
   "private": true,
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/HalSysFin/Codex-Auth-Manager---Desktop-App.git"
+  },
   "type": "module",
   "scripts": {
     "dev": "vite",
