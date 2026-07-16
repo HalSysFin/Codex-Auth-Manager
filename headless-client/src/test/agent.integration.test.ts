@@ -146,6 +146,49 @@ test('headless ensure acquires, materializes, and writes auth file', async () =>
   })
 })
 
+test('headless reset methods use only the active lease and refresh its status', async () => {
+  await withTempAgent(async ({ config, document }) => {
+    document.lease.leaseId = 'lease-1'
+    document.lease.leaseState = 'active'
+    document.lease.expiresAt = '2099-03-23T01:00:00.000Z'
+    const requests: Array<{ url: string; body: Record<string, unknown> }> = []
+    const originalFetch = globalThis.fetch
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input)
+      requests.push({ url, body: JSON.parse(String(init?.body || '{}')) as Record<string, unknown> })
+      if (url.endsWith('/rate-limit-resets/read')) {
+        return new Response(JSON.stringify({ status: 'ok', lease_id: 'lease-1', credential_id: 'cred-1', available_count: 1, credits: [], rate_limits: {}, fetched_at: '2026-07-16T00:00:00Z' }), { status: 200 })
+      }
+      if (url.endsWith('/rate-limit-resets/consume')) {
+        return new Response(JSON.stringify({ status: 'ok', lease_id: 'lease-1', credential_id: 'cred-1', available_count: 0, credits: [], rate_limits: {}, fetched_at: '2026-07-16T00:00:01Z', outcome: 'reset', idempotency_key: 'generated' }), { status: 200 })
+      }
+      if (url.endsWith('/api/leases/lease-1')) {
+        return new Response(JSON.stringify({
+          lease_id: 'lease-1', credential_id: 'cred-1', state: 'active', issued_at: '2026-03-23T00:00:00.000Z',
+          expires_at: '2099-03-23T01:00:00.000Z', renewed_at: null, machine_id: 'linux-machine', agent_id: 'headless-client',
+          latest_telemetry_at: null, latest_utilization_pct: 0, latest_quota_remaining: null, last_success_at: null,
+          last_error_at: null, rotation_recommended: false, replacement_required: false, reason: null, credential_state: 'active',
+        }), { status: 200 })
+      }
+      throw new Error(`Unexpected fetch: ${url}`)
+    }) as typeof fetch
+
+    try {
+      const agent = new HeadlessAgent(config, document, new MemoryOutput())
+      await agent.getRateLimitResets()
+      await agent.useRateLimitReset('credit-1')
+      assert.equal(requests[0].url.endsWith('/api/leases/lease-1/rate-limit-resets/read'), true)
+      assert.deepEqual(requests[0].body, { machine_id: 'linux-machine', agent_id: 'headless-client' })
+      assert.equal(requests[1].url.endsWith('/api/leases/lease-1/rate-limit-resets/consume'), true)
+      assert.equal(requests[1].body.credit_id, 'credit-1')
+      assert.equal(typeof requests[1].body.idempotency_key, 'string')
+      assert.equal(requests[2].url.endsWith('/api/leases/lease-1'), true)
+    } finally {
+      globalThis.fetch = originalFetch
+    }
+  })
+})
+
 test('headless refresh reacquires revoked leases and rewrites auth file', async () => {
   await withTempAgent(async ({ config, document }) => {
     document.lease.leaseId = 'lease-old'

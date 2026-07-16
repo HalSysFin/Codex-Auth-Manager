@@ -42,8 +42,16 @@ export function defaultRuntimeLeaseState(machineId: string, agentId: string, aut
     leaseState: null,
     latestTelemetryAt: null,
     latestUtilizationPct: null,
+    latestRateLimitUsedPercent: null,
+    latestRateLimitResetAt: null,
+    latestRateLimitPeriod: null,
+    latestPrimaryUtilizationPct: null,
+    latestPrimaryResetAt: null,
+    latestSecondaryUtilizationPct: null,
+    latestSecondaryResetAt: null,
     latestQuotaRemaining: null,
     credentialAuthUpdatedAt: null,
+    lastMaterializedCredentialAuthUpdatedAt: null,
     lastAuthWriteAt: null,
     lastAuthFingerprint: null,
     lastBackendRefreshAt: null,
@@ -65,6 +73,18 @@ export function updateRuntimeStateFromLease(state: RuntimeLeaseState, lease: Lea
     leaseState: lease.state,
     latestTelemetryAt: lease.last_telemetry_at,
     latestUtilizationPct: lease.latest_utilization_pct,
+    latestRateLimitUsedPercent:
+      typeof lease.metadata?.rate_limit_used_percent === 'number'
+        ? lease.metadata.rate_limit_used_percent
+        : state.latestRateLimitUsedPercent,
+    latestRateLimitResetAt:
+      typeof lease.metadata?.rate_limit_reset_at === 'string'
+        ? lease.metadata.rate_limit_reset_at
+        : state.latestRateLimitResetAt,
+    latestRateLimitPeriod:
+      lease.metadata?.rate_limit_period === 'month' || lease.metadata?.rate_limit_period === 'week'
+        ? lease.metadata.rate_limit_period
+        : state.latestRateLimitPeriod,
     latestQuotaRemaining: lease.latest_quota_remaining,
     credentialAuthUpdatedAt:
       typeof lease.metadata?.credential_auth_updated_at === 'string'
@@ -84,6 +104,9 @@ export function updateRuntimeStateFromLeaseStatus(state: RuntimeLeaseState, leas
     leaseState: lease.state,
     latestTelemetryAt: lease.latest_telemetry_at,
     latestUtilizationPct: lease.latest_utilization_pct,
+    latestRateLimitUsedPercent: lease.rate_limit_used_percent ?? state.latestRateLimitUsedPercent,
+    latestRateLimitResetAt: lease.rate_limit_reset_at ?? state.latestRateLimitResetAt,
+    latestRateLimitPeriod: lease.rate_limit_period ?? state.latestRateLimitPeriod,
     latestQuotaRemaining: lease.latest_quota_remaining,
     credentialAuthUpdatedAt: lease.credential_auth_updated_at ?? state.credentialAuthUpdatedAt,
     replacementRequired: lease.replacement_required,
@@ -92,9 +115,15 @@ export function updateRuntimeStateFromLeaseStatus(state: RuntimeLeaseState, leas
   }
 }
 
-export function recordAuthWrite(state: RuntimeLeaseState, atIso: string, fingerprint: string | null = null): RuntimeLeaseState {
+export function recordAuthWrite(
+  state: RuntimeLeaseState,
+  atIso: string,
+  fingerprint: string | null = null,
+  materializedCredentialAuthUpdatedAt: string | null = null,
+): RuntimeLeaseState {
   return {
     ...state,
+    lastMaterializedCredentialAuthUpdatedAt: materializedCredentialAuthUpdatedAt ?? state.lastMaterializedCredentialAuthUpdatedAt,
     lastAuthWriteAt: atIso,
     lastAuthFingerprint: fingerprint,
   }

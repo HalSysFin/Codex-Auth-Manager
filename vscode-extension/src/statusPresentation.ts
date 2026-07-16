@@ -38,6 +38,9 @@ export function formatStatusBarTooltip(
     | 'leaseState'
     | 'expiresAt'
     | 'latestUtilizationPct'
+    | 'latestRateLimitUsedPercent'
+    | 'latestRateLimitResetAt'
+    | 'latestRateLimitPeriod'
     | 'latestQuotaRemaining'
   >,
   healthState: LeaseHealthState,
@@ -52,8 +55,9 @@ export function formatStatusBarTooltip(
     `Health: ${healthState.replace(/_/g, ' ')}`,
     `Lease State: ${state.leaseState || 'Unavailable'}`,
     `Expires: ${state.expiresAt || 'Unavailable'}`,
-    `Utilization: ${state.latestUtilizationPct ?? 'Unavailable'}`,
-    `Quota Remaining: ${state.latestQuotaRemaining ?? 'Unavailable'}`,
+    `Rate Limit: ${state.latestRateLimitUsedPercent ?? state.latestUtilizationPct ?? 'Unavailable'}${state.latestRateLimitUsedPercent ?? state.latestUtilizationPct ?? null ? '%' : ''}`,
+    `Period: ${state.latestRateLimitPeriod || 'Unavailable'}`,
+    `Reset: ${state.latestRateLimitResetAt || 'Unavailable'}`,
   ].join('\n')
 }
 

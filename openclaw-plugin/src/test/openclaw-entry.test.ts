@@ -18,6 +18,8 @@ test('entry registers only the service and does not depend on llm_output hooks',
           materialize: () => Promise<unknown>
           flushTelemetry: () => Promise<unknown>
           setAutoMode: (input: { autoRenew?: boolean; autoRotate?: boolean }) => Promise<unknown>
+          rateLimitResets: () => Promise<unknown>
+          useRateLimitReset: (input?: { creditId?: string | null }) => Promise<unknown>
         }
       }
     | undefined

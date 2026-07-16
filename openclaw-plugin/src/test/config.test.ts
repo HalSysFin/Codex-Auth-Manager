@@ -35,12 +35,12 @@ test('resolvePluginConfig prefers explicit config and applies defaults', () => {
 
 test('resolvePluginConfig accepts brokerAddress, derives machineId, and normalizes agentId', () => {
   const config = resolvePluginConfig({
-    brokerAddress: 'https://openauth.plingindigo.org',
+    brokerAddress: 'https://openauth-api.plingindigo.org',
     internalApiToken: 'secret',
     agentId: 'main',
   }, {})
 
-  assert.equal(config.baseUrl, 'https://openauth.plingindigo.org')
+  assert.equal(config.baseUrl, 'https://openauth-api.plingindigo.org')
   assert.equal(config.internalApiToken, 'secret')
   assert.equal(config.agentId, 'openclaw:main')
   assert.ok(config.machineId.length > 0)

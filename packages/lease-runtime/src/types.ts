@@ -48,9 +48,37 @@ export interface LeaseStatusResponse {
   replacement_required: boolean
   reason: string | null
   credential_state: string
+  rate_limit_used_percent?: number | null
+  rate_limit_reset_at?: string | null
+  rate_limit_period?: 'week' | 'month' | null
   credential_auth_updated_at?: string | null
   auth_refresh_required?: boolean
   effective_rotation_policy?: 'replacement_required_only' | 'recommended_or_required'
+}
+
+export interface RateLimitResetCredit {
+  id: string | null
+  reset_type: string | null
+  status: string | null
+  granted_at: number | string | null
+  expires_at: number | string | null
+  title: string | null
+  description: string | null
+}
+
+export interface RateLimitResetCreditsResponse {
+  status: 'ok'
+  lease_id: string
+  credential_id: string
+  available_count: number | null
+  credits: RateLimitResetCredit[]
+  rate_limits: Record<string, unknown>
+  fetched_at: string
+}
+
+export interface ConsumeRateLimitResetResponse extends RateLimitResetCreditsResponse {
+  outcome: 'reset' | 'alreadyRedeemed' | 'nothingToReset' | 'noCredit' | string
+  idempotency_key: string
 }
 
 export interface LeaseTelemetryRequest {
@@ -71,10 +99,12 @@ export interface LeaseTelemetryRequest {
 
 export interface LeaseAuthReconcileResponse {
   status: 'ok'
-  decision: 'in_sync' | 'client_updated_manager' | 'manager_updated_client'
+  decision: 'in_sync' | 'client_updated_manager' | 'manager_updated_client' | 'identity_mismatch' | 'manager_missing_auth'
   reason: string | null
   profile_label?: string | null
   credential_auth_updated_at?: string | null
+  expected_account_key?: string | null
+  incoming_account_key?: string | null
   auth_json?: AuthPayload | null
 }
 
@@ -115,8 +145,17 @@ export interface RuntimeLeaseState {
   leaseState: string | null
   latestTelemetryAt: string | null
   latestUtilizationPct: number | null
+  latestRateLimitUsedPercent?: number | null
+  latestRateLimitResetAt?: string | null
+  latestRateLimitPeriod?: 'week' | 'month' | null
+  // Retained only so existing persisted extension state migrates cleanly.
+  latestPrimaryUtilizationPct?: number | null
+  latestPrimaryResetAt?: string | null
+  latestSecondaryUtilizationPct?: number | null
+  latestSecondaryResetAt?: string | null
   latestQuotaRemaining: number | null
   credentialAuthUpdatedAt: string | null
+  lastMaterializedCredentialAuthUpdatedAt?: string | null
   lastAuthWriteAt: string | null
   lastAuthFingerprint?: string | null
   lastBackendRefreshAt: string | null

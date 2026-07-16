@@ -58,6 +58,9 @@ body{margin:0;background:#0a0a0a;color:#ededed;font-family:Inter,system-ui,sans-
 .codex-badge-text{font-family:Outfit,sans-serif;line-height:1}
 .mono{font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace}
 .limit-row{display:grid;grid-template-columns:40px 1fr 40px;gap:8px;align-items:center;margin:3px 0}
+.limit-product{display:flex;flex-direction:column;gap:4px;margin:0 0 10px}
+.limit-product:last-child{margin-bottom:0}
+.limit-product-title{font-size:.72rem;color:#a3a3a3;text-transform:uppercase;letter-spacing:.04em;font-weight:700;margin:2px 0 1px}
 .bar{height:8px;border-radius:999px;background:#0a0a0a;border:1px solid #2b2b2b;overflow:hidden}
 .fill{display:block;height:100%}
 .fill.ok{background:#10b981}

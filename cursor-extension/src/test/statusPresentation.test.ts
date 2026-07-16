@@ -42,6 +42,9 @@ test('status bar tooltip includes account, lease, credential, and usage details'
       leaseState: 'active',
       expiresAt: '2026-03-23T12:00:00.000Z',
       latestUtilizationPct: 42,
+      latestRateLimitUsedPercent: 42,
+      latestRateLimitResetAt: '2026-03-29T12:00:00.000Z',
+      latestRateLimitPeriod: 'week',
       latestQuotaRemaining: 1234,
     },
     'active',
@@ -49,8 +52,9 @@ test('status bar tooltip includes account, lease, credential, and usage details'
   assert.match(tooltip, /Account: max/)
   assert.match(tooltip, /Lease Id: lease-1/)
   assert.match(tooltip, /Credential Id: cred-1/)
-  assert.match(tooltip, /Utilization: 42/)
-  assert.match(tooltip, /Quota Remaining: 1234/)
+  assert.match(tooltip, /Rate Limit: 42%/)
+  assert.match(tooltip, /Period: week/)
+  assert.match(tooltip, /Reset: 2026-03-29/)
 })
 
 test('extractAccountIdentity prefers materialize label and name fields', () => {
@@ -89,4 +93,3 @@ test('extractAccountIdentity prefers materialize label and name fields', () => {
   assert.equal(identity.accountLabel, 'max')
   assert.equal(identity.accountName, 'Max')
 })
-

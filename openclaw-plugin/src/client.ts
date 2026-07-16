@@ -5,6 +5,8 @@ import type {
   LeaseTelemetryContext,
   MaterializeLeaseResponse,
   TelemetryPostBody,
+  ConsumeRateLimitResetResponse,
+  RateLimitResetCreditsResponse,
 } from './types.js'
 
 export type ClientOptions = {
@@ -69,6 +71,7 @@ export class AuthManagerTelemetryClient {
     agentId: string
     requestedTtlSeconds?: number
     reason?: string
+    excludeCredentialIds?: string[]
   }): Promise<LeaseAcquireResponse> {
     return this.request<LeaseAcquireResponse>('/api/leases/acquire', {
       method: 'POST',
@@ -77,6 +80,7 @@ export class AuthManagerTelemetryClient {
         agent_id: input.agentId,
         requested_ttl_seconds: input.requestedTtlSeconds,
         reason: input.reason,
+        exclude_credential_ids: input.excludeCredentialIds,
       },
     })
   }
@@ -159,6 +163,31 @@ export class AuthManagerTelemetryClient {
         credential_id: input.credentialId,
         source_name: input.sourceName,
         export_json: input.exportJson,
+      },
+    })
+  }
+
+  async getRateLimitResets(context: LeaseTelemetryContext): Promise<RateLimitResetCreditsResponse> {
+    return this.request<RateLimitResetCreditsResponse>(`/api/leases/${encodeURIComponent(context.leaseId)}/rate-limit-resets/read`, {
+      method: 'POST',
+      body: {
+        machine_id: context.machineId,
+        agent_id: context.agentId,
+      },
+    })
+  }
+
+  async consumeRateLimitReset(
+    context: LeaseTelemetryContext,
+    input: { idempotencyKey: string; creditId?: string | null },
+  ): Promise<ConsumeRateLimitResetResponse> {
+    return this.request<ConsumeRateLimitResetResponse>(`/api/leases/${encodeURIComponent(context.leaseId)}/rate-limit-resets/consume`, {
+      method: 'POST',
+      body: {
+        machine_id: context.machineId,
+        agent_id: context.agentId,
+        idempotency_key: input.idempotencyKey,
+        credit_id: input.creditId || undefined,
       },
     })
   }

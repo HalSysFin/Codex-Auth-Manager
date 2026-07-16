@@ -12,10 +12,14 @@ from app.main import (
     api_account_history,
     api_accounts,
     api_accounts_stream,
+    api_lease_reconcile_auth,
+    auth_export,
     auth_relay_callback,
     api_lease_materialize,
     api_lease_telemetry,
     api_usage_history,
+    _normalize_session_limit_payload,
+    _rate_limit_reset_credits_payload,
 )
 
 
@@ -24,6 +28,93 @@ def _json_body(response) -> dict:
 
 
 class CachedAccountsApiTests(unittest.TestCase):
+    def test_normalizes_paid_account_to_one_weekly_limit(self) -> None:
+        payload = _normalize_session_limit_payload({
+            'rateLimits': {
+                'planType': 'team',
+                'primary': {
+                    'usedPercent': 19,
+                    'windowDurationMins': 10080,
+                    'resetsAt': 1784809654,
+                },
+                'secondary': None,
+            },
+        })
+
+        self.assertEqual(set(payload), {'limit', 'period', 'planType'})
+        self.assertEqual(payload['period'], 'week')
+        self.assertEqual(payload['limit']['label'], '1 week')
+        self.assertEqual(payload['limit']['usedPercent'], 19)
+
+    def test_normalizes_free_account_to_one_monthly_limit(self) -> None:
+        payload = _normalize_session_limit_payload({
+            'rateLimits': {
+                'planType': 'free',
+                'primary': {
+                    'usedPercent': 7,
+                    'windowDurationMins': 43200,
+                    'resetsAt': 1786809654,
+                },
+                'secondary': None,
+            },
+        })
+
+        self.assertEqual(payload['period'], 'month')
+        self.assertEqual(payload['limit']['label'], '1 month')
+        self.assertEqual(payload['limit']['windowDurationMins'], 43200)
+
+    def test_preserves_and_normalizes_banked_rate_limit_resets(self) -> None:
+        raw = {
+            'rateLimits': {
+                'planType': 'pro',
+                'primary': {'usedPercent': 91, 'windowDurationMins': 10080},
+            },
+            'rateLimitResetCredits': {
+                'availableCount': 3,
+                'credits': [{
+                    'id': 'credit-1',
+                    'resetType': 'codexRateLimits',
+                    'status': 'available',
+                    'expiresAt': 1784246400,
+                    'title': 'Full reset',
+                }],
+            },
+        }
+
+        normalized_limits = _normalize_session_limit_payload(raw)
+        normalized_credits = _rate_limit_reset_credits_payload(raw)
+
+        self.assertEqual(normalized_limits['rateLimitResetCredits']['availableCount'], 3)
+        self.assertEqual(normalized_credits['available_count'], 3)
+        self.assertEqual(normalized_credits['credits'][0]['id'], 'credit-1')
+        self.assertEqual(normalized_credits['credits'][0]['reset_type'], 'codexRateLimits')
+
+    def test_manual_auth_export_keeps_refresh_token(self) -> None:
+        profile = AccountProfile(
+            label='max',
+            path=Path('db://active-auth'),
+            auth={
+                'auth_mode': 'chatgpt',
+                'OPENAI_API_KEY': None,
+                'tokens': {
+                    'id_token': 'id-token',
+                    'access_token': 'access-token',
+                    'refresh_token': 'refresh-token',
+                    'account_id': 'acct-max',
+                },
+            },
+            account_key='acct:max',
+            email='max@example.com',
+        )
+        with (
+            patch('app.main._require_internal_auth', return_value=None),
+            patch('app.main._profile_for_label', return_value=profile),
+        ):
+            response = asyncio.run(auth_export(request=None, label='max'))
+
+        payload = _json_body(response)
+        self.assertEqual(payload['auth_json']['tokens']['refresh_token'], 'refresh-token')
+
     def test_api_accounts_returns_cached_without_live_probe(self) -> None:
         profile = AccountProfile(
             label='acct',
@@ -44,8 +135,6 @@ class CachedAccountsApiTests(unittest.TestCase):
                 'lifetime_used': 120,
                 'rate_limit_refresh_at': '2026-03-22T00:00:00+00:00',
             }),
-            patch('app.main._fetch_rate_limits') as probe_mock,
-            patch('app.main._fetch_session_limits_for_profiles') as session_mock,
             patch('app.main.list_usage_rollovers', return_value=[]),
         ):
             response = asyncio.run(api_accounts(request=None))
@@ -53,8 +142,9 @@ class CachedAccountsApiTests(unittest.TestCase):
         payload = _json_body(response)
         self.assertIn('accounts', payload)
         self.assertEqual(payload['accounts'][0]['label'], 'acct')
-        probe_mock.assert_not_called()
-        session_mock.assert_not_called()
+        self.assertEqual(set(payload['accounts'][0]['rate_limits']), {'limit', 'period'})
+        self.assertNotIn('primary_used_percent', payload['accounts'][0]['usage_tracking'])
+        self.assertNotIn('secondary_used_percent', payload['accounts'][0]['usage_tracking'])
 
     def test_stream_emits_snapshot_then_complete_for_empty_profiles(self) -> None:
         with (
@@ -197,7 +287,12 @@ class CachedAccountsApiTests(unittest.TestCase):
         self.assertEqual(payload['status'], 'ok')
         self.assertEqual(payload['credential_material']['label'], 'max')
         self.assertEqual(payload['credential_material']['auth_json']['tokens']['account_id'], 'acct-max')
+        self.assertEqual(payload['credential_material']['auth_json']['tokens']['refresh_token'], '')
         self.assertEqual(payload['credential_material']['openclaw']['profile_id'], 'openai-codex:lease')
+        self.assertEqual(
+            payload['credential_material']['openclaw']['openclaw_auth_json']['openai_cid_tokens']['openai-codex:lease']['refresh_token'],
+            '',
+        )
         self.assertEqual(
             payload['credential_material']['openclaw']['openclaw_auth_json']['openai_cid_tokens']['openai-codex:lease']['accountId'],
             'acct-max',
@@ -248,6 +343,115 @@ class CachedAccountsApiTests(unittest.TestCase):
         self.assertEqual(payload['status'], 'ok')
         self.assertEqual(payload['lease']['latest_utilization_pct'], 84.0)
         self.assertEqual(payload['lease']['latest_quota_remaining'], 16000)
+
+    def test_lease_reconcile_rejects_auth_from_different_account(self) -> None:
+        with (
+            patch('app.main._require_internal_auth', return_value=None),
+            patch('app.main._sync_broker_credentials_from_profiles', return_value=[]),
+            patch('app.main.get_broker_lease_status', return_value={
+                'lease_id': 'lease-1',
+                'credential_id': 'sub:auth0|james-user',
+                'machine_id': 'machine-a',
+                'agent_id': 'agent-a',
+                'credential_auth_updated_at': '2026-03-23T00:00:00+00:00',
+            }),
+            patch('app.main._leased_profile_payload_for_credential', return_value={
+                'label': 'james',
+                'account_key': 'sub:auth0|james-user',
+                'auth_json': {
+                    'auth_mode': 'chatgpt',
+                    'OPENAI_API_KEY': None,
+                    'tokens': {
+                        'id_token': 'header.eyJzdWIiOiJhdXRoMHxqYW1lcy11c2VyIiwiZW1haWwiOiJqYW1lc0BleGFtcGxlLmNvbSJ9.sig',
+                        'access_token': 'header.eyJzdWIiOiJhdXRoMHxqYW1lcy11c2VyIn0.sig',
+                        'refresh_token': 'refresh-james',
+                        'account_id': 'acct-james',
+                    },
+                    'last_refresh': '2026-03-23T00:00:00+00:00',
+                },
+            }),
+            patch('app.main._persist_current_auth_to_profile') as persist_mock,
+        ):
+            response = asyncio.run(api_lease_reconcile_auth(
+                request=None,
+                lease_id='lease-1',
+                payload={
+                    'machine_id': 'machine-a',
+                    'agent_id': 'agent-a',
+                    'auth_json': {
+                        'auth_mode': 'chatgpt',
+                        'OPENAI_API_KEY': None,
+                        'tokens': {
+                            'id_token': 'header.eyJzdWIiOiJhdXRoMHxtYXgtdXNlciIsImVtYWlsIjoibWF4QGV4YW1wbGUuY29tIn0.sig',
+                            'access_token': 'header.eyJzdWIiOiJhdXRoMHxtYXgtdXNlciJ9.sig',
+                            'refresh_token': 'refresh-max',
+                            'account_id': 'acct-max',
+                        },
+                        'last_refresh': '2026-03-23T00:10:00+00:00',
+                    },
+                },
+            ))
+
+        payload = _json_body(response)
+        self.assertEqual(payload['decision'], 'identity_mismatch')
+        self.assertEqual(payload['reason'], 'local_auth_identity_mismatch')
+        self.assertEqual(payload['expected_account_key'], 'sub:auth0|james-user')
+        self.assertEqual(payload['incoming_account_key'], 'sub:auth0|max-user')
+        persist_mock.assert_not_called()
+
+    def test_lease_reconcile_rejects_unverifiable_local_auth(self) -> None:
+        with (
+            patch('app.main._require_internal_auth', return_value=None),
+            patch('app.main._sync_broker_credentials_from_profiles', return_value=[]),
+            patch('app.main.get_broker_lease_status', return_value={
+                'lease_id': 'lease-1',
+                'credential_id': 'sub:auth0|james-user',
+                'machine_id': 'machine-a',
+                'agent_id': 'agent-a',
+                'credential_auth_updated_at': '2026-03-23T00:00:00+00:00',
+            }),
+            patch('app.main._leased_profile_payload_for_credential', return_value={
+                'label': 'james',
+                'account_key': 'sub:auth0|james-user',
+                'auth_json': {
+                    'auth_mode': 'chatgpt',
+                    'OPENAI_API_KEY': None,
+                    'tokens': {
+                        'id_token': 'header.eyJzdWIiOiJhdXRoMHxqYW1lcy11c2VyIiwiZW1haWwiOiJqYW1lc0BleGFtcGxlLmNvbSJ9.sig',
+                        'access_token': 'header.eyJzdWIiOiJhdXRoMHxqYW1lcy11c2VyIn0.sig',
+                        'refresh_token': 'refresh-james',
+                        'account_id': 'acct-james',
+                    },
+                    'last_refresh': '2026-03-23T00:00:00+00:00',
+                },
+            }),
+            patch('app.main._persist_current_auth_to_profile') as persist_mock,
+        ):
+            response = asyncio.run(api_lease_reconcile_auth(
+                request=None,
+                lease_id='lease-1',
+                payload={
+                    'machine_id': 'machine-a',
+                    'agent_id': 'agent-a',
+                    'auth_json': {
+                        'auth_mode': 'chatgpt',
+                        'OPENAI_API_KEY': None,
+                        'tokens': {
+                            'id_token': 'not-a-jwt',
+                            'access_token': 'local-token-without-claims',
+                            'refresh_token': 'refresh-unknown',
+                            'account_id': '',
+                        },
+                        'last_refresh': '2026-03-23T00:10:00+00:00',
+                    },
+                },
+            ))
+
+        payload = _json_body(response)
+        self.assertEqual(payload['decision'], 'identity_mismatch')
+        self.assertEqual(payload['reason'], 'local_auth_identity_unverifiable')
+        self.assertEqual(payload['expected_account_key'], 'sub:auth0|james-user')
+        persist_mock.assert_not_called()
 
     def test_relay_callback_accepts_manual_callback_with_mismatched_state(self) -> None:
         session = create_login_session(

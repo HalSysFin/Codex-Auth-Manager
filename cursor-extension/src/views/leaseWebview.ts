@@ -110,15 +110,15 @@ export class LeaseWebviewProvider implements vscode.WebviewViewProvider {
       </div>
       <div id="summaryPanel" class="panel active">
         <div class="usage-card">
-          <label>Current Usage</label>
+          <label>Rate Limit Utilisation</label>
           <div class="usage-row">
-            <strong id="usageValue">--</strong>
-            <span id="usagePercent" class="usage-percent">--</span>
+            <strong id="usagePrimaryValue">--</strong>
+            <span id="usagePrimaryPercent" class="usage-percent">--</span>
           </div>
           <div class="usage-track">
-            <div id="usageBar" class="usage-bar"></div>
+            <div id="usagePrimaryBar" class="usage-bar"></div>
           </div>
-          <div id="usageMeta" class="usage-meta">No lease data yet.</div>
+          <div id="usagePrimaryMeta" class="usage-meta">Awaiting manager refresh.</div>
         </div>
       </div>
       <div class="actions">
@@ -158,15 +158,50 @@ export class LeaseWebviewProvider implements vscode.WebviewViewProvider {
         }
         return String(value);
       }
+      function clampPct(value) {
+        if (typeof value !== 'number' || !Number.isFinite(value)) {
+          return null;
+        }
+        return Math.max(0, Math.min(100, value));
+      }
+      function usageTone(pct) {
+        if (pct === null) {
+          return 'unknown';
+        }
+        if (pct >= 85) {
+          return 'danger';
+        }
+        if (pct >= 60) {
+          return 'warn';
+        }
+        return 'ok';
+      }
+      function formatReset(value) {
+        if (!value) {
+          return 'Reset unavailable.';
+        }
+        const parsed = new Date(value);
+        if (Number.isNaN(parsed.getTime())) {
+          return 'Reset: ' + String(value);
+        }
+        return 'Reset: ' + parsed.toLocaleString();
+      }
+      function renderUsageCard(prefix, pct, metaText) {
+        const valueEl = document.getElementById(prefix + 'Value');
+        const percentEl = document.getElementById(prefix + 'Percent');
+        const barEl = document.getElementById(prefix + 'Bar');
+        const metaEl = document.getElementById(prefix + 'Meta');
+        valueEl.textContent = pct === null ? '-- / 100' : String(Math.round(pct)) + ' / 100';
+        percentEl.textContent = pct === null ? '--' : String(Math.round(pct)) + '%';
+        barEl.style.width = pct === null ? '0%' : String(pct) + '%';
+        barEl.className = 'usage-bar ' + usageTone(pct);
+        metaEl.textContent = metaText;
+      }
       function render(payload) {
         const healthPill = document.getElementById('healthPill');
         const accountName = document.getElementById('accountName');
         const details = document.getElementById('details');
         const message = document.getElementById('message');
-        const usageValue = document.getElementById('usageValue');
-        const usagePercent = document.getElementById('usagePercent');
-        const usageBar = document.getElementById('usageBar');
-        const usageMeta = document.getElementById('usageMeta');
         const state = payload.state;
         const titleMap = {
           active: 'Active',
@@ -181,19 +216,12 @@ export class LeaseWebviewProvider implements vscode.WebviewViewProvider {
         accountName.textContent = state.accountLabel || state.accountName || state.credentialId || 'No Lease';
         message.textContent = payload.lastMessage || '';
         message.style.display = payload.lastMessage ? 'block' : 'none';
-        const pct = typeof state.latestUtilizationPct === 'number' && Number.isFinite(state.latestUtilizationPct)
-          ? Math.max(0, Math.min(100, state.latestUtilizationPct))
-          : null;
-        usageValue.textContent = pct === null ? '-- / 100' : String(Math.round(pct)) + ' / 100';
-        usagePercent.textContent = pct === null ? '--' : String(Math.round(pct)) + '%';
-        usageBar.style.width = pct === null ? '0%' : String(pct) + '%';
-        usageBar.className = 'usage-bar ' + (pct === null ? 'unknown' : (pct >= 85 ? 'danger' : (pct >= 60 ? 'warn' : 'ok')));
-        const remaining = state.latestQuotaRemaining == null && pct !== null
-          ? Math.max(0, Math.round(100 - pct))
-          : state.latestQuotaRemaining;
-        usageMeta.textContent = remaining == null
-          ? 'Remaining quota unavailable.'
-          : ('Remaining quota: ' + String(remaining));
+        const rateLimitPct = clampPct(
+          state.latestRateLimitUsedPercent !== null && state.latestRateLimitUsedPercent !== undefined
+            ? state.latestRateLimitUsedPercent
+            : state.latestUtilizationPct
+        );
+        renderUsageCard('usagePrimary', rateLimitPct, formatReset(state.latestRateLimitResetAt));
         const rows = [
           ['Account', state.accountLabel || state.accountName || state.credentialId],
           ['Lease State', state.leaseState],
@@ -201,7 +229,9 @@ export class LeaseWebviewProvider implements vscode.WebviewViewProvider {
           ['Lease Id', state.leaseId],
           ['Issued At', state.issuedAt],
           ['Expires At', state.expiresAt],
-          ['Latest Utilization %', state.latestUtilizationPct],
+          ['Rate Limit Period', state.latestRateLimitPeriod],
+          ['Rate Limit Utilization %', state.latestRateLimitUsedPercent ?? state.latestUtilizationPct],
+          ['Rate Limit Reset At', state.latestRateLimitResetAt],
           ['Latest Telemetry At', state.latestTelemetryAt],
           ['Last Auth File Write', state.lastAuthWriteAt],
           ['Last Backend Refresh', state.lastBackendRefreshAt],

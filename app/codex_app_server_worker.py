@@ -94,7 +94,15 @@ def _write_auth_json(root: Path, auth_json: dict[str, Any]) -> Path:
     return auth_path
 
 
-def _run_probe(auth_json: dict[str, Any], *, codex_bin: str, timeout_seconds: float) -> dict[str, Any]:
+def _run_probe(
+    auth_json: dict[str, Any],
+    *,
+    codex_bin: str,
+    timeout_seconds: float,
+    operation: str = "read",
+    idempotency_key: str | None = None,
+    credit_id: str | None = None,
+) -> dict[str, Any]:
     with tempfile.TemporaryDirectory(prefix="auth-manager-codex-worker-") as temp_dir:
         temp_root = Path(temp_dir)
         auth_path = _write_auth_json(temp_root, auth_json)
@@ -135,21 +143,42 @@ def _run_probe(auth_json: dict[str, Any], *, codex_bin: str, timeout_seconds: fl
             _find_result(init_messages, 1)
             _send(process, {"method": "initialized", "params": {}})
 
-            _send(process, {"id": 2, "method": "account/read", "params": {"refreshToken": True}})
-            _send(process, {"id": 3, "method": "account/rateLimits/read", "params": {}})
+            if operation == "consume_rate_limit_reset":
+                if not idempotency_key:
+                    raise ValueError("idempotency_key is required to consume a rate-limit reset")
+                consume_params: dict[str, Any] = {"idempotencyKey": idempotency_key}
+                if credit_id:
+                    consume_params["creditId"] = credit_id
+                _send(
+                    process,
+                    {
+                        "id": 2,
+                        "method": "account/rateLimitResetCredit/consume",
+                        "params": consume_params,
+                    },
+                )
+                _send(process, {"id": 3, "method": "account/rateLimits/read", "params": {}})
+            elif operation == "read":
+                _send(process, {"id": 2, "method": "account/read", "params": {"refreshToken": True}})
+                _send(process, {"id": 3, "method": "account/rateLimits/read", "params": {}})
+            else:
+                raise ValueError(f"Unsupported worker operation: {operation}")
             rpc_messages, rpc_stderr = _read_messages(
                 process,
                 timeout_seconds=timeout_seconds,
                 stop_when_ids={2, 3},
             )
 
-            return {
+            result = {
                 "ok": True,
-                "account": _find_result(rpc_messages, 2),
+                "account": _find_result(rpc_messages, 2) if operation == "read" else None,
                 "rate_limits": _find_result(rpc_messages, 3),
                 "notifications": [],
                 "stderr": init_stderr + rpc_stderr,
             }
+            if operation == "consume_rate_limit_reset":
+                result["consume_result"] = _find_result(rpc_messages, 2)
+            return result
         finally:
             try:
                 if process.stdin is not None:
@@ -174,7 +203,17 @@ def main() -> int:
             raise ValueError("auth_json is required")
         codex_bin = str(payload.get("codex_bin") or "codex").strip() or "codex"
         timeout_seconds = float(payload.get("timeout_seconds") or 15.0)
-        result = _run_probe(auth_json, codex_bin=codex_bin, timeout_seconds=timeout_seconds)
+        operation = str(payload.get("operation") or "read").strip()
+        idempotency_key = str(payload.get("idempotency_key") or "").strip() or None
+        credit_id = str(payload.get("credit_id") or "").strip() or None
+        result = _run_probe(
+            auth_json,
+            codex_bin=codex_bin,
+            timeout_seconds=timeout_seconds,
+            operation=operation,
+            idempotency_key=idempotency_key,
+            credit_id=credit_id,
+        )
         print(json.dumps(result))
         return 0
     except Exception as exc:

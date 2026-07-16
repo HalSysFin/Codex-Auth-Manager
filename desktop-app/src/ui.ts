@@ -65,6 +65,8 @@ export class DesktopAppView {
           <button data-action="rotate">Rotate Lease</button>
           <button data-action="release">Release Lease</button>
           <button data-action="rewriteAuth">Rewrite Auth File</button>
+          <button data-action="refreshResets">Refresh Reset Availability</button>
+          <button data-action="useReset">Use Rate-Limit Reset</button>
           <button data-action="openDashboard">Open Dashboard</button>
           <button data-action="openAuthLocation">Open Auth File Location</button>
         </section>
@@ -110,7 +112,10 @@ export class DesktopAppView {
         ['Agent ID', state.agentId],
         ['Issued At', state.issuedAt],
         ['Expires At', state.expiresAt],
-        ['Latest Utilization %', state.latestUtilizationPct],
+        ['Rate Limit Period', state.latestRateLimitPeriod],
+        ['Rate Limit Utilization %', state.latestRateLimitUsedPercent ?? state.latestUtilizationPct],
+        ['Rate Limit Reset At', state.latestRateLimitResetAt],
+        ['Banked Resets Available', snapshot.rateLimitResets?.available_count],
         ['Latest Quota Remaining', state.latestQuotaRemaining],
         ['Replacement Required', state.replacementRequired],
         ['Rotation Recommended', state.rotationRecommended],
@@ -171,6 +176,14 @@ export class DesktopAppView {
         break
       case 'rewriteAuth':
         void this.controller.rewriteAuthFile()
+        break
+      case 'refreshResets':
+        void this.controller.refreshRateLimitResets()
+        break
+      case 'useReset':
+        if (window.confirm('Use one banked rate-limit reset for the account on the active lease? This cannot be undone.')) {
+          void this.controller.useRateLimitReset()
+        }
         break
       case 'openDashboard':
         void this.controller.openDashboard()

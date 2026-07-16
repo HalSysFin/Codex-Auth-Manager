@@ -22,6 +22,9 @@ export function formatStatusLines(input: {
   credentialId: string | null
   expiresAt: string | null
   latestUtilizationPct: number | null
+  latestRateLimitUsedPercent?: number | null
+  latestRateLimitResetAt?: string | null
+  latestRateLimitPeriod?: string | null
   latestQuotaRemaining: number | null
   lastBackendRefreshAt: string | null
   lastAuthWriteAt: string | null
@@ -33,7 +36,9 @@ export function formatStatusLines(input: {
     `Lease id: ${input.leaseId || 'none'}`,
     `Credential id: ${input.credentialId || 'none'}`,
     `Expires at: ${input.expiresAt || 'n/a'}`,
-    `Latest utilization %: ${input.latestUtilizationPct ?? 'n/a'}`,
+    `Rate limit period: ${input.latestRateLimitPeriod || 'n/a'}`,
+    `Rate limit utilization %: ${input.latestRateLimitUsedPercent ?? input.latestUtilizationPct ?? 'n/a'}`,
+    `Rate limit reset at: ${input.latestRateLimitResetAt || 'n/a'}`,
     `Latest quota remaining: ${input.latestQuotaRemaining ?? 'n/a'}`,
     `Last backend refresh: ${input.lastBackendRefreshAt || 'n/a'}`,
     `Last auth write: ${input.lastAuthWriteAt || 'n/a'}`,

@@ -5,7 +5,7 @@ import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from app.account_usage_store import initialize_usage_store
+from app.account_usage_store import initialize_usage_store, update_runtime_settings
 from app.lease_broker_store import (
     acquire_broker_lease,
     get_broker_credential,
@@ -35,6 +35,8 @@ class LeaseBrokerStoreTests(unittest.TestCase):
         credential_id: str,
         *,
         label: str | None = None,
+        email: str | None = None,
+        metadata: dict | None = None,
         utilization_pct: float | None = 10.0,
         quota_remaining: int | None = 50000,
         health_score: float | None = 90.0,
@@ -49,7 +51,11 @@ class LeaseBrokerStoreTests(unittest.TestCase):
             health_score=health_score,
             weekly_reset_at=weekly_reset_at or "2026-03-29T00:00:00+00:00",
             last_telemetry_at=last_telemetry_at or "2026-03-22T12:00:00+00:00",
-            metadata={"label": label or credential_id},
+            metadata={
+                "label": label or credential_id,
+                "email": email,
+                **(metadata or {}),
+            },
             db_path=self.db_path,
         )
 
@@ -230,6 +236,23 @@ class LeaseBrokerStoreTests(unittest.TestCase):
         self.assertEqual(result["status"], "ok")
         self.assertEqual(result["lease"]["credential_id"], "cred-d")
 
+    def test_rotate_prefers_configured_email_priority_for_replacement(self) -> None:
+        self._sync_credential("cred-a", email="other@example.com", health_score=95.0)
+        self._sync_credential("cred-b", email="max@systemsfinance.co.uk", health_score=80.0)
+        self._sync_credential("cred-c", email="skylinearmyzz203@gmail.com", health_score=70.0)
+        lease = acquire_broker_lease(machine_id="m1", agent_id="a1", db_path=self.db_path)["lease"]
+
+        result = rotate_broker_lease(
+            lease_id=lease["id"],
+            machine_id="m1",
+            agent_id="a1",
+            reason="approaching_utilization_threshold",
+            db_path=self.db_path,
+        )
+
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(result["lease"]["credential_id"], "cred-c")
+
     def test_above_threshold_credentials_are_not_assigned(self) -> None:
         self._sync_credential("cred-a", utilization_pct=99.0)
         self._sync_credential("cred-b", utilization_pct=94.0)
@@ -295,6 +318,89 @@ class LeaseBrokerStoreTests(unittest.TestCase):
         self.assertEqual(result["status"], "ok")
         self.assertEqual(result["lease"]["credential_id"], "cred-a")
 
+    def test_acquire_prefers_configured_email_priority_over_default_ranking(self) -> None:
+        self._sync_credential(
+            "cred-a",
+            email="other@example.com",
+            health_score=99.0,
+            utilization_pct=5.0,
+            quota_remaining=90000,
+            weekly_reset_at="2026-03-24T00:00:00+00:00",
+        )
+        self._sync_credential(
+            "cred-b",
+            email="james@systemsfinance.co.uk",
+            health_score=70.0,
+            utilization_pct=60.0,
+            quota_remaining=10000,
+            weekly_reset_at="2026-03-29T00:00:00+00:00",
+        )
+        self._sync_credential(
+            "cred-c",
+            email="skylinearmyzz203@gmail.com",
+            health_score=60.0,
+            utilization_pct=70.0,
+            quota_remaining=5000,
+            weekly_reset_at="2026-03-30T00:00:00+00:00",
+        )
+
+        result = acquire_broker_lease(
+            machine_id="machine-1",
+            agent_id="agent-1",
+            now=datetime(2026, 3, 23, 12, 0, tzinfo=timezone.utc),
+            db_path=self.db_path,
+        )
+
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(result["lease"]["credential_id"], "cred-c")
+
+    def test_acquire_skips_preferred_email_when_not_eligible(self) -> None:
+        self._sync_credential(
+            "cred-a",
+            email="skylinearmyzz203@gmail.com",
+            utilization_pct=100.0,
+        )
+        self._sync_credential(
+            "cred-b",
+            email="james@systemsfinance.co.uk",
+            utilization_pct=10.0,
+        )
+
+        result = acquire_broker_lease(
+            machine_id="machine-1",
+            agent_id="agent-1",
+            db_path=self.db_path,
+        )
+
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(result["lease"]["credential_id"], "cred-b")
+
+    def test_acquire_prefers_preferred_credential_with_usable_auth_even_if_generic_flags_mark_unavailable(self) -> None:
+        self._sync_credential(
+            "cred-a",
+            email="skylinearmyzz203@gmail.com",
+            utilization_pct=10.0,
+            metadata={
+                "reauth_required": True,
+                "admin_assignment_disabled": True,
+                "preferred_auth_usable": True,
+            },
+        )
+        self._sync_credential(
+            "cred-b",
+            email="other@example.com",
+            utilization_pct=5.0,
+        )
+
+        result = acquire_broker_lease(
+            machine_id="machine-1",
+            agent_id="agent-1",
+            db_path=self.db_path,
+        )
+
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(result["lease"]["credential_id"], "cred-a")
+
     def test_weekly_reset_does_not_restore_assignability_until_confirmed(self) -> None:
         self._sync_credential(
             "cred-a",
@@ -351,6 +457,24 @@ class LeaseBrokerStoreTests(unittest.TestCase):
         self.assertEqual(status["latest_utilization_pct"], 88.0)
         self.assertEqual(status["latest_quota_remaining"], 25000)
         self.assertEqual(status["credential_state"], "leased")
+
+    def test_lease_status_exposes_one_rate_limit(self) -> None:
+        self._sync_credential(
+            "cred-a",
+            metadata={
+                "rate_limit_used_percent": 42.0,
+                "rate_limit_reset_at": "2026-03-29T00:00:00+00:00",
+                "rate_limit_period": "week",
+            },
+        )
+        lease = acquire_broker_lease(machine_id="m1", agent_id="a1", db_path=self.db_path)["lease"]
+
+        status = get_broker_lease_status(lease["id"], db_path=self.db_path)
+
+        self.assertEqual(status["rate_limit_used_percent"], 42.0)
+        self.assertEqual(status["rate_limit_period"], "week")
+        self.assertNotIn("primary_utilization_pct", status)
+        self.assertNotIn("secondary_utilization_pct", status)
 
     def test_high_utilization_telemetry_marks_replacement_required_before_exhaustion(self) -> None:
         self._sync_credential("cred-a")
@@ -432,6 +556,7 @@ class LeaseBrokerStoreTests(unittest.TestCase):
         self.assertEqual(metadata["delivery_count"], 1)
         self.assertIn("first_materialized_at", metadata)
         self.assertIn("last_materialized_at", metadata)
+        self.assertEqual(metadata["credential_auth_delivery_version"], 2)
 
     def test_materialize_denies_for_wrong_owner(self) -> None:
         self._sync_credential("cred-a")
@@ -488,6 +613,176 @@ class LeaseBrokerStoreTests(unittest.TestCase):
         self.assertEqual(second["status"], "ok")
         self.assertNotEqual(first_lease["id"], second["lease"]["id"])
         self.assertNotEqual(first_lease["credential_id"], second["lease"]["credential_id"])
+
+    def test_acquire_prefers_agent_pinned_credential_with_fallback_when_unavailable(self) -> None:
+        self._sync_credential("cred-dedicated", email="dedicated@example.com", utilization_pct=10.0)
+        self._sync_credential("cred-fallback", email="fallback@example.com", utilization_pct=20.0)
+        update_runtime_settings(
+            {
+                "assignment_policy_by_agent": {
+                    "leads-app-worker": {
+                        "preferred_credential_ids": ["cred-dedicated"],
+                        "fallback_to_any_eligible": True,
+                    }
+                }
+            },
+            db_path=self.db_path,
+        )
+
+        first = acquire_broker_lease(
+            machine_id="machine-1",
+            agent_id="leads-app-worker",
+            db_path=self.db_path,
+        )
+        self.assertEqual(first["status"], "ok")
+        self.assertEqual(first["lease"]["credential_id"], "cred-dedicated")
+
+        release_broker_lease(
+            lease_id=first["lease"]["id"],
+            machine_id="machine-1",
+            agent_id="leads-app-worker",
+            reason="test_reset",
+            db_path=self.db_path,
+        )
+        self._sync_credential("cred-dedicated", email="dedicated@example.com", utilization_pct=100.0)
+
+        second = acquire_broker_lease(
+            machine_id="machine-2",
+            agent_id="leads-app-worker",
+            db_path=self.db_path,
+        )
+        self.assertEqual(second["status"], "ok")
+        self.assertEqual(second["lease"]["credential_id"], "cred-fallback")
+
+    def test_remote_live_worker_prefers_mysf_then_falls_back_within_business_pool(self) -> None:
+        self._sync_credential("cred-mysf", email="mysf@systemsfinance.co.uk", utilization_pct=0.0)
+        self._sync_credential("cred-james", email="james@systemsfinance.co.uk", utilization_pct=5.0)
+        self._sync_credential("cred-max", email="max@systemsfinance.co.uk", utilization_pct=10.0)
+        self._sync_credential("cred-other", email="other@example.com", utilization_pct=1.0)
+
+        first = acquire_broker_lease(
+            machine_id="machine-remote-1",
+            agent_id="remote-live-worker-01",
+            db_path=self.db_path,
+        )
+        self.assertEqual(first["status"], "ok")
+        self.assertEqual(first["lease"]["credential_id"], "cred-mysf")
+
+        release_broker_lease(
+            lease_id=first["lease"]["id"],
+            machine_id="machine-remote-1",
+            agent_id="remote-live-worker-01",
+            reason="test_reset",
+            db_path=self.db_path,
+        )
+        self._sync_credential("cred-mysf", email="mysf@systemsfinance.co.uk", utilization_pct=100.0)
+
+        second = acquire_broker_lease(
+            machine_id="machine-remote-2",
+            agent_id="remote-live-worker-01",
+            db_path=self.db_path,
+        )
+        self.assertEqual(second["status"], "ok")
+        self.assertIn(second["lease"]["credential_id"], {"cred-james", "cred-max"})
+        self.assertNotEqual(second["lease"]["credential_id"], "cred-other")
+
+    def test_acquire_honors_agent_allowed_credential_scope(self) -> None:
+        self._sync_credential("cred-allowed", email="allowed@example.com", utilization_pct=15.0)
+        self._sync_credential("cred-blocked", email="blocked@example.com", utilization_pct=5.0)
+        update_runtime_settings(
+            {
+                "assignment_policy_by_agent": {
+                    "leads-app-worker": {
+                        "allowed_credential_ids": ["cred-allowed"],
+                        "fallback_to_any_eligible": False,
+                    }
+                }
+            },
+            db_path=self.db_path,
+        )
+
+        result = acquire_broker_lease(
+            machine_id="machine-1",
+            agent_id="leads-app-worker",
+            db_path=self.db_path,
+        )
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(result["lease"]["credential_id"], "cred-allowed")
+
+    def test_rotate_prefers_machine_pinned_credential_with_fallback_when_current_exhausted(self) -> None:
+        self._sync_credential("cred-current", email="current@example.com", utilization_pct=10.0)
+        self._sync_credential("cred-dedicated", email="dedicated@example.com", utilization_pct=20.0)
+        self._sync_credential("cred-fallback", email="fallback@example.com", utilization_pct=30.0)
+        update_runtime_settings(
+            {
+                "assignment_policy_by_machine": {
+                    "machine-1": {
+                        "preferred_credential_ids": ["cred-dedicated"],
+                        "fallback_to_any_eligible": True,
+                    }
+                }
+            },
+            db_path=self.db_path,
+        )
+
+        lease = acquire_broker_lease(
+            machine_id="machine-1",
+            agent_id="agent-a",
+            db_path=self.db_path,
+        )["lease"]
+        self.assertEqual(lease["credential_id"], "cred-dedicated")
+
+        release_broker_lease(
+            lease_id=lease["id"],
+            machine_id="machine-1",
+            agent_id="agent-a",
+            reason="reset_before_rotate_test",
+            db_path=self.db_path,
+        )
+
+        update_runtime_settings(
+            {
+                "assignment_policy_by_machine": {
+                    "machine-1": {
+                        "preferred_credential_ids": ["cred-dedicated"],
+                        "fallback_to_any_eligible": True,
+                    }
+                }
+            },
+            db_path=self.db_path,
+        )
+        base_lease = acquire_broker_lease(
+            machine_id="machine-1",
+            agent_id="agent-a",
+            db_path=self.db_path,
+        )["lease"]
+        self.assertEqual(base_lease["credential_id"], "cred-dedicated")
+
+        release_broker_lease(
+            lease_id=base_lease["id"],
+            machine_id="machine-1",
+            agent_id="agent-a",
+            reason="reset_before_fallback_case",
+            db_path=self.db_path,
+        )
+        self._sync_credential("cred-current", email="current@example.com", utilization_pct=10.0)
+        self._sync_credential("cred-dedicated", email="dedicated@example.com", utilization_pct=95.0)
+        active = acquire_broker_lease(
+            machine_id="machine-1",
+            agent_id="agent-a",
+            db_path=self.db_path,
+        )["lease"]
+        self.assertEqual(active["credential_id"], "cred-current")
+
+        rotated = rotate_broker_lease(
+            lease_id=active["id"],
+            machine_id="machine-1",
+            agent_id="agent-a",
+            reason="approaching_utilization_threshold",
+            db_path=self.db_path,
+        )
+        self.assertEqual(rotated["status"], "ok")
+        self.assertEqual(rotated["lease"]["credential_id"], "cred-fallback")
 
 
 if __name__ == "__main__":

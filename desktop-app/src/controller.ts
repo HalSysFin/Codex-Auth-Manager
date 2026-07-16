@@ -2,7 +2,12 @@ import {
   AuthManagerClient,
   AuthManagerClientError,
 } from '../../packages/lease-runtime/src/authManagerClient.ts'
-import { authPayloadFingerprint, prepareAuthPayloadForWrite } from '../../packages/lease-runtime/src/authPayload.ts'
+import {
+  authPayloadFingerprint,
+  compareAuthPayloadFreshness,
+  extractAuthPayloadIdentity,
+  prepareAuthPayloadForWrite,
+} from '../../packages/lease-runtime/src/authPayload.ts'
 import {
   deriveLeaseHealthState,
   needsReacquire,
@@ -24,6 +29,7 @@ import type {
   LeaseStatusResponse,
   LeaseHealthState,
   PersistedDesktopState,
+  RateLimitResetCreditsResponse,
   RuntimeLeaseState,
   RuntimeSettings,
 } from '../../packages/lease-runtime/src/types.ts'
@@ -36,6 +42,7 @@ export interface ControllerSnapshot {
   backendReachable: boolean
   message: string | null
   logs: string[]
+  rateLimitResets: RateLimitResetCreditsResponse | null
 }
 
 export interface ControllerView {
@@ -53,6 +60,8 @@ export class DesktopLeaseController {
   private refreshTimer: number | null = null
   private telemetryTimer: number | null = null
   private ensuring = false
+  private nextAcquireExcludeCredentialIds: string[] = []
+  private rateLimitResets: RateLimitResetCreditsResponse | null = null
 
   constructor(
     initialState: PersistedDesktopState,
@@ -66,6 +75,7 @@ export class DesktopLeaseController {
     this.logs = await readRecentLogLines(120)
     this.render()
     await this.ensureLease()
+    await this.refreshRateLimitResets(false)
     this.restartTimers()
   }
 
@@ -93,6 +103,59 @@ export class DesktopLeaseController {
       backendReachable: this.backendReachable,
       message: this.message,
       logs: this.logs,
+      rateLimitResets: this.rateLimitResets,
+    }
+  }
+
+  async refreshRateLimitResets(render = true): Promise<void> {
+    const leaseId = this.state.lease.leaseId
+    if (!leaseId) {
+      this.rateLimitResets = null
+      if (render) {
+        this.setMessage('No active lease is available to inspect rate-limit resets.')
+        this.render()
+      }
+      return
+    }
+    try {
+      this.rateLimitResets = await this.client.getRateLimitResets(leaseId, {
+        machineId: this.state.settings.machineId,
+        agentId: this.state.settings.agentId,
+      })
+      this.backendReachable = true
+      if (render) {
+        this.setMessage(`${this.rateLimitResets.available_count} rate-limit reset(s) available.`)
+      }
+    } catch (error) {
+      await this.handleError(error, 'Unable to read rate-limit resets', false)
+    } finally {
+      if (render) {
+        this.render()
+      }
+    }
+  }
+
+  async useRateLimitReset(creditId?: string | null): Promise<void> {
+    const leaseId = this.state.lease.leaseId
+    if (!leaseId) {
+      this.setMessage('No active lease is available to use a rate-limit reset.')
+      this.render()
+      return
+    }
+    try {
+      const result = await this.client.consumeRateLimitReset(leaseId, {
+        machineId: this.state.settings.machineId,
+        agentId: this.state.settings.agentId,
+        idempotencyKey: crypto.randomUUID(),
+        creditId,
+      })
+      this.rateLimitResets = result
+      this.backendReachable = true
+      this.setMessage(`Rate-limit reset request completed: ${result.outcome || 'accepted'}.`)
+    } catch (error) {
+      await this.handleError(error, 'Unable to use rate-limit reset')
+    } finally {
+      this.render()
     }
   }
 
@@ -260,6 +323,7 @@ export class DesktopLeaseController {
     }
     await this.log(`Releasing lease ${this.state.lease.leaseId}`)
     try {
+      const releasedCredentialId = this.state.lease.credentialId
       const response = await this.client.releaseLease(this.state.lease.leaseId, {
         machineId: this.state.settings.machineId,
         agentId: this.state.settings.agentId,
@@ -269,8 +333,10 @@ export class DesktopLeaseController {
       if (response.status !== 'ok') {
         throw new Error(response.reason || 'Lease release denied')
       }
+      this.nextAcquireExcludeCredentialIds = releasedCredentialId ? [releasedCredentialId] : []
+      this.rateLimitResets = null
       this.state.lease = defaultRuntimeLeaseState(this.state.settings.machineId, this.state.settings.agentId, this.state.settings.authFilePath)
-      this.setMessage('Lease released.')
+      this.setMessage('Lease released. The next acquire will avoid reusing this auth.')
     } catch (error) {
       await this.handleError(error, 'Unable to release lease')
     } finally {
@@ -345,8 +411,10 @@ export class DesktopLeaseController {
         agentId: this.state.settings.agentId,
         requestedTtlSeconds: REQUESTED_TTL_SECONDS,
         reason,
+        excludeCredentialIds: this.nextAcquireExcludeCredentialIds,
       })
       this.backendReachable = true
+      this.nextAcquireExcludeCredentialIds = []
       this.state.lease = await this.consumeLeaseResponse(response, 'No eligible credentials available')
       await this.materializeAndWriteAuth(this.state.lease.leaseId!)
       this.setMessage('Lease acquired and auth file written.')
@@ -363,14 +431,47 @@ export class DesktopLeaseController {
     if (materialized.status !== 'ok' || !materialized.credential_material?.auth_json) {
       throw new Error(materialized.reason || 'Backend did not return auth payload for this lease')
     }
-    const payload = prepareAuthPayloadForWrite(materialized.credential_material.auth_json)
-    const result = await writeAuthFile(this.state.settings.authFilePath, payload)
-    const fingerprint = await authPayloadFingerprint(payload)
-    this.state.lease = recordAuthWrite(this.state.lease, result.writtenAt, fingerprint)
-    await this.log(`Wrote auth file to ${result.path}`)
     if (materialized.lease) {
       this.state.lease = updateRuntimeStateFromLease(this.state.lease, materialized.lease)
     }
+    const payload = prepareAuthPayloadForWrite(materialized.credential_material.auth_json)
+    const localAuth = await readAuthFile(this.state.settings.authFilePath)
+    const localIdentity = localAuth ? extractAuthPayloadIdentity(localAuth) : null
+    const remoteIdentity = extractAuthPayloadIdentity(payload)
+    const sameLeasedAccount =
+      Boolean(this.state.lease.credentialId && localIdentity?.accountKey && localIdentity.accountKey === this.state.lease.credentialId) &&
+      Boolean(remoteIdentity.accountKey && remoteIdentity.accountKey === this.state.lease.credentialId)
+    if (localAuth && sameLeasedAccount && compareAuthPayloadFreshness(payload, localAuth) > 0) {
+      const reconciled = await this.client.reconcileLeaseAuth(leaseId, {
+        machineId: this.state.settings.machineId,
+        agentId: this.state.settings.agentId,
+        authJson: localAuth,
+      })
+      if (reconciled.credential_auth_updated_at) {
+        this.state.lease = { ...this.state.lease, credentialAuthUpdatedAt: reconciled.credential_auth_updated_at }
+      }
+      if (reconciled.decision === 'client_updated_manager' || reconciled.decision === 'in_sync') {
+        const fingerprint = await authPayloadFingerprint(localAuth)
+        const acknowledgedAt = reconciled.credential_auth_updated_at || localAuth.last_refresh || new Date().toISOString()
+        this.state.lease = recordAuthWrite(
+          this.state.lease,
+          acknowledgedAt,
+          fingerprint,
+          reconciled.credential_auth_updated_at ?? this.state.lease.credentialAuthUpdatedAt,
+        )
+        await this.log(`Preserved fresher local auth for lease ${leaseId}`)
+        return
+      }
+    }
+    const result = await writeAuthFile(this.state.settings.authFilePath, payload)
+    const fingerprint = await authPayloadFingerprint(payload)
+    this.state.lease = recordAuthWrite(
+      this.state.lease,
+      result.writtenAt,
+      fingerprint,
+      this.state.lease.credentialAuthUpdatedAt,
+    )
+    await this.log(`Wrote auth file to ${result.path}`)
   }
 
   private async reconcileLocalAuthIfNeeded(leaseId: string | null): Promise<void> {
@@ -382,7 +483,9 @@ export class DesktopLeaseController {
       return
     }
     const fingerprint = await authPayloadFingerprint(localAuth)
-    if (this.state.lease.lastAuthFingerprint && this.state.lease.lastAuthFingerprint === fingerprint) {
+    const localIdentity = extractAuthPayloadIdentity(localAuth)
+    const leaseIdentityMismatch = Boolean(this.state.lease.credentialId && localIdentity.accountKey && localIdentity.accountKey !== this.state.lease.credentialId)
+    if (!leaseIdentityMismatch && this.state.lease.lastAuthFingerprint && this.state.lease.lastAuthFingerprint === fingerprint) {
       return
     }
     const reconciled = await this.client.reconcileLeaseAuth(leaseId, {
@@ -397,11 +500,37 @@ export class DesktopLeaseController {
       await this.log(`Manager auth is newer for lease ${leaseId}; rewriting local auth file`)
       const result = await writeAuthFile(this.state.settings.authFilePath, reconciled.auth_json)
       const managerFingerprint = await authPayloadFingerprint(reconciled.auth_json)
-      this.state.lease = recordAuthWrite(this.state.lease, result.writtenAt, managerFingerprint)
+      this.state.lease = recordAuthWrite(
+        this.state.lease,
+        result.writtenAt,
+        managerFingerprint,
+        reconciled.credential_auth_updated_at ?? this.state.lease.credentialAuthUpdatedAt,
+      )
+      return
+    }
+    if (reconciled.decision === 'identity_mismatch' && reconciled.auth_json) {
+      await this.log(`Local auth identity ${reconciled.incoming_account_key || 'unknown'} does not match leased credential ${reconciled.expected_account_key || 'unknown'}; rewriting local auth file`)
+      const result = await writeAuthFile(this.state.settings.authFilePath, reconciled.auth_json)
+      const managerFingerprint = await authPayloadFingerprint(reconciled.auth_json)
+      this.state.lease = recordAuthWrite(
+        this.state.lease,
+        result.writtenAt,
+        managerFingerprint,
+        reconciled.credential_auth_updated_at ?? this.state.lease.credentialAuthUpdatedAt,
+      )
+      return
+    }
+    if (reconciled.decision === 'manager_missing_auth') {
+      await this.log(`Manager cannot reconcile lease ${leaseId}: ${reconciled.reason || 'missing auth material'}`)
       return
     }
     const acknowledgedAt = reconciled.credential_auth_updated_at || localAuth.last_refresh || new Date().toISOString()
-    this.state.lease = recordAuthWrite(this.state.lease, acknowledgedAt, fingerprint)
+    this.state.lease = recordAuthWrite(
+      this.state.lease,
+      acknowledgedAt,
+      fingerprint,
+      reconciled.credential_auth_updated_at ?? this.state.lease.credentialAuthUpdatedAt,
+    )
     if (reconciled.decision === 'client_updated_manager') {
       await this.log(`Uploaded fresher local auth to manager for lease ${leaseId}`)
     }
@@ -440,10 +569,10 @@ export class DesktopLeaseController {
     if (!status.credential_auth_updated_at) {
       return true
     }
-    if (!this.state.lease.lastAuthWriteAt) {
+    if (!this.state.lease.lastMaterializedCredentialAuthUpdatedAt) {
       return true
     }
-    return status.credential_auth_updated_at > this.state.lease.lastAuthWriteAt
+    return status.credential_auth_updated_at > this.state.lease.lastMaterializedCredentialAuthUpdatedAt
   }
 
   private currentHealthState(): LeaseHealthState {

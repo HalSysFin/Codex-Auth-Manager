@@ -5,12 +5,14 @@ import hashlib
 import json
 import re
 import sqlite3
-from contextlib import suppress
+import threading
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
+from .account_identity import extract_account_identity
 from .config import settings
 
 try:  # Optional in tests that don't require Postgres.
@@ -22,6 +24,8 @@ except Exception:  # pragma: no cover - fallback when psycopg is unavailable
 
 
 DEFAULT_WINDOW_TYPE = "daily"
+_SQLITE_PROFILE_REFRESH_LOCKS: dict[str, threading.Lock] = {}
+_SQLITE_PROFILE_REFRESH_LOCKS_GUARD = threading.Lock()
 
 
 @dataclass
@@ -200,6 +204,13 @@ def get_account(account_id: str, db_path: Path | None = None) -> AccountUsageSta
         if row is None:
             return None
         return _row_to_state(row)
+
+
+def list_accounts(db_path: Path | None = None) -> list[AccountUsageState]:
+    with _connect(db_path) as conn:
+        _ensure_schema(conn)
+        rows = conn.execute("SELECT * FROM accounts ORDER BY updated_at DESC, id ASC").fetchall()
+        return [_row_to_state(row) for row in rows]
 
 
 def get_accounts_by_ids(
@@ -477,14 +488,12 @@ def sync_account_rate_limit_percentages(
                 params.append(name)
             updates.append("primary_used_percent = ?")
             params.append(p1)
-            if primary_resets_at is not None:
-                updates.append("primary_resets_at = ?")
-                params.append(primary_resets_at)
+            updates.append("primary_resets_at = ?")
+            params.append(primary_resets_at)
             updates.append("secondary_used_percent = ?")
             params.append(p2)
-            if secondary_resets_at is not None:
-                updates.append("secondary_resets_at = ?")
-                params.append(secondary_resets_at)
+            updates.append("secondary_resets_at = ?")
+            params.append(secondary_resets_at)
             updates.append("rate_limit_last_refreshed_at = ?")
             params.append(now_iso)
             updates.append("last_usage_sync_at = ?")
@@ -876,10 +885,114 @@ def upsert_saved_profile(
     now: datetime | None = None,
     db_path: Path | None = None,
 ) -> None:
+    with _connect(db_path) as conn:
+        _ensure_schema(conn)
+        _upsert_saved_profile_locked(
+            conn,
+            label=label,
+            account_key=account_key,
+            auth_json=auth_json,
+            email=email,
+            name=name,
+            subject=subject,
+            user_id=user_id,
+            provider_account_id=provider_account_id,
+            access_token_expires_at=access_token_expires_at,
+            id_token_expires_at=id_token_expires_at,
+            refresh_token_expires_at=refresh_token_expires_at,
+            last_refresh_at=last_refresh_at,
+            refresh_token_present=refresh_token_present,
+            reauth_required=reauth_required,
+            reauth_reason=reauth_reason,
+            now=now,
+        )
+
+
+def upsert_saved_profile_and_active_auth(
+    *,
+    label: str,
+    account_key: str,
+    auth_json: dict[str, Any],
+    active_auth_json: dict[str, Any] | None,
+    email: str | None = None,
+    name: str | None = None,
+    subject: str | None = None,
+    user_id: str | None = None,
+    provider_account_id: str | None = None,
+    access_token_expires_at: str | None = None,
+    id_token_expires_at: str | None = None,
+    refresh_token_expires_at: str | None = None,
+    last_refresh_at: str | None = None,
+    refresh_token_present: bool | None = None,
+    reauth_required: bool | None = None,
+    reauth_reason: str | None = None,
+    now: datetime | None = None,
+    db_path: Path | None = None,
+) -> None:
+    with _connect(db_path) as conn:
+        _ensure_schema(conn)
+        conn.execute("BEGIN IMMEDIATE")
+        _upsert_saved_profile_locked(
+            conn,
+            label=label,
+            account_key=account_key,
+            auth_json=auth_json,
+            email=email,
+            name=name,
+            subject=subject,
+            user_id=user_id,
+            provider_account_id=provider_account_id,
+            access_token_expires_at=access_token_expires_at,
+            id_token_expires_at=id_token_expires_at,
+            refresh_token_expires_at=refresh_token_expires_at,
+            last_refresh_at=last_refresh_at,
+            refresh_token_present=refresh_token_present,
+            reauth_required=reauth_required,
+            reauth_reason=reauth_reason,
+            now=now,
+        )
+        if isinstance(active_auth_json, dict):
+            _set_active_auth_json_locked(conn, active_auth_json, now=now)
+            conn.execute(
+                """
+                INSERT INTO app_meta (key, value, updated_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
+                """,
+                ("active_profile_label", (label or "").strip() or None, _to_iso(_as_utc(now))),
+            )
+
+
+def _upsert_saved_profile_locked(
+    conn: Any,
+    *,
+    label: str,
+    account_key: str,
+    auth_json: dict[str, Any],
+    email: str | None = None,
+    name: str | None = None,
+    subject: str | None = None,
+    user_id: str | None = None,
+    provider_account_id: str | None = None,
+    access_token_expires_at: str | None = None,
+    id_token_expires_at: str | None = None,
+    refresh_token_expires_at: str | None = None,
+    last_refresh_at: str | None = None,
+    refresh_token_present: bool | None = None,
+    reauth_required: bool | None = None,
+    reauth_reason: str | None = None,
+    now: datetime | None = None,
+) -> None:
     clean_label = (label or "").strip()
     if not clean_label:
         raise ValueError("label is required")
-    clean_account_key = (account_key or "").strip() or "unknown"
+    identity = extract_account_identity(auth_json)
+    clean_account_key = (identity.account_key or account_key or "").strip() or "unknown"
+    email = identity.email or email
+    name = identity.name or name
+    subject = identity.subject or subject
+    user_id = identity.user_id or user_id
+    provider_account_id = identity.account_id or provider_account_id
     now_iso = _to_iso(_as_utc(now))
     auth_payload = json.dumps(auth_json, sort_keys=True)
     if (
@@ -897,125 +1010,198 @@ def upsert_saved_profile(
         refresh_token_expires_at = metadata.get("refresh_token_expires_at")
         last_refresh_at = metadata.get("last_refresh_at")
         refresh_token_present = metadata.get("refresh_token_present")
-    with _connect(db_path) as conn:
-        _ensure_schema(conn)
-        # Keep a single canonical row per concrete account identity.
-        # This avoids stale duplicate labels representing the same user.
-        if clean_account_key and clean_account_key != "unknown":
-            conn.execute(
-                "DELETE FROM saved_profiles WHERE account_key = ? AND label <> ?",
-                (clean_account_key, clean_label),
-            )
-        existing = conn.execute("SELECT auth_json FROM saved_profiles WHERE label = ?", (clean_label,)).fetchone()
-        auth_updated_at = now_iso
-        if existing:
-            prev_raw = existing["auth_json"] if isinstance(existing, dict) else existing[0]
-            prev_payload = None
-            if isinstance(prev_raw, (dict, list)):
-                prev_payload = json.dumps(prev_raw, sort_keys=True)
-            else:
-                prev_payload = str(prev_raw or "")
-            if prev_payload == auth_payload:
-                prev_ts_row = conn.execute("SELECT auth_updated_at FROM saved_profiles WHERE label = ?", (clean_label,)).fetchone()
-                prev_ts = prev_ts_row["auth_updated_at"] if isinstance(prev_ts_row, dict) else (prev_ts_row[0] if prev_ts_row else None)
-                auth_updated_at = str(prev_ts) if prev_ts else now_iso
-        is_pg = getattr(conn, "_kind", "sqlite") == "postgres"
-        if is_pg:
-            conn.execute(
-                """
-                INSERT INTO saved_profiles (
-                    label, account_key, email, name, subject, user_id, provider_account_id,
-                    auth_json, created_at, updated_at, auth_updated_at,
-                    access_token_expires_at, id_token_expires_at, refresh_token_expires_at, last_refresh_at, refresh_token_present,
-                    reauth_required, reauth_reason
-                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                ON CONFLICT (label) DO UPDATE
-                SET account_key = EXCLUDED.account_key,
-                    email = EXCLUDED.email,
-                    name = EXCLUDED.name,
-                    subject = EXCLUDED.subject,
-                    user_id = EXCLUDED.user_id,
-                    provider_account_id = EXCLUDED.provider_account_id,
-                    auth_json = EXCLUDED.auth_json,
-                    updated_at = EXCLUDED.updated_at,
-                    auth_updated_at = EXCLUDED.auth_updated_at,
-                    access_token_expires_at = EXCLUDED.access_token_expires_at,
-                    id_token_expires_at = EXCLUDED.id_token_expires_at,
-                    refresh_token_expires_at = EXCLUDED.refresh_token_expires_at,
-                    last_refresh_at = EXCLUDED.last_refresh_at,
-                    refresh_token_present = EXCLUDED.refresh_token_present,
-                    reauth_required = EXCLUDED.reauth_required,
-                    reauth_reason = EXCLUDED.reauth_reason
-                """,
-                (
-                    clean_label,
-                    clean_account_key,
-                    email,
-                    name,
-                    subject,
-                    user_id,
-                    provider_account_id,
-                    auth_payload,
-                    now_iso,
-                    now_iso,
-                    auth_updated_at,
-                    access_token_expires_at,
-                    id_token_expires_at,
-                    refresh_token_expires_at,
-                    last_refresh_at,
-                    bool(refresh_token_present) if refresh_token_present is not None else None,
-                    bool(reauth_required) if reauth_required is not None else None,
-                    reauth_reason,
-                ),
-            )
+    existing = conn.execute("SELECT auth_json FROM saved_profiles WHERE label = ?", (clean_label,)).fetchone()
+    auth_updated_at = now_iso
+    if existing:
+        prev_raw = existing["auth_json"] if isinstance(existing, dict) else existing[0]
+        if isinstance(prev_raw, (dict, list)):
+            prev_payload = json.dumps(prev_raw, sort_keys=True)
         else:
-            conn.execute(
-                """
-                INSERT INTO saved_profiles (
-                    label, account_key, email, name, subject, user_id, provider_account_id,
-                    auth_json, created_at, updated_at, auth_updated_at,
-                    access_token_expires_at, id_token_expires_at, refresh_token_expires_at, last_refresh_at, refresh_token_present,
-                    reauth_required, reauth_reason
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(label) DO UPDATE SET
-                    account_key = excluded.account_key,
-                    email = excluded.email,
-                    name = excluded.name,
-                    subject = excluded.subject,
-                    user_id = excluded.user_id,
-                    provider_account_id = excluded.provider_account_id,
-                    auth_json = excluded.auth_json,
-                    updated_at = excluded.updated_at,
-                    auth_updated_at = excluded.auth_updated_at,
-                    access_token_expires_at = excluded.access_token_expires_at,
-                    id_token_expires_at = excluded.id_token_expires_at,
-                    refresh_token_expires_at = excluded.refresh_token_expires_at,
-                    last_refresh_at = excluded.last_refresh_at,
-                    refresh_token_present = excluded.refresh_token_present,
-                    reauth_required = excluded.reauth_required,
-                    reauth_reason = excluded.reauth_reason
-                """,
-                (
-                    clean_label,
-                    clean_account_key,
-                    email,
-                    name,
-                    subject,
-                    user_id,
-                    provider_account_id,
-                    auth_payload,
-                    now_iso,
-                    now_iso,
-                    auth_updated_at,
-                    access_token_expires_at,
-                    id_token_expires_at,
-                    refresh_token_expires_at,
-                    last_refresh_at,
-                    bool(refresh_token_present) if refresh_token_present is not None else None,
-                    bool(reauth_required) if reauth_required is not None else None,
-                    reauth_reason,
-                ),
-            )
+            prev_payload = str(prev_raw or "")
+        if prev_payload == auth_payload:
+            prev_ts_row = conn.execute("SELECT auth_updated_at FROM saved_profiles WHERE label = ?", (clean_label,)).fetchone()
+            prev_ts = prev_ts_row["auth_updated_at"] if isinstance(prev_ts_row, dict) else (prev_ts_row[0] if prev_ts_row else None)
+            auth_updated_at = str(prev_ts) if prev_ts else now_iso
+    is_pg = getattr(conn, "_kind", "sqlite") == "postgres"
+    if is_pg:
+        conn.execute(
+            """
+            INSERT INTO saved_profiles (
+                label, account_key, email, name, subject, user_id, provider_account_id,
+                auth_json, created_at, updated_at, auth_updated_at,
+                access_token_expires_at, id_token_expires_at, refresh_token_expires_at, last_refresh_at, refresh_token_present,
+                reauth_required, reauth_reason
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT (label) DO UPDATE
+            SET account_key = EXCLUDED.account_key,
+                email = EXCLUDED.email,
+                name = EXCLUDED.name,
+                subject = EXCLUDED.subject,
+                user_id = EXCLUDED.user_id,
+                provider_account_id = EXCLUDED.provider_account_id,
+                auth_json = EXCLUDED.auth_json,
+                updated_at = EXCLUDED.updated_at,
+                auth_updated_at = EXCLUDED.auth_updated_at,
+                access_token_expires_at = EXCLUDED.access_token_expires_at,
+                id_token_expires_at = EXCLUDED.id_token_expires_at,
+                refresh_token_expires_at = EXCLUDED.refresh_token_expires_at,
+                last_refresh_at = EXCLUDED.last_refresh_at,
+                refresh_token_present = EXCLUDED.refresh_token_present,
+                reauth_required = EXCLUDED.reauth_required,
+                reauth_reason = EXCLUDED.reauth_reason
+            """,
+            (
+                clean_label,
+                clean_account_key,
+                email,
+                name,
+                subject,
+                user_id,
+                provider_account_id,
+                auth_payload,
+                now_iso,
+                now_iso,
+                auth_updated_at,
+                access_token_expires_at,
+                id_token_expires_at,
+                refresh_token_expires_at,
+                last_refresh_at,
+                bool(refresh_token_present) if refresh_token_present is not None else None,
+                bool(reauth_required) if reauth_required is not None else None,
+                reauth_reason,
+            ),
+        )
+        return
+    conn.execute(
+        """
+        INSERT INTO saved_profiles (
+            label, account_key, email, name, subject, user_id, provider_account_id,
+            auth_json, created_at, updated_at, auth_updated_at,
+            access_token_expires_at, id_token_expires_at, refresh_token_expires_at, last_refresh_at, refresh_token_present,
+            reauth_required, reauth_reason
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(label) DO UPDATE SET
+            account_key = excluded.account_key,
+            email = excluded.email,
+            name = excluded.name,
+            subject = excluded.subject,
+            user_id = excluded.user_id,
+            provider_account_id = excluded.provider_account_id,
+            auth_json = excluded.auth_json,
+            updated_at = excluded.updated_at,
+            auth_updated_at = excluded.auth_updated_at,
+            access_token_expires_at = excluded.access_token_expires_at,
+            id_token_expires_at = excluded.id_token_expires_at,
+            refresh_token_expires_at = excluded.refresh_token_expires_at,
+            last_refresh_at = excluded.last_refresh_at,
+            refresh_token_present = excluded.refresh_token_present,
+            reauth_required = excluded.reauth_required,
+            reauth_reason = excluded.reauth_reason
+        """,
+        (
+            clean_label,
+            clean_account_key,
+            email,
+            name,
+            subject,
+            user_id,
+            provider_account_id,
+            auth_payload,
+            now_iso,
+            now_iso,
+            auth_updated_at,
+            access_token_expires_at,
+            id_token_expires_at,
+            refresh_token_expires_at,
+            last_refresh_at,
+            bool(refresh_token_present) if refresh_token_present is not None else None,
+            bool(reauth_required) if reauth_required is not None else None,
+            reauth_reason,
+        ),
+    )
+
+
+def reconcile_saved_profile_identities(
+    *,
+    db_path: Path | None = None,
+) -> int:
+    rows = list_saved_profiles(db_path=db_path)
+    updated = 0
+    for row in rows:
+        auth_json = row.get("auth_json")
+        if not isinstance(auth_json, dict):
+            continue
+        before = {
+            "account_key": str(row.get("account_key") or ""),
+            "email": str(row.get("email") or "") if row.get("email") is not None else None,
+            "name": str(row.get("name") or "") if row.get("name") is not None else None,
+            "subject": str(row.get("subject") or "") if row.get("subject") is not None else None,
+            "user_id": str(row.get("user_id") or "") if row.get("user_id") is not None else None,
+            "provider_account_id": (
+                str(row.get("provider_account_id") or "")
+                if row.get("provider_account_id") is not None
+                else None
+            ),
+        }
+        identity = extract_account_identity(auth_json)
+        after = {
+            "account_key": str(identity.account_key or before["account_key"] or ""),
+            "email": identity.email or before["email"],
+            "name": identity.name or before["name"],
+            "subject": identity.subject or before["subject"],
+            "user_id": identity.user_id or before["user_id"],
+            "provider_account_id": identity.account_id or before["provider_account_id"],
+        }
+        if before == after:
+            continue
+        upsert_saved_profile(
+            label=str(row.get("label") or ""),
+            account_key=after["account_key"],
+            auth_json=auth_json,
+            email=after["email"],
+            name=after["name"],
+            subject=after["subject"],
+            user_id=after["user_id"],
+            provider_account_id=after["provider_account_id"],
+            access_token_expires_at=(
+                str(row.get("access_token_expires_at"))
+                if row.get("access_token_expires_at") is not None
+                else None
+            ),
+            id_token_expires_at=(
+                str(row.get("id_token_expires_at"))
+                if row.get("id_token_expires_at") is not None
+                else None
+            ),
+            refresh_token_expires_at=(
+                str(row.get("refresh_token_expires_at"))
+                if row.get("refresh_token_expires_at") is not None
+                else None
+            ),
+            last_refresh_at=(
+                str(row.get("last_refresh_at"))
+                if row.get("last_refresh_at") is not None
+                else None
+            ),
+            refresh_token_present=(
+                bool(row.get("refresh_token_present"))
+                if row.get("refresh_token_present") is not None
+                else None
+            ),
+            reauth_required=(
+                bool(row.get("reauth_required"))
+                if row.get("reauth_required") is not None
+                else None
+            ),
+            reauth_reason=(
+                str(row.get("reauth_reason"))
+                if row.get("reauth_reason") is not None
+                else None
+            ),
+            db_path=db_path,
+        )
+        updated += 1
+    return updated
 
 
 def update_saved_profile_reauth_status(
@@ -1054,6 +1240,45 @@ def get_saved_profile(label: str, db_path: Path | None = None) -> dict[str, Any]
         if not row:
             return None
         return _row_to_saved_profile(row)
+
+
+@contextmanager
+def saved_profile_refresh_lock(
+    label: str,
+    *,
+    db_path: Path | None = None,
+):
+    """Try to hold the cross-process refresh lock for one saved profile."""
+    clean = (label or "").strip()
+    if not clean:
+        yield False
+        return
+
+    if db_path is None and _is_postgres_configured():
+        with _connect(db_path) as conn:
+            row = conn.execute(
+                "SELECT pg_try_advisory_lock(hashtextextended(?, 0)) AS acquired",
+                (f"auth-manager-refresh:{clean}",),
+            ).fetchone()
+            acquired = bool(row and row["acquired"])
+            try:
+                yield acquired
+            finally:
+                if acquired:
+                    conn.execute(
+                        "SELECT pg_advisory_unlock(hashtextextended(?, 0))",
+                        (f"auth-manager-refresh:{clean}",),
+                    )
+        return
+
+    with _SQLITE_PROFILE_REFRESH_LOCKS_GUARD:
+        lock = _SQLITE_PROFILE_REFRESH_LOCKS.setdefault(clean, threading.Lock())
+    acquired = lock.acquire(blocking=False)
+    try:
+        yield acquired
+    finally:
+        if acquired:
+            lock.release()
 
 
 def list_saved_profiles(db_path: Path | None = None) -> list[dict[str, Any]]:
@@ -1170,30 +1395,39 @@ def get_active_auth_json(db_path: Path | None = None) -> dict[str, Any] | None:
 
 
 def set_active_auth_json(payload: dict[str, Any] | None, db_path: Path | None = None) -> None:
-    now_iso = _to_iso(datetime.now(timezone.utc))
-    encoded = json.dumps(payload, sort_keys=True) if isinstance(payload, dict) else None
     with _connect(db_path) as conn:
         _ensure_schema(conn)
-        conn.execute(
-            """
-            INSERT INTO app_meta (key, value, updated_at)
-            VALUES (?, ?, ?)
-            ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
-            """,
-            (ACTIVE_AUTH_JSON_KEY, encoded, now_iso),
-        )
-        conn.execute(
-            """
-            INSERT INTO app_meta (key, value, updated_at)
-            VALUES (?, ?, ?)
-            ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
-            """,
-            (ACTIVE_AUTH_UPDATED_AT_KEY, now_iso if payload is not None else None, now_iso),
-        )
+        _set_active_auth_json_locked(conn, payload)
 
 
 def get_active_auth_updated_at(db_path: Path | None = None) -> str | None:
     return get_meta_value(ACTIVE_AUTH_UPDATED_AT_KEY, db_path=db_path)
+
+
+def _set_active_auth_json_locked(
+    conn: Any,
+    payload: dict[str, Any] | None,
+    *,
+    now: datetime | None = None,
+) -> None:
+    now_iso = _to_iso(_as_utc(now))
+    encoded = json.dumps(payload, sort_keys=True) if isinstance(payload, dict) else None
+    conn.execute(
+        """
+        INSERT INTO app_meta (key, value, updated_at)
+        VALUES (?, ?, ?)
+        ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
+        """,
+        (ACTIVE_AUTH_JSON_KEY, encoded, now_iso),
+    )
+    conn.execute(
+        """
+        INSERT INTO app_meta (key, value, updated_at)
+        VALUES (?, ?, ?)
+        ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
+        """,
+        (ACTIVE_AUTH_UPDATED_AT_KEY, now_iso if payload is not None else None, now_iso),
+    )
 
 
 def runtime_settings_defaults() -> dict[str, Any]:
@@ -1212,6 +1446,22 @@ def runtime_settings_defaults() -> dict[str, Any]:
         "rotation_policy_default": "replacement_required_only",
         "rotation_policy_by_agent": {},
         "rotation_policy_by_machine": {},
+        "assignment_policy_by_agent": {},
+        "assignment_policy_by_machine": {
+            "remote-live-worker-01": {
+                "preferred_credential_ids": [],
+                "preferred_emails": ["mysf@systemsfinance.co.uk"],
+                "allowed_credential_ids": [],
+                "allowed_emails": [
+                    "mysf@systemsfinance.co.uk",
+                    "james@systemsfinance.co.uk",
+                    "max@systemsfinance.co.uk",
+                    "harry@systemsfinance.co.uk",
+                    "george@systemsfinance.co.uk",
+                ],
+                "fallback_to_any_eligible": True,
+            }
+        },
     }
 
 
@@ -1273,6 +1523,43 @@ def _normalize_runtime_settings(values: dict[str, Any] | None) -> dict[str, Any]
                 normalized[map_key_text] = map_value_text
         merged[key] = normalized
 
+    def _assignment_policy_map(key: str) -> None:
+        raw = values.get(key)
+        if not isinstance(raw, dict):
+            return
+        normalized: dict[str, dict[str, Any]] = {}
+        for map_key, map_value in raw.items():
+            map_key_text = str(map_key).strip()
+            if not map_key_text or not isinstance(map_value, dict):
+                continue
+
+            def _string_list(field: str) -> list[str]:
+                value = map_value.get(field)
+                if not isinstance(value, list):
+                    return []
+                out: list[str] = []
+                for item in value:
+                    text = str(item).strip()
+                    if text:
+                        out.append(text)
+                return out
+
+            fallback_raw = map_value.get("fallback_to_any_eligible")
+            if isinstance(fallback_raw, bool):
+                fallback = fallback_raw
+            else:
+                fallback_text = str(fallback_raw).strip().lower()
+                fallback = fallback_text not in {"0", "false", "no", "off"}
+
+            normalized[map_key_text] = {
+                "preferred_credential_ids": _string_list("preferred_credential_ids"),
+                "preferred_emails": _string_list("preferred_emails"),
+                "allowed_credential_ids": _string_list("allowed_credential_ids"),
+                "allowed_emails": _string_list("allowed_emails"),
+                "fallback_to_any_eligible": fallback,
+            }
+        merged[key] = normalized
+
     _int("analytics_snapshot_interval_seconds", 60)
     _int("lease_default_ttl_seconds", 60)
     _int("lease_renewal_min_remaining_seconds", 15)
@@ -1287,6 +1574,8 @@ def _normalize_runtime_settings(values: dict[str, Any] | None) -> dict[str, Any]
     _rotation_policy("rotation_policy_default")
     _rotation_policy_map("rotation_policy_by_agent")
     _rotation_policy_map("rotation_policy_by_machine")
+    _assignment_policy_map("assignment_policy_by_agent")
+    _assignment_policy_map("assignment_policy_by_machine")
 
     if merged["lease_reclaim_after_seconds"] <= merged["lease_stale_after_seconds"]:
         merged["lease_reclaim_after_seconds"] = merged["lease_stale_after_seconds"] + 60

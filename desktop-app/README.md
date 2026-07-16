@@ -13,6 +13,7 @@ What it does:
 - posts minimal truthful lease telemetry
 - persists non-secret lease metadata and local settings across restarts
 - shows current lease and usage state in a desktop UI
+- shows banked rate-limit reset availability and requires confirmation before using one
 
 ## Reuse from the VS Code extension
 
@@ -42,6 +43,8 @@ The app expects these existing backend endpoints:
 - `POST /api/leases/rotate`
 - `POST /api/leases/{lease_id}/materialize`
 - `POST /api/leases/{lease_id}/reconcile-auth`
+- `POST /api/leases/{lease_id}/rate-limit-resets/read`
+- `POST /api/leases/{lease_id}/rate-limit-resets/consume`
 
 The materialize endpoint must return `credential_material.auth_json`.
 
@@ -80,6 +83,8 @@ The app writes `~/.codex/auth.json` by:
 6. renaming it into place atomically
 
 The app never stores raw auth tokens in the local app state. The token payload only lives in the auth file returned by backend materialization.
+
+Automatic lease, telemetry, and auth refresh work never consumes banked resets. The separate **Use Rate-Limit Reset** action requires an interactive confirmation.
 
 ## Lease lifecycle behavior
 

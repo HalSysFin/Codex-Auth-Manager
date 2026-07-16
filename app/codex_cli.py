@@ -16,6 +16,7 @@ from typing import Any
 
 import httpx
 
+from .account_identity import extract_account_identity
 from .account_usage_store import get_active_auth_json, get_active_auth_updated_at, set_active_auth_json
 from .config import settings
 from .oauth_flow import build_auth_payload, build_oauth_authorize_url
@@ -49,6 +50,10 @@ class LoginStartResult:
     browser_url: str | None
     instructions: str
     output_excerpt: str | None = None
+    oauth_state: str | None = None
+    code_verifier: str | None = None
+    redirect_uri: str | None = None
+    auth_updated_at: str | None = None
 
 
 @dataclass
@@ -69,6 +74,12 @@ class AppServerRateLimitsResult:
     account: dict[str, Any] | None
     rate_limits: Any
     notifications: list[dict[str, Any]]
+
+
+@dataclass
+class RateLimitResetResult:
+    outcome: str
+    rate_limits: Any
 
 
 @dataclass
@@ -144,6 +155,34 @@ async def read_rate_limits_for_auth_async(
     return await _read_rate_limits_via_worker_async(auth_json, timeout_seconds=timeout_seconds)
 
 
+async def consume_rate_limit_reset_for_auth_async(
+    auth_json: dict[str, Any],
+    *,
+    idempotency_key: str,
+    credit_id: str | None = None,
+    timeout_seconds: float = 15.0,
+) -> RateLimitResetResult:
+    clean_key = idempotency_key.strip()
+    if not clean_key:
+        raise CodexCLIError("A non-empty idempotency key is required")
+    payload = _worker_payload(auth_json, timeout_seconds=timeout_seconds)
+    payload.update(
+        {
+            "operation": "consume_rate_limit_reset",
+            "idempotency_key": clean_key,
+            "credit_id": credit_id.strip() if credit_id and credit_id.strip() else None,
+        }
+    )
+    raw = await _run_worker_async(payload, timeout_seconds=timeout_seconds)
+    consume_result = raw.get("consume_result")
+    if not isinstance(consume_result, dict):
+        raise CodexCLIError("Codex reset worker returned no redemption result")
+    outcome = str(consume_result.get("outcome") or "").strip()
+    if not outcome:
+        raise CodexCLIError("Codex reset worker returned no redemption outcome")
+    return RateLimitResetResult(outcome=outcome, rate_limits=raw.get("rate_limits"))
+
+
 def _chatgpt_backend_headers(auth_json: dict[str, Any]) -> dict[str, str]:
     access_token = _find_first_key(auth_json, ["access_token", "accessToken", "token"])
     if not access_token:
@@ -164,9 +203,14 @@ def _chatgpt_backend_headers(auth_json: dict[str, Any]) -> dict[str, str]:
     }
 
 
-def _chatgpt_backend_payload() -> dict[str, Any]:
+def _chatgpt_backend_payload(model: str | None = None) -> dict[str, Any]:
+    model_name = str(
+        model
+        or settings.chatgpt_backend_rate_limits_model
+        or "gpt-5.1-codex-mini"
+    ).strip() or "gpt-5.1-codex-mini"
     return {
-        "model": str(settings.chatgpt_backend_rate_limits_model or "gpt-5.1-codex-mini").strip() or "gpt-5.1-codex-mini",
+        "model": model_name,
         "instructions": str(settings.chatgpt_backend_rate_limits_instructions or "You are Codex. Be concise.").strip() or "You are Codex. Be concise.",
         "store": False,
         "stream": True,
@@ -257,48 +301,170 @@ def _chatgpt_rate_limits_from_headers(headers: dict[str, str]) -> dict[str, Any]
     }
 
 
-def _read_rate_limits_via_chatgpt_backend(
+def _auth_has_pro_plan(auth_json: dict[str, Any]) -> bool:
+    identity = extract_account_identity(auth_json)
+    return str(identity.plan_type or "").strip().lower() == "pro"
+
+
+def _chatgpt_product_limits_payload(
+    parsed: dict[str, Any],
+    *,
+    model: str,
+    label: str,
+) -> dict[str, Any]:
+    return {
+        "id": model,
+        "model": model,
+        "label": label,
+        "planType": parsed.get("planType"),
+        "limitId": parsed.get("limitId"),
+        "primary": parsed.get("primary"),
+        "secondary": parsed.get("secondary"),
+    }
+
+
+def _merge_chatgpt_product_limits(
+    primary_limits: dict[str, Any],
+    *,
+    primary_model: str,
+    primary_label: str,
+    spark_limits: dict[str, Any] | None = None,
+    spark_model: str | None = None,
+    spark_label: str | None = None,
+) -> dict[str, Any]:
+    products = [
+        _chatgpt_product_limits_payload(
+            primary_limits,
+            model=primary_model,
+            label=primary_label,
+        )
+    ]
+    if isinstance(spark_limits, dict) and spark_model and spark_label:
+        products.append(
+            _chatgpt_product_limits_payload(
+                spark_limits,
+                model=spark_model,
+                label=spark_label,
+            )
+        )
+
+    merged = dict(primary_limits)
+    merged["products"] = products
+    return merged
+
+
+def _chatgpt_backend_rate_limits_request(
     auth_json: dict[str, Any],
-    timeout_seconds: float = 15.0,
-) -> AppServerRateLimitsResult:
+    *,
+    model: str,
+    timeout_seconds: float,
+) -> dict[str, Any]:
     url = str(settings.chatgpt_backend_rate_limits_url or "").strip()
     if not url:
         raise CodexCLIError("Missing configured ChatGPT backend rate-limit URL")
     headers = _chatgpt_backend_headers(auth_json)
-    payload = _chatgpt_backend_payload()
+    payload = _chatgpt_backend_payload(model)
     try:
         with httpx.Client(timeout=timeout_seconds, follow_redirects=True) as client:
             with client.stream("POST", url, headers=headers, json=payload) as response:
                 if response.status_code >= 400:
                     detail = response.read().decode("utf-8", errors="replace").strip()
                     raise CodexCLIError(detail or f"ChatGPT backend request failed with HTTP {response.status_code}")
-                parsed = _chatgpt_rate_limits_from_headers(dict(response.headers))
+                return _chatgpt_rate_limits_from_headers(dict(response.headers))
     except httpx.HTTPError as exc:
         raise CodexCLIError(f"Unable to reach ChatGPT backend rate-limit endpoint {url}: {exc}") from exc
 
-    return AppServerRateLimitsResult(account=None, rate_limits=parsed, notifications=[])
 
-
-async def _read_rate_limits_via_chatgpt_backend_async(
+async def _chatgpt_backend_rate_limits_request_async(
     auth_json: dict[str, Any],
-    timeout_seconds: float = 15.0,
-) -> AppServerRateLimitsResult:
+    *,
+    model: str,
+    timeout_seconds: float,
+) -> dict[str, Any]:
     url = str(settings.chatgpt_backend_rate_limits_url or "").strip()
     if not url:
         raise CodexCLIError("Missing configured ChatGPT backend rate-limit URL")
     headers = _chatgpt_backend_headers(auth_json)
-    payload = _chatgpt_backend_payload()
+    payload = _chatgpt_backend_payload(model)
     try:
         async with httpx.AsyncClient(timeout=timeout_seconds, follow_redirects=True) as client:
             async with client.stream("POST", url, headers=headers, json=payload) as response:
                 if response.status_code >= 400:
                     detail = (await response.aread()).decode("utf-8", errors="replace").strip()
                     raise CodexCLIError(detail or f"ChatGPT backend request failed with HTTP {response.status_code}")
-                parsed = _chatgpt_rate_limits_from_headers(dict(response.headers))
+                return _chatgpt_rate_limits_from_headers(dict(response.headers))
     except httpx.HTTPError as exc:
         raise CodexCLIError(f"Unable to reach ChatGPT backend rate-limit endpoint {url}: {exc}") from exc
 
-    return AppServerRateLimitsResult(account=None, rate_limits=parsed, notifications=[])
+
+def _read_rate_limits_via_chatgpt_backend(
+    auth_json: dict[str, Any],
+    timeout_seconds: float = 15.0,
+) -> AppServerRateLimitsResult:
+    primary_model = str(settings.chatgpt_backend_rate_limits_model or "gpt-5.1-codex-mini").strip() or "gpt-5.1-codex-mini"
+    primary_label = str(settings.chatgpt_backend_rate_limits_label or "Codex").strip() or "Codex"
+    parsed = _chatgpt_backend_rate_limits_request(
+        auth_json,
+        model=primary_model,
+        timeout_seconds=timeout_seconds,
+    )
+    spark_model = str(settings.chatgpt_backend_rate_limits_spark_model or "").strip()
+    spark_label = str(settings.chatgpt_backend_rate_limits_spark_label or "GPT-5.3 Spark").strip() or "GPT-5.3 Spark"
+    spark_limits = None
+    if spark_model and spark_model != primary_model and _auth_has_pro_plan(auth_json):
+        try:
+            spark_limits = _chatgpt_backend_rate_limits_request(
+                auth_json,
+                model=spark_model,
+                timeout_seconds=timeout_seconds,
+            )
+        except CodexCLIError:
+            spark_limits = None
+
+    merged = _merge_chatgpt_product_limits(
+        parsed,
+        primary_model=primary_model,
+        primary_label=primary_label,
+        spark_limits=spark_limits,
+        spark_model=spark_model or None,
+        spark_label=spark_label,
+    )
+    return AppServerRateLimitsResult(account=None, rate_limits=merged, notifications=[])
+
+
+async def _read_rate_limits_via_chatgpt_backend_async(
+    auth_json: dict[str, Any],
+    timeout_seconds: float = 15.0,
+) -> AppServerRateLimitsResult:
+    primary_model = str(settings.chatgpt_backend_rate_limits_model or "gpt-5.1-codex-mini").strip() or "gpt-5.1-codex-mini"
+    primary_label = str(settings.chatgpt_backend_rate_limits_label or "Codex").strip() or "Codex"
+    parsed = await _chatgpt_backend_rate_limits_request_async(
+        auth_json,
+        model=primary_model,
+        timeout_seconds=timeout_seconds,
+    )
+    spark_model = str(settings.chatgpt_backend_rate_limits_spark_model or "").strip()
+    spark_label = str(settings.chatgpt_backend_rate_limits_spark_label or "GPT-5.3 Spark").strip() or "GPT-5.3 Spark"
+    spark_limits = None
+    if spark_model and spark_model != primary_model and _auth_has_pro_plan(auth_json):
+        try:
+            spark_limits = await _chatgpt_backend_rate_limits_request_async(
+                auth_json,
+                model=spark_model,
+                timeout_seconds=timeout_seconds,
+            )
+        except CodexCLIError:
+            spark_limits = None
+
+    merged = _merge_chatgpt_product_limits(
+        parsed,
+        primary_model=primary_model,
+        primary_label=primary_label,
+        spark_limits=spark_limits,
+        spark_model=spark_model or None,
+        spark_label=spark_label,
+    )
+    return AppServerRateLimitsResult(account=None, rate_limits=merged, notifications=[])
 
 
 def _read_rate_limits_via_direct_api(
@@ -408,6 +574,19 @@ async def _read_rate_limits_via_worker_async(
     timeout_seconds: float = 15.0,
 ) -> AppServerRateLimitsResult:
     payload = _worker_payload(auth_json, timeout_seconds=timeout_seconds)
+    raw = await _run_worker_async(payload, timeout_seconds=timeout_seconds)
+    return AppServerRateLimitsResult(
+        account=raw.get("account") if isinstance(raw.get("account"), dict) else None,
+        rate_limits=raw.get("rate_limits"),
+        notifications=raw.get("notifications") if isinstance(raw.get("notifications"), list) else [],
+    )
+
+
+async def _run_worker_async(
+    payload: dict[str, Any],
+    *,
+    timeout_seconds: float,
+) -> dict[str, Any]:
     try:
         process = await asyncio.create_subprocess_exec(
             sys.executable,
@@ -431,7 +610,7 @@ async def _read_rate_limits_via_worker_async(
         await process.wait()
         raise CodexCLIError("Codex rate-limit worker timed out") from exc
 
-    return _parse_worker_result(
+    return _parse_worker_payload(
         stdout=stdout.decode("utf-8", errors="replace"),
         stderr=stderr.decode("utf-8", errors="replace"),
         returncode=process.returncode,
@@ -440,10 +619,23 @@ async def _read_rate_limits_via_worker_async(
 
 def _worker_payload(auth_json: dict[str, Any], *, timeout_seconds: float) -> dict[str, Any]:
     return {
-        "auth_json": auth_json,
+        # The probe only needs the access token. Never let a temporary Codex
+        # process rotate a refresh token that it cannot persist back to us.
+        "auth_json": _without_refresh_tokens(auth_json),
         "timeout_seconds": timeout_seconds,
         "codex_bin": settings.codex_bin,
     }
+
+
+def _without_refresh_tokens(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {
+            key: "" if key == "refresh_token" else _without_refresh_tokens(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [_without_refresh_tokens(item) for item in value]
+    return value
 
 
 def _parse_worker_result(
@@ -452,6 +644,24 @@ def _parse_worker_result(
     stderr: str,
     returncode: int,
 ) -> AppServerRateLimitsResult:
+    payload = _parse_worker_payload(stdout=stdout, stderr=stderr, returncode=returncode)
+    return AppServerRateLimitsResult(
+        account=payload.get("account") if isinstance(payload.get("account"), dict) else None,
+        rate_limits=payload.get("rate_limits"),
+        notifications=(
+            payload.get("notifications")
+            if isinstance(payload.get("notifications"), list)
+            else []
+        ),
+    )
+
+
+def _parse_worker_payload(
+    *,
+    stdout: str,
+    stderr: str,
+    returncode: int,
+) -> dict[str, Any]:
     output = stdout.strip()
     if not output:
         message = stderr.strip() or f"worker exited with code {returncode}"
@@ -465,15 +675,7 @@ def _parse_worker_result(
     if not payload.get("ok"):
         error = str(payload.get("error") or stderr.strip() or "unknown worker failure").strip()
         raise CodexCLIError(f"Codex rate-limit worker failed: {error}")
-    return AppServerRateLimitsResult(
-        account=payload.get("account") if isinstance(payload.get("account"), dict) else None,
-        rate_limits=payload.get("rate_limits"),
-        notifications=(
-            payload.get("notifications")
-            if isinstance(payload.get("notifications"), list)
-            else []
-        ),
-    )
+    return payload
 
 
 def start_login(capture_timeout_seconds: float = 1.2) -> LoginStartResult:
@@ -514,6 +716,10 @@ def start_login(capture_timeout_seconds: float = 1.2) -> LoginStartResult:
             "back to /auth/relay-callback."
         ),
         output_excerpt=None,
+        oauth_state=flow["state"],
+        code_verifier=flow["code_verifier"],
+        redirect_uri=settings.openai_redirect_uri,
+        auth_updated_at=_LOGIN_STATE.auth_updated_at,
     )
 
 
@@ -801,6 +1007,65 @@ async def relay_callback_to_login_async(callback_payload: dict[str, Any]) -> dic
             }
 
     return relay_callback_to_login(callback_payload)
+
+
+async def exchange_callback_with_pkce_async(
+    callback_payload: dict[str, Any],
+    *,
+    code_verifier: str,
+    redirect_uri: str,
+    expected_state: str | None = None,
+) -> dict[str, Any]:
+    error = callback_payload.get("error")
+    if isinstance(error, str) and error.strip():
+        return {
+            "attempted": True,
+            "supported": True,
+            "completed": False,
+            "message": str(callback_payload.get("error_description") or error).strip(),
+        }
+
+    callback_state = str(callback_payload.get("state") or "").strip()
+    expected = str(expected_state or "").strip()
+    if expected and callback_state and callback_state != expected:
+        return {
+            "attempted": True,
+            "supported": True,
+            "completed": False,
+            "message": "Callback state did not match the saved PKCE login session.",
+        }
+
+    code = str(callback_payload.get("code") or "").strip()
+    if not code:
+        return {
+            "attempted": False,
+            "supported": True,
+            "completed": False,
+            "message": "Missing authorization code in callback payload.",
+        }
+
+    try:
+        token_response = await _exchange_code_for_token_async(
+            code=code,
+            code_verifier=code_verifier,
+            redirect_uri=redirect_uri,
+        )
+        auth_json = build_auth_payload(token_response)
+        set_active_auth_json(auth_json)
+        return {
+            "attempted": True,
+            "supported": True,
+            "completed": True,
+            "message": "Callback exchanged and active auth updated in database.",
+            "auth_path": "db://active-auth",
+        }
+    except Exception as exc:
+        return {
+            "attempted": True,
+            "supported": True,
+            "completed": False,
+            "message": f"Unable to exchange callback code: {exc}",
+        }
 
 
 def cancel_login() -> bool:

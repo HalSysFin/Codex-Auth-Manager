@@ -338,7 +338,7 @@ It can:
 
 - ensure a lease on startup
 - refresh, renew, rotate, and release broker leases
-- materialize auth into `~/.codex/auth.json`
+- materialize access auth into `~/.codex/auth.json` while the manager retains exclusive ownership of the refresh token
 - display lease and usage status in a sidebar and status bar
 
 Key commands:
@@ -428,6 +428,8 @@ The older `openclaw-skill/` content is no longer the primary documented integrat
 ## Lease Broker
 
 Auth Manager can now act as a lease broker for approved credentials already stored as saved profiles.
+
+Full integration contract: [docs/lease-api.md](./docs/lease-api.md)
 
 - `POST /api/leases/acquire` selects the best policy-eligible credential and issues a time-bounded lease.
 - `POST /api/leases/{lease_id}/renew` extends an active lease while the credential is still usable.

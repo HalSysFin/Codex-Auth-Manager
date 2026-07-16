@@ -89,6 +89,7 @@ The extension contributes these commands:
 - `Auth Manager: Reload Window`
 - `Auth Manager: Open Dashboard`
 - `Auth Manager: Show Lease View`
+- `Auth Manager: Use Codex Rate-Limit Reset`
 
 Practical command behavior:
 
@@ -96,6 +97,7 @@ Practical command behavior:
 - `Reload Codex Auth` rewrites the local auth file from the current active lease state
 - `Reload Window` is available as a manual fallback after auth replacement
 - `Open Dashboard` opens the manager UI
+- `Use Codex Rate-Limit Reset` confirms before consuming one banked reset for the currently leased account
 
 ## Auth File Behavior
 

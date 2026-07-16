@@ -24,6 +24,9 @@ async function main(): Promise<void> {
         credentialId: status.lease.credentialId,
         expiresAt: status.lease.expiresAt,
         latestUtilizationPct: status.lease.latestUtilizationPct,
+        latestRateLimitUsedPercent: status.lease.latestRateLimitUsedPercent ?? null,
+        latestRateLimitResetAt: status.lease.latestRateLimitResetAt ?? null,
+        latestRateLimitPeriod: status.lease.latestRateLimitPeriod ?? null,
         latestQuotaRemaining: status.lease.latestQuotaRemaining,
         lastBackendRefreshAt: status.lease.lastBackendRefreshAt,
         lastAuthWriteAt: status.lease.lastAuthWriteAt,
@@ -42,6 +45,9 @@ async function main(): Promise<void> {
         credentialId: status.lease.credentialId,
         expiresAt: status.lease.expiresAt,
         latestUtilizationPct: status.lease.latestUtilizationPct,
+        latestRateLimitUsedPercent: status.lease.latestRateLimitUsedPercent ?? null,
+        latestRateLimitResetAt: status.lease.latestRateLimitResetAt ?? null,
+        latestRateLimitPeriod: status.lease.latestRateLimitPeriod ?? null,
         latestQuotaRemaining: status.lease.latestQuotaRemaining,
         lastBackendRefreshAt: status.lease.lastBackendRefreshAt,
         lastAuthWriteAt: status.lease.lastAuthWriteAt,
@@ -59,6 +65,20 @@ async function main(): Promise<void> {
     case 'release':
       await agent.release()
       break
+    case 'resets': {
+      const resets = await agent.getRateLimitResets()
+      output.info(JSON.stringify(resets, null, 2))
+      break
+    }
+    case 'reset': {
+      if (parsed.flags.yes !== true) {
+        throw new Error('Refusing to consume a rate-limit reset without --yes.')
+      }
+      const creditId = typeof parsed.flags['credit-id'] === 'string' ? parsed.flags['credit-id'] : undefined
+      const result = await agent.useRateLimitReset(creditId)
+      output.info(JSON.stringify(result, null, 2))
+      break
+    }
     case 'run':
       await agent.run()
       break

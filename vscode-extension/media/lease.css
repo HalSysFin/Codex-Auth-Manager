@@ -94,6 +94,11 @@ button:hover {
   background: var(--vscode-button-hoverBackground);
 }
 
+button:disabled {
+  cursor: not-allowed;
+  opacity: 0.45;
+}
+
 .message {
   margin-top: 12px;
   padding: 10px;
@@ -178,6 +183,25 @@ button:hover {
 .usage-meta {
   margin-top: 10px;
   opacity: 0.8;
+}
+
+.reset-credit-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin-top: 12px;
+  padding-top: 12px;
+  border-top: 1px solid var(--vscode-panel-border);
+}
+
+.reset-credit-row span {
+  font-size: 12px;
+  opacity: 0.85;
+}
+
+.reset-credit-row button {
+  flex: 0 0 auto;
 }
 
 .grid {

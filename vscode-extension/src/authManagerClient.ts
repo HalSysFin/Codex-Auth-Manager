@@ -11,6 +11,9 @@ import type {
   LeaseStatusResponse,
   LeaseTelemetryRequest,
   MaterializeLeaseResponse,
+  ConsumeRateLimitResetResponse,
+  RateLimitResetCredit,
+  RateLimitResetCreditsResponse,
 } from '../../packages/lease-runtime/src/types.js'
 
 export type {
@@ -21,6 +24,9 @@ export type {
   LeaseStatusResponse,
   LeaseTelemetryRequest,
   MaterializeLeaseResponse,
+  ConsumeRateLimitResetResponse,
+  RateLimitResetCredit,
+  RateLimitResetCreditsResponse,
 }
 
 export { AuthManagerClientError, normalizeBackendErrorPayload }

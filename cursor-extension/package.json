@@ -2,7 +2,7 @@
   "name": "cam-cursor-extension",
   "displayName": "CAM Cursor Extension",
   "description": "Connects Cursor to Codex Auth Manager leases and writes leased auth payloads into ~/.codex/auth.json.",
-  "version": "1.12.6",
+  "version": "1.12.8",
   "publisher": "halsysfin",
   "license": "MIT",
   "repository": {
@@ -169,12 +169,13 @@
     }
   },
   "scripts": {
-    "compile": "tsc -p .",
+    "clean": "rm -rf dist",
+    "compile": "npm run clean && tsc -p .",
     "watch": "tsc -p . -w",
     "lint": "tsc -p . --noEmit",
     "test": "node --import tsx --test \"src/test/**/*.test.ts\"",
     "prepublishOnly": "npm run compile",
-    "package": "vsce package"
+    "package": "npm run compile && vsce package"
   },
   "devDependencies": {
     "@types/node": "^22.10.2",

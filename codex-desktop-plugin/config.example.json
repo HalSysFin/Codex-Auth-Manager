@@ -1,0 +1,26 @@
+{
+  "base_url": "https://openauth-api.plingindigo.org",
+  "timeout_seconds": 20,
+  "headers": {
+    "Accept": "application/json",
+    "Authorization": "Bearer ${INTERNAL_API_TOKEN}",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) CodexDesktopAuthManager/0.1"
+  },
+  "client": {
+    "product": "codex-desktop",
+    "id_path": "${HOME_DIR}/.codex/codex-desktop-plugin-client-id.txt"
+  },
+  "lease": {
+    "agent_id": "codex-desktop-plugin",
+    "requested_ttl_seconds": 1800
+  },
+  "codex": {
+    "auth_path": "${HOME_DIR}/.codex/auth.json",
+    "backup_dir": "${HOME_DIR}/.codex/auth-backups",
+    "restart_delay_seconds": 2
+  },
+  "watcher": {
+    "interval_seconds": 60,
+    "state_dir": "${HOME_DIR}/.codex/codex-desktop-plugin"
+  }
+}

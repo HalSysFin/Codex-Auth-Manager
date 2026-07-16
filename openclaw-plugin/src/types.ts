@@ -153,6 +153,31 @@ export type AutomaticLeaseManagementUpdate = {
   autoRotate?: boolean
 }
 
+export type RateLimitResetCredit = {
+  id: string | null
+  reset_type: string | null
+  status: string | null
+  granted_at: number | string | null
+  expires_at: number | string | null
+  title: string | null
+  description: string | null
+}
+
+export type RateLimitResetCreditsResponse = {
+  status: 'ok'
+  lease_id: string
+  credential_id: string
+  available_count: number | null
+  credits: RateLimitResetCredit[]
+  rate_limits: Record<string, unknown>
+  fetched_at: string
+}
+
+export type ConsumeRateLimitResetResponse = RateLimitResetCreditsResponse & {
+  outcome: 'reset' | 'alreadyRedeemed' | 'nothingToReset' | 'noCredit' | string
+  idempotency_key: string
+}
+
 export type LeaseControlAPI = {
   status: (input?: { refresh?: boolean }) => Promise<LeaseControlResult>
   ensure: (input?: { reason?: string }) => Promise<LeaseControlResult>
@@ -163,6 +188,8 @@ export type LeaseControlAPI = {
   materialize: () => Promise<LeaseControlResult>
   flushTelemetry: () => Promise<LeaseControlResult>
   setAutoMode: (input: AutomaticLeaseManagementUpdate) => Promise<LeaseControlResult>
+  rateLimitResets: () => Promise<RateLimitResetCreditsResponse>
+  useRateLimitReset: (input?: { creditId?: string | null }) => Promise<ConsumeRateLimitResetResponse>
 }
 
 export type Lease = {

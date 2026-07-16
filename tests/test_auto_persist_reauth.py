@@ -30,6 +30,127 @@ def _jwt_with_claims(claims: dict) -> str:
 
 
 class AutoPersistReauthTests(unittest.TestCase):
+    def test_reauth_does_not_delete_other_user_sharing_provider_account_id(self) -> None:
+        james = AccountProfile(
+            label="james",
+            path=Path("/tmp/james.json"),
+            auth={"email": "james@systemsfinance.co.uk", "tokens": {"access_token": "old-james"}},
+            account_key="sub:auth0|james-user",
+            access_token="old-james",
+            email="james@systemsfinance.co.uk",
+            provider_account_id="shared-team-account",
+        )
+        max_profile = AccountProfile(
+            label="max",
+            path=Path("/tmp/max.json"),
+            auth={"email": "max@systemsfinance.co.uk", "tokens": {"access_token": "old-max"}},
+            account_key="sub:auth0|max-user",
+            access_token="old-max",
+            email="max@systemsfinance.co.uk",
+            provider_account_id="shared-team-account",
+        )
+        incoming_auth = {
+            "tokens": {
+                "id_token": _jwt_with_claims(
+                    {
+                        "sub": "auth0|james-user",
+                        "email": "james@systemsfinance.co.uk",
+                        "https://api.openai.com/auth": {
+                            "chatgpt_account_id": "shared-team-account",
+                        },
+                    }
+                ),
+                "access_token": _jwt_with_claims(
+                    {
+                        "sub": "auth0|james-user",
+                        "https://api.openai.com/auth": {
+                            "chatgpt_account_id": "shared-team-account",
+                        },
+                    }
+                ),
+            }
+        }
+        switch_result = AuthStoreSwitchResult(
+            command=["internal-save", "--label", "james"],
+            returncode=0,
+            stdout="ok",
+            stderr="",
+        )
+
+        with (
+            patch("app.main.read_current_auth", return_value=incoming_auth),
+            patch("app.main.list_profiles", return_value=[james, max_profile]),
+            patch("app.main.list_auth_labels", return_value=["james", "max"]),
+            patch("app.main.persist_current_auth"),
+            patch("app.main._touch_account_usage"),
+            patch("app.main.save_current_auth_under_label", return_value=switch_result),
+            patch("app.main.delete_saved_profile") as delete_mock,
+        ):
+            result = _persist_current_auth_to_profile(
+                desired_label=None,
+                create_if_missing=False,
+            )
+
+        self.assertTrue(result.persisted)
+        self.assertEqual(result.label, "james")
+        delete_mock.assert_not_called()
+
+    def test_missing_placeholder_label_is_rejected_as_save_target(self) -> None:
+        incoming_auth = {
+            "tokens": {
+                "id_token": _jwt_with_claims(
+                    {
+                        "sub": "auth0|same-user",
+                        "email": "user@example.com",
+                    }
+                ),
+                "access_token": _jwt_with_claims({"sub": "auth0|same-user"}),
+            }
+        }
+
+        with (
+            patch("app.main.read_current_auth", return_value=incoming_auth),
+            patch("app.main.list_profiles", return_value=[]),
+            patch("app.main.list_auth_labels", return_value=[]),
+        ):
+            with self.assertRaisesRegex(ValueError, "Synthetic missing-auth labels"):
+                _persist_current_auth_to_profile(
+                    desired_label="missing:sub:auth0|same-user",
+                    create_if_missing=True,
+                )
+
+    def test_existing_mismatched_label_is_rejected_as_save_target(self) -> None:
+        existing_profile = AccountProfile(
+            label="james",
+            path=Path("/tmp/james.json"),
+            auth={"email": "james@systemsfinance.co.uk", "tokens": {"access_token": "old"}},
+            account_key="sub:auth0|james-user",
+            access_token="old",
+            email="james@systemsfinance.co.uk",
+        )
+        incoming_auth = {
+            "tokens": {
+                "id_token": _jwt_with_claims(
+                    {
+                        "sub": "auth0|different-user",
+                        "email": "max@systemsfinance.co.uk",
+                    }
+                ),
+                "access_token": _jwt_with_claims({"sub": "auth0|different-user"}),
+            }
+        }
+
+        with (
+            patch("app.main.read_current_auth", return_value=incoming_auth),
+            patch("app.main.list_profiles", return_value=[existing_profile]),
+            patch("app.main.list_auth_labels", return_value=["james"]),
+        ):
+            with self.assertRaisesRegex(ValueError, "different saved account identity"):
+                _persist_current_auth_to_profile(
+                    desired_label="james",
+                    create_if_missing=True,
+                )
+
     def test_expired_token_reauth_auto_persists_matching_profile(self) -> None:
         profile = AccountProfile(
             label="other",

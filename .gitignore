@@ -10,3 +10,5 @@ tests/
 backups/
 .vscode/
 openclaw-plugin/*.tgz
+codex-desktop-plugin/config.local.json
+codex-desktop-plugin/ui/*.html

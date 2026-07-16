@@ -2,6 +2,8 @@ import type {
   AutomaticLeaseManagementUpdate,
   LeaseControlAPI,
   LeaseControlResult,
+  ConsumeRateLimitResetResponse,
+  RateLimitResetCreditsResponse,
 } from './types.js'
 import type { OpenClawLeaseTelemetryService } from './service.js'
 
@@ -42,6 +44,14 @@ export class LeaseManagerController implements LeaseControlAPI {
 
   setAutoMode(input: AutomaticLeaseManagementUpdate): Promise<LeaseControlResult> {
     return this.service.setAutomaticLeaseManagement(input)
+  }
+
+  rateLimitResets(): Promise<RateLimitResetCreditsResponse> {
+    return this.service.getRateLimitResets()
+  }
+
+  useRateLimitReset(input?: { creditId?: string | null }): Promise<ConsumeRateLimitResetResponse> {
+    return this.service.useRateLimitReset(input)
   }
 }
 

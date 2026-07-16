@@ -33,6 +33,12 @@ ROTATION_REASONS = {
     "expiry_approaching",
     "admin_requested_rotation",
 }
+PREFERRED_CREDENTIAL_EMAILS = (
+    "skylinearmyzz203@gmail.com",
+    "james@systemsfinance.co.uk",
+    "max@systemsfinance.co.uk",
+)
+AUTH_DELIVERY_VERSION = 2
 
 
 def _runtime_value(key: str, default: Any) -> Any:
@@ -70,6 +76,21 @@ def _effective_rotation_policy(machine_id: str, agent_id: str) -> str:
     if default_policy in {"replacement_required_only", "recommended_or_required"}:
         return default_policy
     return "replacement_required_only"
+
+
+def _effective_assignment_policy(machine_id: str, agent_id: str) -> dict[str, Any] | None:
+    runtime = get_runtime_settings()
+    machine_overrides = runtime.get("assignment_policy_by_machine") or {}
+    if isinstance(machine_overrides, dict):
+        machine_policy = machine_overrides.get(machine_id)
+        if isinstance(machine_policy, dict):
+            return machine_policy
+    agent_overrides = runtime.get("assignment_policy_by_agent") or {}
+    if isinstance(agent_overrides, dict):
+        agent_policy = agent_overrides.get(agent_id)
+        if isinstance(agent_policy, dict):
+            return agent_policy
+    return None
 
 def initialize_lease_broker_store(db_path: Path | None = None) -> None:
     with _connect(db_path) as conn:
@@ -496,6 +517,7 @@ def acquire_broker_lease(
     agent_id: str,
     requested_ttl_seconds: int | None = None,
     reason: str | None = None,
+    exclude_ids: set[str] | None = None,
     now: datetime | None = None,
     db_path: Path | None = None,
 ) -> dict[str, Any]:
@@ -524,7 +546,14 @@ def acquire_broker_lease(
             lease = _decode_lease_row(existing_machine_lease)
             return {"status": "ok", "reason": "existing_machine_lease_reused", "lease": lease}
 
-        credential = _select_best_eligible_credential(conn, now_dt=now_dt)
+        credential = _select_best_eligible_credential(
+            conn,
+            now_dt=now_dt,
+            machine_id=machine_id,
+            agent_id=agent_id,
+            exclude_ids=exclude_ids,
+            prefer_below_rotation_threshold=True,
+        )
         if credential is None:
             return {
                 "status": "denied",
@@ -712,6 +741,11 @@ def record_broker_lease_telemetry(
         credential = dict(
             conn.execute("SELECT * FROM broker_credentials WHERE id = ?", (lease["credential_id"],)).fetchone()
         )
+        effective_utilization = _nullable_float(credential.get("utilization_pct"))
+        effective_quota = _nullable_int(credential.get("quota_remaining"))
+        if effective_utilization is not None or effective_quota is not None:
+            utilization_pct = effective_utilization
+            quota_remaining = effective_quota
         conn.execute(
             """
             INSERT INTO broker_lease_telemetry (
@@ -776,6 +810,26 @@ def record_broker_lease_telemetry(
             "health_score": health_score,
             "last_telemetry_at": captured_iso,
         }
+        ignore_rotation_thresholds = False
+        grace_seconds = _runtime_int(
+            "telemetry_rotation_grace_seconds",
+            settings.telemetry_rotation_grace_seconds,
+        )
+        if grace_seconds > 0:
+            metadata = lease.get("metadata")
+            if not isinstance(metadata, dict):
+                metadata = {}
+            anchor_iso = metadata.get("first_materialized_at") or lease.get("issued_at")
+            if anchor_iso:
+                try:
+                    anchor_dt = _parse_iso(str(anchor_iso))
+                    captured_dt = _parse_iso(captured_iso)
+                except Exception:
+                    anchor_dt = None
+                    captured_dt = None
+                if anchor_dt and captured_dt:
+                    if captured_dt <= anchor_dt + timedelta(seconds=grace_seconds):
+                        ignore_rotation_thresholds = True
         credential_row = _apply_telemetry_to_credential(
             conn,
             credential,
@@ -788,6 +842,7 @@ def record_broker_lease_telemetry(
             last_error_at=last_error_at,
             updates=credential_updates,
             now_iso=created_iso,
+            ignore_rotation_thresholds=ignore_rotation_thresholds,
         )
         lease_row = dict(conn.execute("SELECT * FROM broker_leases WHERE id = ?", (lease_id,)).fetchone())
         return {
@@ -825,7 +880,11 @@ def rotate_broker_lease(
         replacement = _select_best_eligible_credential(
             conn,
             now_dt=now_dt,
+            machine_id=machine_id,
+            agent_id=agent_id,
             exclude_ids={lease["credential_id"]},
+            require_below_rotation_threshold=True,
+            prefer_below_rotation_threshold=True,
         )
         if replacement is None:
             return {"status": "denied", "reason": "no_eligible_credentials_available", "lease": _decode_lease_row(lease)}
@@ -915,6 +974,10 @@ def materialize_broker_lease(
         metadata["delivery_count"] = delivery_count
         metadata["last_materialized_at"] = now_iso
         metadata["credential_auth_updated_at"] = credential_metadata.get("auth_updated_at")
+        metadata["credential_auth_delivery_version"] = credential_metadata.get(
+            "auth_delivery_version",
+            AUTH_DELIVERY_VERSION,
+        )
         if not metadata.get("first_materialized_at"):
             metadata["first_materialized_at"] = now_iso
         conn.execute(
@@ -1093,10 +1156,17 @@ def get_broker_lease_status(
             "replacement_required": replacement_required,
             "reason": lease["reason"],
             "credential_state": credential["state"],
+            "rate_limit_used_percent": credential_metadata.get("rate_limit_used_percent"),
+            "rate_limit_reset_at": credential_metadata.get("rate_limit_reset_at"),
+            "rate_limit_period": credential_metadata.get("rate_limit_period"),
             "credential_auth_updated_at": credential_metadata.get("auth_updated_at"),
             "auth_refresh_required": (
-                credential_metadata.get("auth_updated_at") is not None
-                and credential_metadata.get("auth_updated_at") != lease_metadata.get("credential_auth_updated_at")
+                (
+                    credential_metadata.get("auth_updated_at") is not None
+                    and credential_metadata.get("auth_updated_at") != lease_metadata.get("credential_auth_updated_at")
+                )
+                or credential_metadata.get("auth_delivery_version", AUTH_DELIVERY_VERSION)
+                != lease_metadata.get("credential_auth_delivery_version")
             ),
             "effective_rotation_policy": effective_rotation_policy,
             "last_seen_at": lease.get("last_seen_at"),
@@ -1146,10 +1216,13 @@ def is_credential_assignable(
     now: datetime | None = None,
 ) -> tuple[bool, str | None]:
     now_dt = _as_utc(now)
-    if _credential_admin_assignment_disabled(credential):
+    preferred_override = _credential_preferred_override_allowed(credential)
+    if _credential_admin_assignment_disabled(credential) and not preferred_override:
         return False, "admin_assignment_disabled"
     state = str(credential.get("state") or "")
-    if state in UNASSIGNABLE_CREDENTIAL_STATES:
+    if state in UNASSIGNABLE_CREDENTIAL_STATES and not (
+        preferred_override and state == "unavailable_for_assignment"
+    ):
         return False, f"state:{state}"
     if state == "degraded":
         return False, "state:degraded"
@@ -1191,13 +1264,120 @@ def rank_credential_for_assignment(
     return (seconds_until_reset, quota, -utilization, -health, last_assigned)
 
 
+def _credential_preference_rank(credential: dict[str, Any]) -> int:
+    metadata = credential.get("metadata") if isinstance(credential.get("metadata"), dict) else {}
+    email = str(metadata.get("email") or "").strip().lower()
+    if not email:
+        return len(PREFERRED_CREDENTIAL_EMAILS)
+    try:
+        return PREFERRED_CREDENTIAL_EMAILS.index(email)
+    except ValueError:
+        return len(PREFERRED_CREDENTIAL_EMAILS)
+
+
+def _credential_is_preferred(credential: dict[str, Any]) -> bool:
+    return _credential_preference_rank(credential) < len(PREFERRED_CREDENTIAL_EMAILS)
+
+
+def _credential_preferred_override_allowed(credential: dict[str, Any]) -> bool:
+    if not _credential_is_preferred(credential):
+        return False
+    metadata = credential.get("metadata") if isinstance(credential.get("metadata"), dict) else {}
+    return bool(metadata.get("preferred_auth_usable"))
+
+
+def _credential_policy_email(credential: dict[str, Any]) -> str:
+    metadata = credential.get("metadata") if isinstance(credential.get("metadata"), dict) else {}
+    return str(metadata.get("email") or "").strip().lower()
+
+
+def _credential_allows_machine(
+    credential: dict[str, Any],
+    *,
+    machine_id: str,
+    agent_id: str,
+) -> bool:
+    metadata = credential.get("metadata") if isinstance(credential.get("metadata"), dict) else {}
+
+    def _string_set(key: str) -> set[str]:
+        raw = metadata.get(key)
+        if not isinstance(raw, list):
+            return set()
+        return {str(item).strip() for item in raw if str(item).strip()}
+
+    allowed_machine_ids = _string_set("allowed_machine_ids")
+    if allowed_machine_ids and machine_id not in allowed_machine_ids:
+        return False
+
+    allowed_agent_ids = _string_set("allowed_agent_ids")
+    if allowed_agent_ids and agent_id not in allowed_agent_ids:
+        return False
+
+    return True
+
+
+def _credential_matches_assignment_policy(
+    credential: dict[str, Any],
+    policy: dict[str, Any] | None,
+    *,
+    match_allowed: bool,
+    match_preferred: bool,
+) -> bool:
+    if not isinstance(policy, dict):
+        return True
+
+    credential_id = str(credential.get("id") or "").strip()
+    credential_email = _credential_policy_email(credential)
+
+    if match_allowed:
+        allowed_ids = {
+            str(item).strip()
+            for item in (policy.get("allowed_credential_ids") or [])
+            if str(item).strip()
+        }
+        allowed_emails = {
+            str(item).strip().lower()
+            for item in (policy.get("allowed_emails") or [])
+            if str(item).strip()
+        }
+        if allowed_ids or allowed_emails:
+            return credential_id in allowed_ids or (credential_email and credential_email in allowed_emails)
+
+    if match_preferred:
+        preferred_ids = {
+            str(item).strip()
+            for item in (policy.get("preferred_credential_ids") or [])
+            if str(item).strip()
+        }
+        preferred_emails = {
+            str(item).strip().lower()
+            for item in (policy.get("preferred_emails") or [])
+            if str(item).strip()
+        }
+        if preferred_ids or preferred_emails:
+            return credential_id in preferred_ids or (credential_email and credential_email in preferred_emails)
+
+    return True
+
+
+def _assignment_policy_prefers_specific_credentials(policy: dict[str, Any] | None) -> bool:
+    if not isinstance(policy, dict):
+        return False
+    return bool((policy.get("preferred_credential_ids") or []) or (policy.get("preferred_emails") or []))
+
+
 def _select_best_eligible_credential(
     conn: Any,
     *,
     now_dt: datetime,
+    machine_id: str,
+    agent_id: str,
     exclude_ids: set[str] | None = None,
+    require_below_rotation_threshold: bool = False,
+    prefer_below_rotation_threshold: bool = False,
 ) -> dict[str, Any] | None:
     exclude = exclude_ids or set()
+    assignment_policy = _effective_assignment_policy(machine_id, agent_id)
     rows = conn.execute("SELECT * FROM broker_credentials ORDER BY label ASC, id ASC").fetchall()
     eligible: list[dict[str, Any]] = []
     for row in rows:
@@ -1210,11 +1390,65 @@ def _select_best_eligible_credential(
         if credential["id"] in exclude:
             continue
         ok, _ = is_credential_assignable(credential, now=now_dt)
-        if ok:
-            eligible.append(credential)
+        if not ok:
+            continue
+        if not _credential_allows_machine(
+            credential,
+            machine_id=machine_id,
+            agent_id=agent_id,
+        ):
+            continue
+        if require_below_rotation_threshold:
+            utilization = _nullable_float(credential.get("utilization_pct"))
+            if utilization is not None and utilization >= _runtime_float(
+                "rotation_request_threshold_percent",
+                settings.rotation_request_threshold_percent,
+            ):
+                continue
+        if not _credential_matches_assignment_policy(
+            credential,
+            assignment_policy,
+            match_allowed=True,
+            match_preferred=False,
+        ):
+            continue
+        eligible.append(credential)
     if not eligible:
         return None
-    eligible.sort(key=lambda credential: rank_credential_for_assignment(credential, now_dt=now_dt))
+    if prefer_below_rotation_threshold:
+        threshold = _runtime_float(
+            "rotation_request_threshold_percent",
+            settings.rotation_request_threshold_percent,
+        )
+        below_threshold = [
+            credential
+            for credential in eligible
+            if _nullable_float(credential.get("utilization_pct")) is None
+            or _nullable_float(credential.get("utilization_pct")) < threshold
+        ]
+        if below_threshold:
+            eligible = below_threshold
+    if _assignment_policy_prefers_specific_credentials(assignment_policy):
+        preferred = [
+            credential
+            for credential in eligible
+            if _credential_matches_assignment_policy(
+                credential,
+                assignment_policy,
+                match_allowed=False,
+                match_preferred=True,
+            )
+        ]
+        if preferred:
+            eligible = preferred
+        elif not bool((assignment_policy or {}).get("fallback_to_any_eligible", True)):
+            return None
+    eligible.sort(
+        key=lambda credential: (
+            _credential_preference_rank(credential),
+            *rank_credential_for_assignment(credential, now_dt=now_dt),
+        )
+    )
     return eligible[0]
 
 
@@ -1309,6 +1543,7 @@ def _apply_telemetry_to_credential(
     last_error_at: str | None,
     updates: dict[str, Any],
     now_iso: str,
+    ignore_rotation_thresholds: bool = False,
 ) -> dict[str, Any]:
     weekly_reset_at = credential.get("weekly_reset_at")
     next_state = str(credential.get("state") or "available")
@@ -1317,7 +1552,10 @@ def _apply_telemetry_to_credential(
     reset_confirmed_at = credential.get("reset_confirmed_at")
     utilization = _nullable_float(utilization_pct)
     quota = _nullable_int(quota_remaining)
-    if utilization is not None and utilization >= _runtime_float("exhausted_utilization_percent", settings.exhausted_utilization_percent):
+    if not ignore_rotation_thresholds and utilization is not None and utilization >= _runtime_float(
+        "exhausted_utilization_percent",
+        settings.exhausted_utilization_percent,
+    ):
         next_state = "exhausted"
         exhausted_at = exhausted_at or now_iso
         due_after = due_after or weekly_reset_at
@@ -1327,11 +1565,13 @@ def _apply_telemetry_to_credential(
             reason="credential_exhausted",
             revoked_at=now_iso,
         )
-    elif (
-        utilization is not None
-        and utilization >= _runtime_float("rotation_request_threshold_percent", settings.rotation_request_threshold_percent)
-    ) or (
-        quota is not None and quota <= _runtime_int("min_quota_remaining", settings.min_quota_remaining)
+    elif not ignore_rotation_thresholds and (
+        (
+            utilization is not None
+            and utilization >= _runtime_float("rotation_request_threshold_percent", settings.rotation_request_threshold_percent)
+        ) or (
+            quota is not None and quota <= _runtime_int("min_quota_remaining", settings.min_quota_remaining)
+        )
     ):
         conn.execute(
             """
@@ -1349,7 +1589,10 @@ def _apply_telemetry_to_credential(
                 lease_id,
             ),
         )
-        if utilization is not None and utilization >= _runtime_float("max_assignable_utilization_percent", settings.max_assignable_utilization_percent):
+        if utilization is not None and utilization >= _runtime_float(
+            "max_assignable_utilization_percent",
+            settings.max_assignable_utilization_percent,
+        ):
             next_state = "unavailable_for_assignment"
             due_after = due_after or weekly_reset_at
         else:
@@ -1443,13 +1686,14 @@ def _reconcile_credential_row(
     admin_assignment_disabled = _credential_admin_assignment_disabled(credential)
     metadata = credential.get("metadata") if isinstance(credential.get("metadata"), dict) else {}
     reauth_required = bool(metadata.get("reauth_required"))
+    preferred_override = _credential_preferred_override_allowed(credential) and not has_active_lease
     if revoked_at:
         state = "revoked"
     elif cooldown_until and _parse_iso(str(cooldown_until)) > now_dt:
         state = "cooldown"
-    elif reauth_required:
+    elif reauth_required and not preferred_override:
         state = "leased" if has_active_lease else "unavailable_for_assignment"
-    elif admin_assignment_disabled:
+    elif admin_assignment_disabled and not preferred_override:
         state = "leased" if has_active_lease else "unavailable_for_assignment"
     elif due_after and _runtime_bool("weekly_reset_confirmation_required", settings.weekly_reset_confirmation_required):
         due_dt = _parse_iso(str(due_after))

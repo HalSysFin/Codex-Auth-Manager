@@ -2,7 +2,7 @@
   "name": "codex-auth-manager-extension",
   "displayName": "Codex Auth Manager",
   "description": "Manages Auth Manager leases and writes leased auth payloads into ~/.codex/auth.json.",
-  "version": "1.12.6",
+  "version": "1.12.11",
   "publisher": "halsysfin",
   "license": "MIT",
   "repository": {
@@ -26,11 +26,13 @@
     "onCommand:authManager.reloadWindow",
     "onCommand:authManager.openDashboard",
     "onCommand:authManager.showLeaseView",
+    "onCommand:authManager.useRateLimitReset",
     "onView:authManager.leaseView"
   ],
   "main": "./dist/vscode-extension/src/extension.js",
   "files": [
-    "dist/**",
+    "dist/vscode-extension/**",
+    "dist/packages/**",
     "media/**",
     "package.json",
     "README.md",
@@ -73,6 +75,10 @@
       {
         "command": "authManager.showLeaseView",
         "title": "Auth Manager: Show Lease View"
+      },
+      {
+        "command": "authManager.useRateLimitReset",
+        "title": "Auth Manager: Use Codex Rate-Limit Reset"
       }
     ],
     "viewsContainers": {
@@ -167,12 +173,13 @@
     }
   },
   "scripts": {
-    "compile": "tsc -p .",
+    "clean": "rm -rf dist",
+    "compile": "npm run clean && tsc -p .",
     "watch": "tsc -p . -w",
     "lint": "tsc -p . --noEmit",
     "test": "node --import tsx --test \"src/test/**/*.test.ts\"",
     "prepublishOnly": "npm run compile",
-    "package": "vsce package"
+    "package": "npm run compile && vsce package"
   },
   "devDependencies": {
     "@types/node": "^22.10.2",

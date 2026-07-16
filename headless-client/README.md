@@ -17,6 +17,8 @@ It reuses the shared broker runtime in `packages/lease-runtime/` for:
 - `auth-manager-agent renew`
 - `auth-manager-agent rotate`
 - `auth-manager-agent release`
+- `auth-manager-agent resets`
+- `auth-manager-agent reset --yes [--credit-id <id>]`
 - `auth-manager-agent run`
 - `auth-manager-agent doctor`
 
@@ -27,6 +29,8 @@ It reuses the shared broker runtime in `packages/lease-runtime/` for:
 - `renew`: attempt lease renewal
 - `rotate`: request a replacement lease
 - `release`: release the current lease
+- `resets`: inspect banked reset availability for the active lease without consuming anything
+- `reset --yes`: explicitly consume one banked reset; automatic lease management never runs this command
 - `run`: continuous background loop for refresh + telemetry
 - `doctor`: validate config, state paths, backend connectivity, and auth path
 

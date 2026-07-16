@@ -98,3 +98,46 @@ test('shared client handles missing bearer token responses', async () => {
     (error: unknown) => error instanceof AuthManagerClientError && error.status === 401 && error.message === 'Missing bearer token',
   )
 })
+
+test('rate-limit reset methods remain scoped to the active lease owner', async () => {
+  const requests: Array<{ url: string; body: Record<string, unknown> }> = []
+  const client = new AuthManagerClient({
+    baseUrl: 'http://127.0.0.1:8080',
+    allowInsecureLocalhost: true,
+    fetchImpl: async (input, init) => {
+      requests.push({
+        url: String(input),
+        body: JSON.parse(String(init?.body || '{}')) as Record<string, unknown>,
+      })
+      return new Response(JSON.stringify({
+        status: 'ok',
+        lease_id: 'lease-123',
+        credential_id: 'account-1',
+        available_count: 1,
+        credits: [],
+        rate_limits: {},
+        fetched_at: '2026-07-16T00:00:00Z',
+        outcome: 'reset',
+        idempotency_key: 'redeem-123',
+      }), { status: 200 })
+    },
+  })
+
+  await client.getRateLimitResets('lease-123', { machineId: 'machine-a', agentId: 'vscode-extension' })
+  await client.consumeRateLimitReset('lease-123', {
+    machineId: 'machine-a',
+    agentId: 'vscode-extension',
+    idempotencyKey: 'redeem-123',
+    creditId: 'credit-1',
+  })
+
+  assert.equal(requests[0].url, 'http://127.0.0.1:8080/api/leases/lease-123/rate-limit-resets/read')
+  assert.deepEqual(requests[0].body, { machine_id: 'machine-a', agent_id: 'vscode-extension' })
+  assert.equal(requests[1].url, 'http://127.0.0.1:8080/api/leases/lease-123/rate-limit-resets/consume')
+  assert.deepEqual(requests[1].body, {
+    machine_id: 'machine-a',
+    agent_id: 'vscode-extension',
+    idempotency_key: 'redeem-123',
+    credit_id: 'credit-1',
+  })
+})

@@ -75,6 +75,14 @@ export function createAuthManagerOpenClawEntry(): OpenClawPluginLikeDefinition {
             if (!leaseApi) throw new Error('Lease service is not started')
             return leaseApi.setAutoMode(input)
           },
+          rateLimitResets: async () => {
+            if (!leaseApi) throw new Error('Lease service is not started')
+            return leaseApi.rateLimitResets()
+          },
+          useRateLimitReset: async (input) => {
+            if (!leaseApi) throw new Error('Lease service is not started')
+            return leaseApi.useRateLimitReset(input)
+          },
         },
         async start(ctx) {
           const config = resolvePluginConfig((ctx.config ?? {}) as Record<string, unknown>, ctx.env ?? process.env)

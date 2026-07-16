@@ -1,0 +1,42 @@
+{
+  "name": "codex-desktop-plugin",
+  "version": "0.1.1",
+  "description": "Lease-based Codex Desktop auth plugin for materializing, reconciling, and rotating auth manager credentials.",
+  "author": {
+    "name": "James",
+    "email": "you@example.com",
+    "url": "https://github.com/HalSysFin/Codex-Auth-Manager---VS-Code-Extension"
+  },
+  "homepage": "https://github.com/HalSysFin/Codex-Auth-Manager---VS-Code-Extension",
+  "repository": "https://github.com/HalSysFin/Codex-Auth-Manager---VS-Code-Extension",
+  "license": "MIT",
+  "keywords": [
+    "auth",
+    "quota",
+    "rotation",
+    "utilization",
+    "codex"
+  ],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Codex Desktop Plugin",
+    "shortDescription": "Keeps Codex Desktop synced to an auth-manager lease and reports lease telemetry.",
+    "longDescription": "A local Codex Desktop plugin that acquires an auth-manager lease, materializes auth into Codex Desktop, reconciles stale local auth, and reports readable lease telemetry for AI workflows.",
+    "developerName": "James",
+    "category": "Developer Tools",
+    "capabilities": [
+      "Interactive",
+      "Read",
+      "Write"
+    ],
+    "websiteURL": "https://github.com/HalSysFin/Codex-Auth-Manager---VS-Code-Extension",
+    "defaultPrompt": [
+      "Check the current Codex Desktop lease health and tell me if anything needs rotating.",
+      "Ensure Codex Desktop has an active lease and materialized auth.",
+      "Show me a compact usage summary for Codex Desktop.",
+      "Run the Codex Desktop auth plugin in dry-run mode.",
+      "Rotate the Codex Desktop lease now if replacement is recommended."
+    ],
+    "brandColor": "#0F766E"
+  }
+}

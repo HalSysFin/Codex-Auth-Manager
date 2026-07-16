@@ -5,6 +5,7 @@ import {
   needsReacquire,
   selectStartupAction,
   shouldReacquireAfterLookupError,
+  shouldRematerializeAuth,
   shouldRenewLease,
   shouldRotateLease,
 } from '../leaseLifecycle'
@@ -179,6 +180,12 @@ test('healthy active lease maps to shared startup noop action', () => {
 test('404 lease lookup stays on the shared reacquire path', () => {
   assert.equal(shouldReacquireAfterLookupError(404), true)
   assert.equal(shouldReacquireAfterLookupError(500), false)
+})
+
+test('manager refresh flag forces rematerialization without a new auth timestamp', () => {
+  assert.equal(shouldRematerializeAuth('lease-1', { auth_refresh_required: true }), true)
+  assert.equal(shouldRematerializeAuth('lease-1', { auth_refresh_required: false }), false)
+  assert.equal(shouldRematerializeAuth(null, { auth_refresh_required: true }), false)
 })
 
 test('vscode extension matches the shared startup parity matrix', () => {

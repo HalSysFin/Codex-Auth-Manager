@@ -49,3 +49,31 @@ test('telemetry client surfaces missing token responses cleanly', async () => {
     /Missing bearer token/,
   )
 })
+
+test('reset read and consume calls remain scoped to the active lease identity', async () => {
+  const requests: Array<{ url: string; body: Record<string, unknown> }> = []
+  const client = new AuthManagerTelemetryClient({
+    baseUrl: 'http://127.0.0.1:8080',
+    internalApiToken: 'secret-token',
+    allowInsecureLocalhost: true,
+    fetchImpl: async (input, init) => {
+      requests.push({ url: String(input), body: JSON.parse(String(init?.body || '{}')) as Record<string, unknown> })
+      return new Response(JSON.stringify({
+        status: 'ok', lease_id: 'lease-1', credential_id: 'cred-1', available_count: 1,
+        credits: [], rate_limits: {}, fetched_at: '2026-07-16T00:00:00Z', outcome: 'reset',
+        idempotency_key: 'redeem-1',
+      }), { status: 200 })
+    },
+  })
+  const context = { leaseId: 'lease-1', machineId: 'machine-a', agentId: 'openclaw' }
+
+  await client.getRateLimitResets(context)
+  await client.consumeRateLimitReset(context, { idempotencyKey: 'redeem-1', creditId: 'credit-1' })
+
+  assert.equal(requests[0].url, 'http://127.0.0.1:8080/api/leases/lease-1/rate-limit-resets/read')
+  assert.deepEqual(requests[0].body, { machine_id: 'machine-a', agent_id: 'openclaw' })
+  assert.equal(requests[1].url, 'http://127.0.0.1:8080/api/leases/lease-1/rate-limit-resets/consume')
+  assert.deepEqual(requests[1].body, {
+    machine_id: 'machine-a', agent_id: 'openclaw', idempotency_key: 'redeem-1', credit_id: 'credit-1',
+  })
+})

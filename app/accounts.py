@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Any
 
 from .account_identity import extract_access_token, extract_account_identity
-from .account_usage_store import get_accounts_by_ids, list_saved_profiles
+from .account_usage_store import get_accounts_by_ids, list_accounts, list_saved_profiles
 from .config import settings
 
 
@@ -40,6 +40,8 @@ class AccountProfile:
     lifetime_used: int | None = None
     usage_created_at: str | None = None
     usage_updated_at: str | None = None
+    missing_auth: bool = False
+    missing_reason: str | None = None
 
 
 def _load_json(path: Path) -> dict[str, Any] | None:
@@ -114,6 +116,39 @@ def list_profiles() -> list[AccountProfile]:
                     if row.get("reauth_reason") is not None
                     else None
                 ),
+            )
+        )
+
+    existing_keys = {profile.account_key for profile in profiles if profile.account_key}
+    try:
+        usage_rows = list_accounts()
+    except Exception:
+        usage_rows = []
+    for usage in usage_rows:
+        if usage.id in existing_keys:
+            continue
+        fallback_name = (usage.name or "").strip()
+        fallback_email = fallback_name.lower() if "@" in fallback_name else None
+        profiles.append(
+            AccountProfile(
+                label=f"missing:{usage.id}",
+                path=Path("db://accounts-only"),
+                auth={},
+                account_key=usage.id,
+                provider_account_id=usage.provider_account_id,
+                name=fallback_name or None,
+                email=fallback_email,
+                rate_limit_window_type=usage.rate_limit_window_type,
+                usage_limit=usage.usage_limit,
+                usage_in_window=usage.usage_in_window,
+                rate_limit_refresh_at=usage.rate_limit_refresh_at,
+                rate_limit_last_refreshed_at=usage.rate_limit_last_refreshed_at,
+                last_usage_sync_at=usage.last_usage_sync_at,
+                lifetime_used=usage.lifetime_used,
+                usage_created_at=usage.created_at,
+                usage_updated_at=usage.updated_at,
+                missing_auth=True,
+                missing_reason="Account identity exists in the manager, but no saved auth JSON is currently stored.",
             )
         )
 

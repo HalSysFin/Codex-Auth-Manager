@@ -127,6 +127,44 @@ class AccountIdentityTrackingTests(unittest.TestCase):
         self.assertFalse(result.created_new_profile)
         self.assertEqual(result.account_key, "sub:auth0|same-user")
 
+    def test_reauth_ignores_missing_placeholder_when_real_profile_matches(self) -> None:
+        placeholder_profile = AccountProfile(
+            label="missing:sub:auth0|same-user",
+            path=Path("db://accounts-only"),
+            auth={},
+            account_key="sub:auth0|same-user",
+            email="old@example.com",
+            missing_auth=True,
+        )
+        real_profile = AccountProfile(
+            label="james",
+            path=Path("/tmp/james.json"),
+            auth={"email": "old@example.com", "tokens": {"access_token": "old"}},
+            account_key="sub:auth0|same-user",
+            access_token="old",
+            email="old@example.com",
+        )
+        incoming_auth = {
+            "tokens": {
+                "id_token": _jwt({"sub": "auth0|same-user", "email": "new@example.com"}),
+                "access_token": _jwt({"sub": "auth0|same-user"}),
+            }
+        }
+
+        with (
+            patch("app.main.read_current_auth", return_value=incoming_auth),
+            patch("app.main.list_profiles", return_value=[placeholder_profile, real_profile]),
+            patch("app.main.list_auth_labels", return_value=["james"]),
+            patch("app.main.persist_current_auth"),
+            patch("app.main.save_current_auth_under_label"),
+            patch("app.main._touch_account_usage"),
+        ):
+            result = _persist_current_auth_to_profile(desired_label=None, create_if_missing=True)
+
+        self.assertEqual(result.label, "james")
+        self.assertTrue(result.matched_existing_profile)
+        self.assertFalse(result.created_new_profile)
+
     def test_switch_touches_usage_by_resolved_profile_identity(self) -> None:
         profile = AccountProfile(
             label="max",

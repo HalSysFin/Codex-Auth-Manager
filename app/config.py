@@ -46,6 +46,9 @@ class Settings(BaseSettings):
     openai_account_url: str | None = None
     chatgpt_backend_rate_limits_url: str = "https://chatgpt.com/backend-api/codex/responses"
     chatgpt_backend_rate_limits_model: str = "gpt-5.1-codex-mini"
+    chatgpt_backend_rate_limits_label: str = "Codex"
+    chatgpt_backend_rate_limits_spark_model: str = "gpt-5.3-codex"
+    chatgpt_backend_rate_limits_spark_label: str = "GPT-5.3 Spark"
     chatgpt_backend_rate_limits_instructions: str = "You are Codex. Be concise."
     chatgpt_backend_rate_limits_prompt: str = "Reply with exactly OK."
     codex_bin: str = "codex"
@@ -55,6 +58,7 @@ class Settings(BaseSettings):
     live_refresh_concurrency: int = 12
     analytics_timezone: str = "UTC"
     analytics_snapshot_interval_seconds: int = 600
+    telemetry_rotation_grace_seconds: int = 90
     max_assignable_utilization_percent: float = 99.0
     rotation_request_threshold_percent: float = 90.0
     exhausted_utilization_percent: float = 100.0
@@ -66,6 +70,10 @@ class Settings(BaseSettings):
     lease_reclaim_after_seconds: int = 180
     weekly_reset_confirmation_required: bool = True
     auth_keepalive_in_app: bool = True
+    auth_keepalive_interval_seconds: int = 60
+    auth_refresh_leeway_seconds: int = 24 * 60 * 60
+    auth_manager_process_role: str = "api"
+    auth_manager_api_workers: int = 2
 
     def callback_dir(self) -> Path:
         return _expand(self.callback_store_dir)

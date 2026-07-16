@@ -2,7 +2,7 @@ import * as vscode from 'vscode'
 import * as os from 'node:os'
 import { AuthManagerClient, AuthManagerClientError, type AuthPayload, type LeaseStatusResponse } from './authManagerClient'
 import { authFileExists, deleteAuthFile, readAuthFile, writeAuthFile } from './authFile'
-import { authPayloadFingerprint } from '../../packages/lease-runtime/src/authPayload.js'
+import { authPayloadFingerprint, compareAuthPayloadFreshness, extractAuthPayloadIdentity } from '../../packages/lease-runtime/src/authPayload.js'
 import {
   deriveLeaseHealthState,
   selectStartupAction,
@@ -52,6 +52,7 @@ class AuthManagerController {
   private backendReachable = false
   private lastMessage: string | null = null
   private runningEnsure = false
+  private nextAcquireExcludeCredentialIds: string[] = []
 
   constructor(private readonly context: vscode.ExtensionContext) {
     this.stateStore = new LeaseStateStore(context.globalState)
@@ -257,10 +258,10 @@ class AuthManagerController {
     if (!status.credential_auth_updated_at) {
       return true
     }
-    if (!this.state.lastAuthWriteAt) {
+    if (!this.state.lastMaterializedCredentialAuthUpdatedAt) {
       return true
     }
-    return status.credential_auth_updated_at > this.state.lastAuthWriteAt
+    return status.credential_auth_updated_at > this.state.lastMaterializedCredentialAuthUpdatedAt
   }
 
   private currentViewModel(): LeaseViewModel {
@@ -457,6 +458,7 @@ class AuthManagerController {
 
   async requestNewLease(): Promise<void> {
     this.log('Requesting a fresh auth lease')
+    const previousCredentialId = this.state.credentialId
     try {
       await requestFreshLease({
         currentLeaseId: this.state.leaseId,
@@ -477,7 +479,11 @@ class AuthManagerController {
           }
         },
         acquireFreshLease: async () => {
-          await this.acquireAndMaterializeLease('manual request new lease')
+          await this.acquireAndMaterializeLease(
+            'manual request new lease',
+            true,
+            previousCredentialId ? [previousCredentialId] : undefined,
+          )
         },
       })
       this.setMessage(`Fresh auth lease acquired for ${deriveAccountDisplayName(this.state)}.`)
@@ -496,6 +502,7 @@ class AuthManagerController {
     }
     this.log(`Releasing lease ${this.state.leaseId}`)
     try {
+      const releasedCredentialId = this.state.credentialId
       const response = await this.client.releaseLease(this.state.leaseId, {
         machineId: this.state.machineId,
         agentId: this.state.agentId,
@@ -505,8 +512,9 @@ class AuthManagerController {
       if (response.status !== 'ok') {
         throw new Error(response.reason || 'Lease release denied')
       }
+      this.nextAcquireExcludeCredentialIds = releasedCredentialId ? [releasedCredentialId] : []
       this.state = await this.stateStore.clear(this.state.machineId, this.state.agentId, this.authFilePath())
-      this.setMessage('Lease released.')
+      this.setMessage('Lease released. The next acquire will avoid reusing this auth.')
     } catch (error) {
       await this.handleBackendError(error, 'Unable to release lease')
     } finally {
@@ -582,7 +590,11 @@ class AuthManagerController {
     }
   }
 
-  private async acquireAndMaterializeLease(reason: string, showPopup = true): Promise<void> {
+  private async acquireAndMaterializeLease(
+    reason: string,
+    showPopup = true,
+    excludeCredentialIds?: string[],
+  ): Promise<void> {
     this.log(`Acquiring lease (${reason})`)
     const previousLeaseId = this.state.leaseId
     try {
@@ -591,11 +603,13 @@ class AuthManagerController {
         agentId: this.state.agentId,
         requestedTtlSeconds: 1800,
         reason,
+        excludeCredentialIds: excludeCredentialIds ?? this.nextAcquireExcludeCredentialIds,
       })
       this.backendReachable = true
       if (response.status !== 'ok' || !response.lease) {
         throw new Error(response.reason || 'No eligible credentials available')
       }
+      this.nextAcquireExcludeCredentialIds = []
       this.state = await this.stateStore.updateFromLease(this.state, response.lease)
       await this.materializeAndWriteAuth(response.lease.id)
       this.setMessage('Lease acquired and auth file written.')
@@ -627,6 +641,37 @@ class AuthManagerController {
       throw new Error(materialized.reason || 'Backend did not return auth payload for this lease')
     }
     const payload = materialized.credential_material.auth_json
+    if (materialized.lease) {
+      this.state = await this.stateStore.updateFromLease(this.state, materialized.lease)
+    }
+    const localAuth = await readAuthFile(this.authFilePath())
+    const localIdentity = localAuth ? extractAuthPayloadIdentity(localAuth) : null
+    const remoteIdentity = extractAuthPayloadIdentity(payload)
+    const sameLeasedAccount =
+      Boolean(this.state.credentialId && localIdentity?.accountKey && localIdentity.accountKey === this.state.credentialId) &&
+      Boolean(remoteIdentity.accountKey && remoteIdentity.accountKey === this.state.credentialId)
+    if (localAuth && sameLeasedAccount && compareAuthPayloadFreshness(payload, localAuth) > 0) {
+      const reconciled = await this.client.reconcileLeaseAuth(leaseId, {
+        machineId: this.state.machineId,
+        agentId: this.state.agentId,
+        authJson: localAuth,
+      })
+      if (reconciled.credential_auth_updated_at) {
+        this.state = { ...this.state, credentialAuthUpdatedAt: reconciled.credential_auth_updated_at }
+      }
+      if (reconciled.decision === 'client_updated_manager' || reconciled.decision === 'in_sync') {
+        const fingerprint = await authPayloadFingerprint(localAuth)
+        const acknowledgedAt = reconciled.credential_auth_updated_at || localAuth.last_refresh || new Date().toISOString()
+        this.state = await this.stateStore.recordAuthWrite(
+          this.state,
+          acknowledgedAt,
+          fingerprint,
+          reconciled.credential_auth_updated_at ?? this.state.credentialAuthUpdatedAt,
+        )
+        this.log(`Preserved fresher local auth for lease ${leaseId}`)
+        return
+      }
+    }
     await this.writePayloadToAuthFile(payload)
     const identity = extractAccountIdentity(materialized)
     this.state = {
@@ -635,16 +680,18 @@ class AuthManagerController {
       accountName: identity.accountName,
     }
     await this.stateStore.save(this.state)
-    if (materialized.lease) {
-      this.state = await this.stateStore.updateFromLease(this.state, materialized.lease)
-    }
   }
 
   private async writePayloadToAuthFile(payload: AuthPayload): Promise<void> {
     const result = await writeAuthFile(this.authFilePath(), payload)
     const fingerprint = await authPayloadFingerprint(payload)
     this.state = { ...this.state, authFilePath: this.authFilePath() }
-    this.state = await this.stateStore.recordAuthWrite(this.state, result.writtenAt, fingerprint)
+    this.state = await this.stateStore.recordAuthWrite(
+      this.state,
+      result.writtenAt,
+      fingerprint,
+      this.state.credentialAuthUpdatedAt,
+    )
     this.log(`Wrote auth file to ${result.path}`)
   }
 
@@ -657,7 +704,9 @@ class AuthManagerController {
       return
     }
     const fingerprint = await authPayloadFingerprint(localAuth)
-    if (this.state.lastAuthFingerprint && this.state.lastAuthFingerprint === fingerprint) {
+    const localIdentity = extractAuthPayloadIdentity(localAuth)
+    const leaseIdentityMismatch = Boolean(this.state.credentialId && localIdentity.accountKey && localIdentity.accountKey !== this.state.credentialId)
+    if (!leaseIdentityMismatch && this.state.lastAuthFingerprint && this.state.lastAuthFingerprint === fingerprint) {
       return
     }
     const reconciled = await this.client.reconcileLeaseAuth(leaseId, {
@@ -673,8 +722,23 @@ class AuthManagerController {
       await this.writePayloadToAuthFile(reconciled.auth_json)
       return
     }
+    if (reconciled.decision === 'identity_mismatch' && reconciled.auth_json) {
+      this.log(`Local auth identity ${reconciled.incoming_account_key || 'unknown'} does not match leased credential ${reconciled.expected_account_key || 'unknown'}; rewriting local auth file`)
+      await this.writePayloadToAuthFile(reconciled.auth_json)
+      return
+    }
+    if (reconciled.decision === 'manager_missing_auth') {
+      this.log(`Manager cannot reconcile lease ${leaseId}: ${reconciled.reason || 'missing auth material'}`)
+      this.setMessage('Lease/auth mismatch detected; manager is missing auth material for this credential.')
+      return
+    }
     const acknowledgedAt = reconciled.credential_auth_updated_at || localAuth.last_refresh || new Date().toISOString()
-    this.state = await this.stateStore.recordAuthWrite(this.state, acknowledgedAt, fingerprint)
+    this.state = await this.stateStore.recordAuthWrite(
+      this.state,
+      acknowledgedAt,
+      fingerprint,
+      reconciled.credential_auth_updated_at ?? this.state.credentialAuthUpdatedAt,
+    )
     if (reconciled.decision === 'client_updated_manager') {
       this.log(`Uploaded fresher local auth to manager for lease ${leaseId}`)
     }

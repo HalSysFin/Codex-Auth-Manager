@@ -38,4 +38,4 @@ EXPOSE 8080
 
 VOLUME ["/root/.codex", "/root/.codex-switch/profiles", "/root/.codex-switch/callbacks", "/root/.codex-switch"]
 
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8080"]
+CMD ["sh", "-c", "uvicorn app.main:app --host 0.0.0.0 --port 8080 --workers ${AUTH_MANAGER_API_WORKERS:-2}"]

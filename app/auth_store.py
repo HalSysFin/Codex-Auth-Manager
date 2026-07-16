@@ -88,6 +88,7 @@ def save_current_auth_under_label(label: str) -> AuthStoreSwitchResult:
         reauth_required=False,
         reauth_reason=None,
     )
+    set_active_profile_label(clean)
     touch_profile_last_used(clean)
 
     return AuthStoreSwitchResult(

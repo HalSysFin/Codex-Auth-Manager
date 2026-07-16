@@ -51,6 +51,70 @@ class ProfileDbMigrationTests(unittest.TestCase):
             self.assertEqual(len(all_profiles), 1)
             self.assertEqual(all_profiles[0]["label"], "james")
 
+    def test_same_account_key_can_exist_under_multiple_labels(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "usage.sqlite3"
+            initialize_usage_store(db_path)
+
+            upsert_saved_profile(
+                label="girliegirl",
+                account_key="acct:shared",
+                auth_json={"tokens": {"access_token": "tok-1"}},
+                email="girliegirl@example.com",
+                name="Girlie Girl",
+                db_path=db_path,
+            )
+            upsert_saved_profile(
+                label="hayden",
+                account_key="acct:shared",
+                auth_json={"tokens": {"access_token": "tok-2"}},
+                email="girliegirl@example.com",
+                name="Girlie Girl",
+                db_path=db_path,
+            )
+
+            first = get_saved_profile("girliegirl", db_path=db_path)
+            second = get_saved_profile("hayden", db_path=db_path)
+            all_profiles = list_saved_profiles(db_path=db_path)
+
+            self.assertIsNotNone(first)
+            self.assertIsNotNone(second)
+            assert first is not None
+            assert second is not None
+            self.assertEqual(first["account_key"], "acct:shared")
+            self.assertEqual(second["account_key"], "acct:shared")
+            self.assertEqual(first["auth_json"]["tokens"]["access_token"], "tok-1")
+            self.assertEqual(second["auth_json"]["tokens"]["access_token"], "tok-2")
+            self.assertEqual([profile["label"] for profile in all_profiles], ["girliegirl", "hayden"])
+
+    def test_usage_only_account_is_exposed_as_missing_auth_profile(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "usage.sqlite3"
+            initialize_usage_store(db_path)
+            ensure_account(
+                "acct:dazz",
+                provider_account_id="provider-dazz",
+                name="Dazz A",
+                usage_limit=100,
+                rate_limit_refresh_at="2026-03-23T00:00:00+00:00",
+                db_path=db_path,
+            )
+
+            with (
+                patch.object(settings, "usage_db_path", str(db_path)),
+                patch("app.account_usage_store._is_postgres_configured", return_value=False),
+            ):
+                from app.accounts import list_profiles
+
+                profiles = list_profiles()
+
+            dazz = next((profile for profile in profiles if profile.account_key == "acct:dazz"), None)
+            self.assertIsNotNone(dazz)
+            assert dazz is not None
+            self.assertTrue(dazz.missing_auth)
+            self.assertEqual(dazz.label, "missing:acct:dazz")
+            self.assertEqual(dazz.name, "Dazz A")
+
     def test_switch_materializes_active_auth_from_db(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             db_path = Path(tmp) / "usage.sqlite3"

@@ -2,6 +2,8 @@
 
 This plugin connects OpenClaw to Codex Auth Manager so OpenClaw can run on a managed lease, receive the active auth automatically, and report usage back to the manager.
 
+The lease control API exposes `rateLimitResets()` for read-only availability and `useRateLimitReset({ creditId? })` for an explicit redemption request. Automatic lease management never consumes banked resets.
+
 ## What It Does
 
 - acquires or reuses a sticky lease for the OpenClaw machine

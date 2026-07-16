@@ -17,6 +17,7 @@ type Limit = {
   remaining?: number
   percent?: number
   usedPercent?: number
+  label?: string
   resetsAt?: string | number | null
   resetAt?: string | number | null
   nextResetAt?: string | number | null
@@ -29,6 +30,9 @@ type UsageTracking = {
   usage_in_window?: number
   lifetime_used?: number
   rate_limit_refresh_at?: string | null
+  rate_limit_used_percent?: number | null
+  rate_limit_reset_at?: string | null
+  rate_limit_period?: 'week' | 'month' | null
   last_usage_sync_at?: string | null
   updated_at?: string | null
 }
@@ -39,16 +43,29 @@ type Account = {
   display_label: string | null
   email: string | null
   is_current: boolean
+  missing_auth?: boolean
+  missing_reason?: string | null
   account_type?: string | null
   rate_limits?: {
-    primary?: Limit | null
-    secondary?: Limit | null
-    requests?: Limit | null
-    tokens?: Limit | null
+    limit?: Limit | null
+    period?: 'week' | 'month' | null
     error?: string
   }
   usage_tracking?: UsageTracking | null
   refresh_status?: RefreshStatus
+  broker_credential?: {
+    state?: string | null
+    utilization_pct?: number | null
+    quota_remaining?: number | null
+    weekly_reset_at?: string | null
+    metadata?: {
+      rate_limit_used_percent?: number | null
+      rate_limit_reset_at?: string | null
+      rate_limit_period?: 'week' | 'month' | null
+      assignment_blocked_by?: string[] | null
+      exhausted_by?: string[] | null
+    } | null
+  } | null
   active_lease?: {
     lease_id: string
     machine_id: string
@@ -823,9 +840,18 @@ function limitPercent(limit?: Limit | null): number | null {
   return null
 }
 
+function limitLabel(limit: Limit | null | undefined, fallback: string): string {
+  const label = typeof limit?.label === 'string' ? limit.label.trim() : ''
+  return label || fallback
+}
+
+function accountRateLimit(account: Account): Limit | null {
+  return account.rate_limits?.limit || null
+}
+
 function averagePrimaryPercent(accounts: Account[]): number {
   const vals = accounts
-    .map((a) => limitPercent(a.rate_limits?.requests || a.rate_limits?.primary))
+    .map((a) => limitPercent(accountRateLimit(a)))
     .filter((v): v is number => typeof v === 'number' && Number.isFinite(v))
   if (!vals.length) return 0
   return Math.round(vals.reduce((a, b) => a + b, 0) / vals.length)
@@ -834,8 +860,13 @@ function averagePrimaryPercent(accounts: Account[]): number {
 function normalizeAccount(account: Account, currentLabel: string | null): Account {
   return {
     ...account,
-    is_current: account.label === currentLabel,
-    refresh_status: account.refresh_status ?? { state: 'idle', is_stale: true },
+    is_current: !account.missing_auth && account.label === currentLabel,
+    refresh_status: account.refresh_status ?? {
+      state: account.missing_auth ? 'failed' : 'idle',
+      is_stale: true,
+      reauth_required: Boolean(account.missing_auth),
+      last_error: account.missing_reason ?? null,
+    },
   }
 }
 
@@ -891,15 +922,12 @@ function accountDisplayName(account: Account): string {
 }
 
 function accountConsumptionValue(account: Account): number {
-  const primary = limitPercent(account.rate_limits?.requests || account.rate_limits?.primary)
-  const secondary = limitPercent(account.rate_limits?.tokens || account.rate_limits?.secondary)
-  const candidate = secondary ?? primary
+  const candidate = limitPercent(accountRateLimit(account))
   return candidate === null ? Number.POSITIVE_INFINITY : candidate
 }
 
 function accountWeeklyRefreshValue(account: Account): number {
-  const secondary = account.rate_limits?.tokens || account.rate_limits?.secondary
-  const refreshAt = resetDate(secondary, account.usage_tracking)
+  const refreshAt = resetDate(accountRateLimit(account), account.usage_tracking)
   return refreshAt ? refreshAt.getTime() : Number.POSITIVE_INFINITY
 }
 
@@ -977,26 +1005,22 @@ function App() {
 
   const accountCount = accounts.length
   const profilesWithToken = accountCount
-  const valid5hr = accounts
-    .map((a) => limitPercent(a.rate_limits?.requests || a.rate_limits?.primary))
+  const validRateLimits = accounts
+    .map((a) => limitPercent(accountRateLimit(a)))
     .filter((v): v is number => typeof v === 'number' && Number.isFinite(v))
-  const valid7d = accounts
-    .map((a) => limitPercent(a.rate_limits?.tokens || a.rate_limits?.secondary))
-    .filter((v): v is number => typeof v === 'number' && Number.isFinite(v))
-  const avg5hr = valid5hr.length ? Math.round(valid5hr.reduce((a, b) => a + b, 0) / valid5hr.length) : null
-  const avg7d = valid7d.length ? Math.round(valid7d.reduce((a, b) => a + b, 0) / valid7d.length) : null
+  const avgRateLimit = validRateLimits.length
+    ? Math.round(validRateLimits.reduce((a, b) => a + b, 0) / validRateLimits.length)
+    : null
   const displayUtilization = aggregate.aggregate_utilization_percent > 0
     ? aggregate.aggregate_utilization_percent
     : averagePrimaryPercent(accounts)
   const recommended = accounts.reduce<Account | null>((best, a) => {
     const getScore = (acc: Account) => {
-      const p1 = limitPercent(acc.rate_limits?.requests || acc.rate_limits?.primary) ?? 100
-      const p2 = limitPercent(acc.rate_limits?.tokens || acc.rate_limits?.secondary) ?? 100
-      const r2 = resetDate(acc.rate_limits?.tokens || acc.rate_limits?.secondary, acc.usage_tracking)
+      const used = limitPercent(accountRateLimit(acc)) ?? 100
+      const reset = resetDate(accountRateLimit(acc), acc.usage_tracking)
       const now = Date.now()
-      const msLeft = r2 ? Math.max(0, r2.getTime() - now) : 7 * 24 * 3600 * 1000
-      const usage = Math.max(p1, p2)
-      if (usage >= 90) { return 1e15 + msLeft }
+      const msLeft = reset ? Math.max(0, reset.getTime() - now) : 7 * 24 * 3600 * 1000
+      if (used >= 90) { return 1e15 + msLeft }
       return msLeft
     }
     if (!best) return a
@@ -1033,13 +1057,15 @@ function App() {
       const refreshStatus = account.refresh_status || {}
       const requiresReauth = Boolean(refreshStatus.reauth_required)
       const hasActiveLease = Boolean(account.active_lease)
+      const brokerState = account.broker_credential?.state || ''
+      const brokerAssignable = brokerState === 'available'
       if (refreshStatus.is_stale) stale += 1
       if (hasActiveLease) leased += 1
       if (requiresReauth) {
         reauthRequired += 1
         continue
       }
-      if (!hasActiveLease) {
+      if (!hasActiveLease && brokerAssignable) {
         safeToAssign += 1
       }
     }
@@ -1108,7 +1134,7 @@ function App() {
   const openClawUsageTotals = openClawCredentialUsage?.totals
   const wastedMaxValue = Math.max(1, ...wastedSeries.map((d) => Number(d.value || 0)))
   const weeklyPercents = accounts
-    .map((a) => limitPercent(a.rate_limits?.tokens || a.rate_limits?.secondary))
+    .map((a) => limitPercent(accountRateLimit(a)))
     .filter((v): v is number => typeof v === 'number' && Number.isFinite(v))
   const weeklyUtilizationNow = weeklyPercents.length
     ? Math.round(weeklyPercents.reduce((sum, value) => sum + value, 0) / weeklyPercents.length)
@@ -1786,7 +1812,7 @@ function App() {
     setMachineDetail(null)
     try {
       const data = await requestJson<MachineLeaseDetailResponse>(
-        `/api/admin/machines/${encodeURIComponent(machineId)}/detail?lease_limit=500&telemetry_limit_per_lease=40`,
+        `/api/admin/machines/${encodeURIComponent(machineId)}/detail?lease_limit=500&telemetry_limit_per_lease=40&include_history=false`,
         apiKey,
       )
       setMachineDetail(data)
@@ -1798,27 +1824,34 @@ function App() {
   }
 
   const startAddAccount = async () => {
-    if (!apiKey.trim()) return
     setErr(null)
+    setAddAccountModalOpen(true)
+    setAddAuthUrl('')
+    setAddSessionId('')
+    setAddRelayToken('')
+    setAddCallbackUrl('')
+    setAddLabelInput('')
+    setAddAccountFeedback('Preparing auth link...')
+    setAddAccountFeedbackTone('info')
     setAddAccountLoading(true)
     try {
       const start = await requestJson<{ auth_url?: string; session_id?: string; relay_token?: string; instructions?: string }>(
         '/auth/login/start-relay',
-        apiKey,
+        '',
         { method: 'POST', body: '{}' },
       )
       const authUrl = (start.auth_url || '').trim()
       setAddAuthUrl(authUrl)
       setAddSessionId((start.session_id || '').trim())
       setAddRelayToken((start.relay_token || '').trim())
-      setAddCallbackUrl('')
-      setAddLabelInput('')
       setAddAccountFeedback(null)
       setAddAccountFeedbackTone('info')
-      setAddAccountModalOpen(true)
       setStatus('Add Account link ready. Copy the auth URL, complete login, then paste the callback URL.')
     } catch (e) {
-      setErr(e instanceof Error ? e.message : 'Add account failed')
+      const message = e instanceof Error ? e.message : 'Add account failed'
+      setErr(message)
+      setAddAccountFeedback(message)
+      setAddAccountFeedbackTone('error')
     } finally {
       setAddAccountLoading(false)
     }
@@ -1827,7 +1860,7 @@ function App() {
   const pollAddAccountFinalization = async (): Promise<LoginStatusResponse> => {
     let last: LoginStatusResponse = {}
     for (let attempt = 0; attempt < 18; attempt += 1) {
-      const next = await requestJson<LoginStatusResponse>('/auth/login/status', apiKey, { method: 'GET' })
+      const next = await requestJson<LoginStatusResponse>('/auth/login/status', '', { method: 'GET' })
       last = next
       if (next.status === 'complete' || next.status === 'failed') {
         return next
@@ -1838,7 +1871,6 @@ function App() {
   }
 
   const submitAddAccountCallback = async () => {
-    if (!apiKey.trim()) return
     const fullUrl = addCallbackUrl.trim()
     if (!fullUrl || (!fullUrl.includes('code=') && !fullUrl.includes('error='))) {
       setErr('Paste a full callback URL containing code= or error=')
@@ -2249,7 +2281,7 @@ function App() {
                 </div>
                 <div>
                   <label>Next Refresh</label>
-                  <strong style={{ color: '#10b981' }}>{refreshBadge(recommended?.rate_limits?.requests || recommended?.rate_limits?.primary, recommended?.rate_limits?.tokens || recommended?.rate_limits?.secondary, recommended?.usage_tracking)?.text.replace('reset in ', '') || '--'}</strong>
+                  <strong style={{ color: '#10b981' }}>{refreshBadge(recommended ? accountRateLimit(recommended) : null, null, recommended?.usage_tracking)?.text.replace('reset in ', '') || '--'}</strong>
                 </div>
               </div>
               
@@ -2265,10 +2297,8 @@ function App() {
             </div>
             <div className="panel">
               <h4 className="panel-title">Aggregated Usage</h4>
-              <div className="limit-row"><span>5hr</span><div className="bar"><span className={`fill ${pctClass(avg5hr || 0)}`} style={{ width: `${avg5hr || 0}%` }} /></div><span>{avg5hr === null ? '--' : `${avg5hr}%`}</span></div>
-              <div className="muted">{avg5hr === null ? 'No live 5hr data available.' : `${Math.max(0, 100 - avg5hr)}% remaining across cluster`}</div>
-              <div className="limit-row" style={{ marginTop: 8 }}><span>7d</span><div className="bar"><span className={`fill ${pctClass(avg7d || 0)}`} style={{ width: `${avg7d || 0}%` }} /></div><span>{avg7d === null ? '--' : `${avg7d}%`}</span></div>
-              <div className="muted">{avg7d === null ? 'No live 7d data available.' : `${Math.max(0, 100 - avg7d)}% remaining across cluster`}</div>
+              <div className="limit-row"><span>Limit</span><div className="bar"><span className={`fill ${pctClass(avgRateLimit || 0)}`} style={{ width: `${avgRateLimit || 0}%` }} /></div><span>{avgRateLimit === null ? '--' : `${avgRateLimit}%`}</span></div>
+              <div className="muted">{avgRateLimit === null ? 'No live rate-limit data available.' : `${Math.max(0, 100 - avgRateLimit)}% remaining across cluster`}</div>
               <label style={{ marginTop: 10 }}>Recommended Profile</label>
               <div style={{ marginTop: 8 }}>
                 {recommended ? (
@@ -2330,18 +2360,24 @@ function App() {
             </div>
             {accounts.length === 0 ? <div className="empty">No accounts found.</div> : null}
             {sortedAccounts.map((a) => {
-              const primary = a.rate_limits?.requests || a.rate_limits?.primary
-              const secondary = a.rate_limits?.tokens || a.rate_limits?.secondary
-              const p1Raw = limitPercent(primary)
-              const p2Raw = limitPercent(secondary)
-              const p1 = p1Raw === null ? null : Math.max(0, Math.min(100, p1Raw))
-              const p2 = p2Raw === null ? null : Math.max(0, Math.min(100, p2Raw))
+              const rateLimit = accountRateLimit(a)
+              const rateLimitRaw = limitPercent(rateLimit)
+              const rateLimitPct = rateLimitRaw === null ? null : Math.max(0, Math.min(100, rateLimitRaw))
+              const rateLimitLabel = limitLabel(
+                rateLimit,
+                a.rate_limits?.period === 'month' || a.account_type === 'ChatGPT Free' ? '1 month' : '1 week',
+              )
               const rateError = typeof a.rate_limits?.error === 'string' ? a.rate_limits.error : ''
               const scopeError = rateError.includes('Missing scopes') ? 'Live rate-limit scopes are missing for this account.' : rateError
-              const badge = refreshBadge(secondary, null, undefined)
+              const badge = refreshBadge(rateLimit, null, a.usage_tracking)
               const refreshState = a.refresh_status?.state || 'idle'
               const requiresReauth = Boolean(a.refresh_status?.reauth_required)
-              const safeToAssign = !requiresReauth && !a.active_lease
+              const missingAuth = Boolean(a.missing_auth)
+              const brokerState = a.broker_credential?.state || ''
+              const safeToAssign = !missingAuth && !requiresReauth && !a.active_lease && brokerState === 'available'
+              const blockedBy = Array.isArray(a.broker_credential?.metadata?.assignment_blocked_by)
+                ? a.broker_credential?.metadata?.assignment_blocked_by || []
+                : []
               const refreshLabel =
                 refreshState === 'refreshing'
                   ? 'Refreshing'
@@ -2354,16 +2390,28 @@ function App() {
                 <div className="row" key={`${a.account_key}:${a.label}`}>
                   <div>
                     <div className="profile-title">
-                      <button className="profile-link-btn" onClick={() => void openAccountHistory(a.label)}>
-                        {sensitiveText(a.display_label || a.label)}
-                      </button>
-                      {requiresReauth ? (
+                      {missingAuth ? (
+                        <span>{sensitiveText(a.display_label || a.label)}</span>
+                      ) : (
+                        <button className="profile-link-btn" onClick={() => void openAccountHistory(a.label)}>
+                          {sensitiveText(a.display_label || a.label)}
+                        </button>
+                      )}
+                      {missingAuth ? (
+                        <span className="pill" style={{ background: 'rgba(239,68,68,.12)', color: '#fca5a5', borderColor: 'rgba(239,68,68,.35)' }}>
+                          Missing Saved Auth
+                        </span>
+                      ) : requiresReauth ? (
                         <span className="pill" style={{ background: 'rgba(239,68,68,.12)', color: '#fca5a5', borderColor: 'rgba(239,68,68,.35)' }}>
                           Reauth Required
                         </span>
                       ) : safeToAssign ? (
                         <span className="pill" style={{ background: 'rgba(16,185,129,.12)', color: '#6ee7b7', borderColor: 'rgba(16,185,129,.35)' }}>
                           Safe To Assign
+                        </span>
+                      ) : brokerState === 'exhausted' || brokerState === 'unavailable_for_assignment' ? (
+                        <span className="pill" style={{ background: 'rgba(245,158,11,.12)', color: '#fbbf24', borderColor: 'rgba(245,158,11,.35)' }}>
+                          {blockedBy.includes('rate_limit') ? 'Rate Limit Maxed' : 'Not Leasable'}
                         </span>
                       ) : null}
                       <span className={`refresh-indicator ${refreshState}`}>
@@ -2379,6 +2427,9 @@ function App() {
                       <CodexBadge />
                     </div>
                     <div className="muted mono">Profile label: {sensitiveText(a.label)}</div>
+                    {missingAuth && a.missing_reason ? (
+                      <div className="muted">{a.missing_reason}</div>
+                    ) : null}
                     {a.active_lease ? (
                       <div className="muted mono">
                         Leased to {a.active_lease.machine_id} / {a.active_lease.agent_id}
@@ -2386,18 +2437,25 @@ function App() {
                     ) : null}
                   </div>
                   <div>
-                    {p1 !== null || p2 !== null ? (
-                      <>
-                        <div className="limit-row"><span>5hr</span><div className="bar"><span className={`fill ${pctClass(p1 || 0)}`} style={{ width: `${p1 || 0}%` }} /></div><span>{p1 === null ? '--' : `${p1}%`}</span></div>
-                        <div className="limit-row"><span>7d</span><div className="bar"><span className={`fill ${pctClass(p2 || 0)}`} style={{ width: `${p2 || 0}%` }} /></div><span>{p2 === null ? '--' : `${p2}%`}</span></div>
-                      </>
+                    {rateLimitPct !== null ? (
+                      <div className="limit-product">
+                        <div className="limit-row"><span>{rateLimitLabel}</span><div className="bar"><span className={`fill ${pctClass(rateLimitPct)}`} style={{ width: `${rateLimitPct}%` }} /></div><span>{`${rateLimitPct}%`}</span></div>
+                      </div>
                     ) : (
                       <div className="muted">{scopeError || 'No live rate-limit data available.'}</div>
                     )}
                   </div>
                   <div>
-                    <div className="muted">{p1 !== null ? fmtTs(primary?.resetsAt || primary?.resetAt) : '--'}</div>
-                    <div className="muted">{p2 !== null ? fmtTs(secondary?.resetsAt || secondary?.resetAt) : '--'}</div>
+                    {rateLimitPct !== null ? (
+                      <div className="limit-product">
+                        <div className="muted">{fmtTs(rateLimit?.resetsAt || rateLimit?.resetAt)}</div>
+                      </div>
+                    ) : (
+                      <>
+                        <div className="muted">--</div>
+                        <div className="muted">--</div>
+                      </>
+                    )}
                   </div>
                   <div className="actions-col">
                     <div className="menu-root" onMouseLeave={() => setOpenMenuFor(null)}>
@@ -2406,11 +2464,11 @@ function App() {
                       </button>
                       {openMenuFor === a.label ? (
                         <div className="menu-panel">
-                          <button className="menu-item" onClick={() => void switchAccount(a.label)} disabled={!hasActionApiKey}>{a.is_current ? 'Switch (Current)' : 'Switch'}</button>
-                          <button className="menu-item" onClick={() => void renameAccount(a.label, a.display_label || a.label)} disabled={!hasActionApiKey}>Change profile label</button>
-                          <button className="menu-item" onClick={() => void exportAccount(a.label)} disabled={!hasActionApiKey}>Export</button>
-                          <button className="menu-item" onClick={() => void openOpenClawExport(a.label)} disabled={!hasActionApiKey}>Openclaw Export</button>
-                          <button className="menu-item danger" onClick={() => void deleteAccount(a.label)} disabled={!hasActionApiKey}>Delete</button>
+                          <button className="menu-item" onClick={() => void switchAccount(a.label)} disabled={!hasActionApiKey || missingAuth}>{a.is_current ? 'Switch (Current)' : 'Switch'}</button>
+                          <button className="menu-item" onClick={() => void renameAccount(a.label, a.display_label || a.label)} disabled={!hasActionApiKey || missingAuth}>Change profile label</button>
+                          <button className="menu-item" onClick={() => void exportAccount(a.label)} disabled={!hasActionApiKey || missingAuth}>Export</button>
+                          <button className="menu-item" onClick={() => void openOpenClawExport(a.label)} disabled={!hasActionApiKey || missingAuth}>Openclaw Export</button>
+                          <button className="menu-item danger" onClick={() => void deleteAccount(a.label)} disabled={!hasActionApiKey || missingAuth}>Delete</button>
                         </div>
                       ) : null}
                     </div>
@@ -2462,7 +2520,7 @@ function App() {
               <label>Current Used</label>
               <div className="unit-value"><strong>{fmtNullableNumber(statsSummary?.current_total_used)}</strong></div>
               <div className={`muted small ${pctClass(statsSummary?.weekly_utilization_now || 0)}`}>
-                {statsSummary?.weekly_utilization_now == null ? 'No live 5h utilization snapshot' : `${statsSummary.weekly_utilization_now}% 5h utilization now`}
+                {statsSummary?.weekly_utilization_now == null ? 'No live rate-limit snapshot' : `${statsSummary.weekly_utilization_now}% rate-limit utilization now`}
               </div>
             </div>
             <div>
@@ -2470,8 +2528,8 @@ function App() {
               <div className="unit-value"><strong>{fmtNullableNumber(statsSummary?.current_total_remaining)}</strong></div>
               <div className="muted small">
                 {statsModeledFallback
-                  ? 'Normalized 5h remaining capacity across accounts'
-                  : (statsFallbackMode ? 'Unavailable in fallback mode' : 'Current remaining across the 5h pool window')}
+                  ? 'Normalized remaining capacity across accounts'
+                  : (statsFallbackMode ? 'Unavailable in fallback mode' : 'Current remaining across account limits')}
               </div>
             </div>
             <div className={(aggregate.fleet_efficiency_pct < 80 && !statsFallbackMode) ? 'warn-card' : ''}>
@@ -2479,8 +2537,8 @@ function App() {
               <div className="unit-value"><strong>{fmtNullableNumber(statsSummary?.current_total_limit)}</strong></div>
               <div className="muted small">
                 {statsModeledFallback
-                  ? 'Normalized 5h capacity at 100 units per account'
-                  : (statsFallbackMode ? 'Unavailable in fallback mode' : 'Current total 5h limit across accounts')}
+                  ? 'Normalized capacity at 100 units per account'
+                  : (statsFallbackMode ? 'Unavailable in fallback mode' : 'Current total limit across accounts')}
               </div>
             </div>
             <div className={aggregate.total_wasted_units > 0 ? 'warn-card' : ''}>
@@ -2510,14 +2568,14 @@ function App() {
                 {statsModeledFallback
                   ? (selectedRange === '1d' && statsChartMode === 'daily'
                       ? 'Usage line = normalized units reconstructed from 10-minute utilization buckets'
-                      : 'Usage line = normalized 5h units reconstructed from utilization snapshots (100 per account)')
+                      : 'Usage line = normalized units reconstructed from utilization snapshots (100 per account)')
                   : (statsFallbackMode
-                      ? 'Usage line = 5h utilization % from stored snapshots (absolute counters unavailable)'
+                      ? 'Usage line = rate-limit utilization % from stored snapshots (absolute counters unavailable)'
                       : 'Usage line = consumed units (from lifetime deltas), not utilization %')}
               </span>
               <span className="legend-item">
                 <span className="legend-dot legend-dot-amber" />
-                5h utilization now: {weeklyUtilizationNow == null ? '--' : `${weeklyUtilizationNow}%`}
+                Rate-limit utilization now: {weeklyUtilizationNow == null ? '--' : `${weeklyUtilizationNow}%`}
                 {weeklyPercents.length ? ` (${weeklyAtCapCount}/${weeklyPercents.length} at 100%)` : ''}
               </span>
             </div>
@@ -2790,6 +2848,10 @@ function App() {
               <h3>Active Leases</h3>
               <span className="pill">{leaseOverview?.active_leases?.length ?? 0}</span>
             </div>
+            <div className="muted" style={{ margin: '-6px 0 10px' }}>
+              Lease telemetry (util/remaining) is client-reported and can lag. Rotation eligibility uses broker credential state
+              refreshed by the manager, so these two views can temporarily diverge.
+            </div>
             <div className="table-head">
               <span>Lease</span>
               <span>Credential</span>
@@ -2878,7 +2940,7 @@ function App() {
                   <div className="muted mono">
                     util: {cred.utilization_pct == null ? '--' : `${Math.round(Number(cred.utilization_pct))}%`} · remaining: {cred.quota_remaining == null ? '--' : cred.quota_remaining}
                   </div>
-                  <div className="muted mono">5h reset: {fmtTs(cred.weekly_reset_at || null)}</div>
+                  <div className="muted mono">rate-limit reset: {fmtTs(cred.weekly_reset_at || null)}</div>
                   <div className="muted mono">telemetry: {fmtTs(cred.last_telemetry_at || null)}</div>
                 </div>
                 <div className="actions-col">
@@ -2989,7 +3051,7 @@ function App() {
                     </div>
                   </div>
                   <div><label>Lifetime Used</label><strong>{fmtNullableNumber(historyData.current_state.lifetime_used)}</strong></div>
-                  <div><label>Next 5hr Reset</label><strong>{fmtTs(historyData.current_state.next_reset || null)}</strong></div>
+                  <div><label>Next Rate-Limit Reset</label><strong>{fmtTs(historyData.current_state.next_reset || null)}</strong></div>
                   <div><label>{historyData.summary?.last_refresh_label || 'Last Refresh'}</label><strong>{fmtTs(historyData.summary?.last_refresh_time || historyData.current_state.last_sync || null)}</strong></div>
                       </>
                     )

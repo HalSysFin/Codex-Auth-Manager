@@ -16,6 +16,8 @@ import type {
   LeaseTelemetryContext,
   OpenClawLeaseTelemetryServiceOptions,
   UsageShape,
+  ConsumeRateLimitResetResponse,
+  RateLimitResetCreditsResponse,
 } from './types.js'
 import { OpenClawAuthManagerPlugin } from './plugin.js'
 import { AuthManagerClientError, AuthManagerTelemetryClient } from './client.js'
@@ -82,6 +84,7 @@ export class OpenClawLeaseTelemetryService {
   private lastImportedUsageHash: string | null = null
   private usageImportRunning = false
   private activeMutation: string | null = null
+  private nextAcquireExcludeCredentialIds: string[] = []
 
   constructor(options: OpenClawLeaseTelemetryServiceOptions) {
     this.client = new AuthManagerTelemetryClient({
@@ -270,7 +273,9 @@ export class OpenClawLeaseTelemetryService {
       }
       try {
         await this.flushIfNeeded(true)
+        const releasedCredentialId = this.currentCredentialId
         await this.releaseLeaseInternal(reason)
+        this.nextAcquireExcludeCredentialIds = releasedCredentialId ? [releasedCredentialId] : []
         return this.successResult('release')
       } catch (error) {
         this.captureError(error)
@@ -283,10 +288,14 @@ export class OpenClawLeaseTelemetryService {
     return this.runMutation('reacquire', async () => {
       try {
         await this.flushIfNeeded(true)
+        let excludeCredentialIds = this.nextAcquireExcludeCredentialIds
         if (this.context?.leaseId) {
+          const releasedCredentialId = this.currentCredentialId
           await this.releaseLeaseInternal(`${reason}:release_current`)
+          excludeCredentialIds = releasedCredentialId ? [releasedCredentialId] : excludeCredentialIds
         }
-        await this.acquireAndMaterialize(reason)
+        this.nextAcquireExcludeCredentialIds = excludeCredentialIds
+        await this.acquireAndMaterialize(reason, excludeCredentialIds)
         return this.successResult('reacquire')
       } catch (error) {
         this.captureError(error)
@@ -337,6 +346,28 @@ export class OpenClawLeaseTelemetryService {
       this.autoRotate = update.autoRotate
     }
     return this.successResult('set_auto_mode')
+  }
+
+  async getRateLimitResets(): Promise<RateLimitResetCreditsResponse> {
+    if (!this.context?.leaseId) {
+      throw new Error('No active lease is available to inspect rate-limit resets.')
+    }
+    return this.client.getRateLimitResets(this.context)
+  }
+
+  async useRateLimitReset(input?: { creditId?: string | null }): Promise<ConsumeRateLimitResetResponse> {
+    if (!this.context?.leaseId) {
+      throw new Error('No active lease is available to consume a rate-limit reset.')
+    }
+    const result = await this.client.consumeRateLimitReset(this.context, {
+      idempotencyKey: crypto.randomUUID(),
+      creditId: input?.creditId,
+    })
+    if (this.context?.leaseId) {
+      const status = await this.client.getLease(this.context.leaseId)
+      this.captureLeaseStatus(status)
+    }
+    return result
   }
 
   async shutdown(): Promise<void> {
@@ -423,14 +454,16 @@ export class OpenClawLeaseTelemetryService {
     }
   }
 
-  private async acquireAndMaterialize(reason: string): Promise<void> {
+  private async acquireAndMaterialize(reason: string, excludeCredentialIds: string[] = this.nextAcquireExcludeCredentialIds): Promise<void> {
     const response = await this.client.acquireLease({
       machineId: this.machineId,
       agentId: this.agentId,
       requestedTtlSeconds: this.requestedTtlSeconds,
       reason,
+      excludeCredentialIds,
     })
     const lease = this.consumeLeaseResponse(response, 'lease acquire denied')
+    this.nextAcquireExcludeCredentialIds = []
     await this.materializeAndWriteAuth(lease.id)
   }
 

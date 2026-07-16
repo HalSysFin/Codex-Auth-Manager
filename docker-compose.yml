@@ -15,10 +15,11 @@ services:
     restart: unless-stopped
 
   auth-manager:
-    image: ${AUTH_MANAGER_IMAGE:-ghcr.io/halsysfin/codex-auth-manager:latest}
-    pull_policy: always
+    build:
+      context: .
+    image: ${AUTH_MANAGER_IMAGE:-auth-manager-local:latest}
     ports:
-      - "8080:8080"
+      - "${AUTH_MANAGER_HOST_PORT:-8180}:8080"
     environment:
       CODEX_CLI_BIN: ${CODEX_CLI_BIN:-codex}
       # Keep active Codex auth where Codex CLI expects it.
@@ -44,10 +45,88 @@ services:
       OPENAI_CLIENT_ID: ${OPENAI_CLIENT_ID:-}
       OPENAI_CLIENT_SECRET: ${OPENAI_CLIENT_SECRET:-}
       OPENAI_REDIRECT_URI: ${OPENAI_REDIRECT_URI:-http://localhost:1455/auth/callback}
+      AUTH_MANAGER_PROCESS_ROLE: ${AUTH_MANAGER_PROCESS_ROLE:-api}
+      AUTH_MANAGER_API_WORKERS: ${AUTH_MANAGER_API_WORKERS:-2}
     volumes:
       # Active in-container Codex auth (named volume, not host ~/.codex).
       - codex_auth:/root/.codex
       # Auth-manager state (callbacks + legacy migration sources).
+      - auth_manager_state:/var/lib/auth-manager
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
+  auth-manager-lease-worker:
+    build:
+      context: .
+    image: ${AUTH_MANAGER_IMAGE:-auth-manager-local:latest}
+    command: ["python", "-m", "app.worker_main", "lease"]
+    environment:
+      CODEX_CLI_BIN: ${CODEX_CLI_BIN:-codex}
+      CODEX_AUTH_PATH: ${CODEX_AUTH_PATH:-/root/.codex/auth.json}
+      CALLBACK_STORE_DIR: ${CALLBACK_STORE_DIR:-/var/lib/auth-manager/callbacks}
+      CODEX_PROFILES_DIR: ${CODEX_PROFILES_DIR:-/var/lib/auth-manager/legacy/profiles}
+      USAGE_DB_PATH: ${USAGE_DB_PATH:-/var/lib/auth-manager/legacy/auth-manager.sqlite3}
+      DATABASE_URL: ${DATABASE_URL:-postgresql://auth_manager:auth_manager@postgres:5432/auth_manager}
+      AUTH_ENCRYPTION_KEY: ${AUTH_ENCRYPTION_KEY:-}
+      LOGIN_SESSION_TTL_SECONDS: ${LOGIN_SESSION_TTL_SECONDS:-600}
+      WEB_LOGIN_USERNAME: ${WEB_LOGIN_USERNAME:-}
+      WEB_LOGIN_PASSWORD: ${WEB_LOGIN_PASSWORD:-}
+      WEB_LOGIN_SESSION_SECRET: ${WEB_LOGIN_SESSION_SECRET:-}
+      WEB_LOGIN_COOKIE_NAME: ${WEB_LOGIN_COOKIE_NAME:-auth_manager_session}
+      WEB_LOGIN_SESSION_TTL_SECONDS: ${WEB_LOGIN_SESSION_TTL_SECONDS:-43200}
+      TRUSTED_PROXY_IPS: ${TRUSTED_PROXY_IPS:-}
+      INTERNAL_NETWORK_CIDRS: ${INTERNAL_NETWORK_CIDRS:-127.0.0.1/32,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,::1/128,fc00::/7}
+      INTERNAL_API_TOKEN: ${INTERNAL_API_TOKEN:-}
+      OPENAI_ORGANIZATION: ${OPENAI_ORGANIZATION:-}
+      OPENAI_PROJECT: ${OPENAI_PROJECT:-}
+      OPENAI_TOKEN_URL: ${OPENAI_TOKEN_URL:-}
+      OPENAI_CLIENT_ID: ${OPENAI_CLIENT_ID:-}
+      OPENAI_CLIENT_SECRET: ${OPENAI_CLIENT_SECRET:-}
+      OPENAI_REDIRECT_URI: ${OPENAI_REDIRECT_URI:-http://localhost:1455/auth/callback}
+      AUTH_MANAGER_PROCESS_ROLE: lease
+    volumes:
+      - codex_auth:/root/.codex
+      - auth_manager_state:/var/lib/auth-manager
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
+  auth-manager-refresh-worker:
+    build:
+      context: .
+    image: ${AUTH_MANAGER_IMAGE:-auth-manager-local:latest}
+    command: ["python", "-m", "app.worker_main", "refresh"]
+    environment:
+      CODEX_CLI_BIN: ${CODEX_CLI_BIN:-codex}
+      CODEX_AUTH_PATH: ${CODEX_AUTH_PATH:-/root/.codex/auth.json}
+      CALLBACK_STORE_DIR: ${CALLBACK_STORE_DIR:-/var/lib/auth-manager/callbacks}
+      CODEX_PROFILES_DIR: ${CODEX_PROFILES_DIR:-/var/lib/auth-manager/legacy/profiles}
+      USAGE_DB_PATH: ${USAGE_DB_PATH:-/var/lib/auth-manager/legacy/auth-manager.sqlite3}
+      DATABASE_URL: ${DATABASE_URL:-postgresql://auth_manager:auth_manager@postgres:5432/auth_manager}
+      AUTH_ENCRYPTION_KEY: ${AUTH_ENCRYPTION_KEY:-}
+      LOGIN_SESSION_TTL_SECONDS: ${LOGIN_SESSION_TTL_SECONDS:-600}
+      WEB_LOGIN_USERNAME: ${WEB_LOGIN_USERNAME:-}
+      WEB_LOGIN_PASSWORD: ${WEB_LOGIN_PASSWORD:-}
+      WEB_LOGIN_SESSION_SECRET: ${WEB_LOGIN_SESSION_SECRET:-}
+      WEB_LOGIN_COOKIE_NAME: ${WEB_LOGIN_COOKIE_NAME:-auth_manager_session}
+      WEB_LOGIN_SESSION_TTL_SECONDS: ${WEB_LOGIN_SESSION_TTL_SECONDS:-43200}
+      TRUSTED_PROXY_IPS: ${TRUSTED_PROXY_IPS:-}
+      INTERNAL_NETWORK_CIDRS: ${INTERNAL_NETWORK_CIDRS:-127.0.0.1/32,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,::1/128,fc00::/7}
+      INTERNAL_API_TOKEN: ${INTERNAL_API_TOKEN:-}
+      OPENAI_ORGANIZATION: ${OPENAI_ORGANIZATION:-}
+      OPENAI_PROJECT: ${OPENAI_PROJECT:-}
+      OPENAI_TOKEN_URL: ${OPENAI_TOKEN_URL:-}
+      OPENAI_CLIENT_ID: ${OPENAI_CLIENT_ID:-}
+      OPENAI_CLIENT_SECRET: ${OPENAI_CLIENT_SECRET:-}
+      OPENAI_REDIRECT_URI: ${OPENAI_REDIRECT_URI:-http://localhost:1455/auth/callback}
+      AUTH_MANAGER_PROCESS_ROLE: refresh
+      AUTH_KEEPALIVE_INTERVAL_SECONDS: ${AUTH_KEEPALIVE_INTERVAL_SECONDS:-60}
+      AUTH_REFRESH_LEEWAY_SECONDS: ${AUTH_REFRESH_LEEWAY_SECONDS:-86400}
+    volumes:
+      - codex_auth:/root/.codex
       - auth_manager_state:/var/lib/auth-manager
     depends_on:
       postgres:
