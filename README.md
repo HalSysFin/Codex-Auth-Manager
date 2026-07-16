@@ -12,7 +12,7 @@ Codex Auth Manager manages numerous Codex / ChatGPT account auths, keeps those a
 
 ## Dashboard Preview
 
-![Codex Auth Manager dashboard](./assets/codex-auth-manager-dashboard.png)
+![Codex Auth Manager dashboard](./assets/dashboard.png)
 
 ## Lease Management Preview
 
